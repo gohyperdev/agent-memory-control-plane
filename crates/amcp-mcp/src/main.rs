@@ -229,6 +229,19 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_events_list",
+                "description": "List persisted, deduplicated AMCP runtime events for diagnostics and collection freshness.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "provider_id": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_retrieve_context",
                 "description": "Retrieve optional RAG context. It is disabled by default and returns an explicit fallback warning with no uncited context.",
                 "inputSchema": {
@@ -350,6 +363,16 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             let host_id = arguments.get("host_id").and_then(Value::as_str);
             let project_id = arguments.get("project_id").and_then(Value::as_str);
             Ok(json!({ "guidance": catalog.list_guidance(host_id, project_id)? }))
+        }
+        "amcp_events_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            let provider_id = arguments.get("provider_id").and_then(Value::as_str);
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 100) as usize;
+            Ok(json!({ "events": catalog.list_runtime_events(host_id, provider_id, limit)? }))
         }
         "amcp_retrieve_context" => {
             let query = arguments

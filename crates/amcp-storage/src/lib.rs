@@ -1,7 +1,7 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
-    HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, SensitivityClass,
-    SessionItem, SessionRecord,
+    HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, RuntimeEvent,
+    SensitivityClass, SessionItem, SessionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -160,6 +160,16 @@ impl Catalog {
                 host_id TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
                 PRIMARY KEY (lower_guidance_id, higher_guidance_id, host_id, provider_id)
+            );
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                event_id TEXT PRIMARY KEY,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY (host_id) REFERENCES hosts(host_id)
             );
             CREATE TABLE IF NOT EXISTS artifacts (
                 artifact_id TEXT PRIMARY KEY,
@@ -428,6 +438,21 @@ impl Catalog {
                 ],
             )?;
         }
+        for event in &batch.runtime_events {
+            transaction.execute(
+                "INSERT OR IGNORE INTO runtime_events(event_id, host_id, provider_id, event_type, sequence, payload_json, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.event_id,
+                    event.host_id,
+                    event.provider_id,
+                    event.event_type,
+                    event.sequence,
+                    event.payload_json,
+                    event.occurred_at.to_rfc3339(),
+                ],
+            )?;
+        }
 
         let mut inserted = 0;
         for artifact in &batch.artifacts {
@@ -687,6 +712,32 @@ impl Catalog {
                 content: row.get(6)?,
                 source_reference: row.get(7)?,
                 observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_runtime_events(
+        &self,
+        host_id: Option<&str>,
+        provider_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, host_id, provider_id, event_type, sequence, payload_json, occurred_at
+             FROM runtime_events WHERE (?1 IS NULL OR host_id = ?1) AND (?2 IS NULL OR provider_id = ?2)
+             ORDER BY occurred_at DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![host_id, provider_id, limit as i64], |row| {
+            let occurred_at: String = row.get(6)?;
+            Ok(RuntimeEvent {
+                event_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                event_type: row.get(3)?,
+                sequence: row.get(4)?,
+                payload_json: row.get(5)?,
+                occurred_at: parse_utc(&occurred_at).unwrap_or_else(Utc::now),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -969,7 +1020,8 @@ mod tests {
     use amcp_domain::{
         ArtifactKind, ArtifactRecord, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
         GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState,
-        ProjectRecord, ProviderDescriptor, SessionItem, SessionRecord, SourceObservation, new_id,
+        ProjectRecord, ProviderDescriptor, RuntimeEvent, SessionItem, SessionRecord,
+        SourceObservation, new_id,
     };
 
     fn batch() -> CollectionBatch {
@@ -1088,6 +1140,15 @@ mod tests {
                 higher_guidance_id: "guidance-test".into(),
                 relation: "more_specific".into(),
             }],
+            runtime_events: vec![RuntimeEvent {
+                event_id: "event-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                event_type: "inventory.completed".into(),
+                sequence: 0,
+                payload_json: "{}".into(),
+                occurred_at: now,
+            }],
             artifacts: vec![ArtifactRecord {
                 artifact_id: new_id("artifact"),
                 host_id: "host_test".into(),
@@ -1121,6 +1182,13 @@ mod tests {
         let inserted = catalog.ingest(&batch()).expect("ingest");
         assert_eq!(inserted, 1);
         assert_eq!(catalog.artifact_count().expect("count"), 1);
+        assert_eq!(
+            catalog
+                .list_runtime_events(None, None, 10)
+                .expect("events")
+                .len(),
+            1
+        );
         assert_eq!(catalog.search("sandbox", 10).expect("search").len(), 1);
         assert_eq!(catalog.list_projects(None).expect("projects").len(), 1);
         assert_eq!(
@@ -1142,6 +1210,13 @@ mod tests {
             catalog
                 .list_session_items("session-test", None)
                 .expect("session items")
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .list_runtime_events(None, None, 10)
+                .expect("events")
                 .len(),
             1
         );

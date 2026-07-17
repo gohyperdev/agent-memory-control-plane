@@ -424,6 +424,17 @@ pub struct GuidanceEdge {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEvent {
+    pub event_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub event_type: String,
+    pub sequence: i64,
+    pub payload_json: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
@@ -459,6 +470,8 @@ pub struct CollectionBatch {
     pub guidance_records: Vec<GuidanceRecord>,
     #[serde(default)]
     pub guidance_edges: Vec<GuidanceEdge>,
+    #[serde(default)]
+    pub runtime_events: Vec<RuntimeEvent>,
     pub artifacts: Vec<ArtifactRecord>,
     pub next_cursor: Option<String>,
 }

@@ -2,7 +2,8 @@ use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
     GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
-    ProviderDescriptor, SensitivityClass, SessionItem, SessionRecord, SourceObservation, new_id,
+    ProviderDescriptor, RuntimeEvent, SensitivityClass, SessionItem, SessionRecord,
+    SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -118,7 +119,7 @@ impl CodexAdapter {
         guidance_records.dedup_by(|left, right| left.source_reference == right.source_reference);
         let guidance_edges = self.guidance_edges(&guidance_records, &projects);
 
-        Ok(CollectionBatch {
+        let mut batch = CollectionBatch {
             collection_run_id,
             host,
             providers: vec![self.provider()],
@@ -129,9 +130,26 @@ impl CodexAdapter {
             config_layers,
             guidance_records,
             guidance_edges,
+            runtime_events: Vec::new(),
             artifacts,
             next_cursor: None,
-        })
+        };
+        batch.runtime_events.push(RuntimeEvent {
+            event_id: new_id("event"),
+            host_id: batch.host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            event_type: "inventory.completed".to_owned(),
+            sequence: 0,
+            payload_json: serde_json::json!({
+                "artifacts": batch.artifacts.len(),
+                "projects": batch.projects.len(),
+                "sessions": batch.sessions.len(),
+                "memories": batch.memory_records.len()
+            })
+            .to_string(),
+            occurred_at: Utc::now(),
+        });
+        Ok(batch)
     }
 
     pub fn propose_change(&self, request: &ChangeRequest) -> Result<ChangeSet> {
