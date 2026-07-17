@@ -773,6 +773,13 @@ The macOS Agent should run as a per-user LaunchAgent:
 
 The Controller should be able to start a foreground Agent for development and connect to the LaunchAgent in production.
 
+The installer creates mode-700 AMCP state/log directories, writes the plist
+through a temporary file, configures launchd restart throttling and keeps the
+rotated Agent credential out of the plist. `scripts/diagnose-agent.sh` exports
+only launchd status, plist metadata, socket permissions and redacted log tails;
+it intentionally excludes the central database, provider files, credentials and
+raw session content.
+
 ### 11.3 macOS security boundaries
 
 - Use the macOS Keychain only for AMCP host credentials and enrollment secrets.

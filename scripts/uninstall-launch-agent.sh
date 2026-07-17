@@ -10,4 +10,4 @@ plist="$HOME/Library/LaunchAgents/com.gohyperdev.amcp.agent.plist"
 uid=$(id -u)
 /bin/launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || true
 rm -f "$plist"
-echo "Removed $plist"
+echo "Removed $plist; AMCP state and logs were preserved"

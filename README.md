@@ -130,4 +130,10 @@ AMCP_AGENT_BIN="$PWD/target/debug/amcp-agent" \
 
 Use `./scripts/uninstall-launch-agent.sh` to stop and remove it. The installer keeps the Agent in the user session and does not create a network listener.
 
+Export a bounded macOS diagnostic bundle without copying the central database or native provider files:
+
+```bash
+./scripts/diagnose-agent.sh
+```
+
 See [PLAN-IMPLEMENTACJI.md](PLAN-IMPLEMENTACJI.md) for the full implementation roadmap.
