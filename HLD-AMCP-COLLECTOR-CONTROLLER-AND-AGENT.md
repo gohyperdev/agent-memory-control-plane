@@ -193,7 +193,10 @@ Recommended first implementation:
 - FTS5 for lexical search.
 - Schema migrations managed by the Controller.
 - Database backups before schema migrations and on user request.
-- Rebuildable search projections derived from normalized records.
+- Rebuildable search projections derived from normalized records. Collection
+  updates FTS5 incrementally in the same transaction as normalized records,
+  records projection runs in `index_runs`, and the Controller can rebuild the
+  projection in bounded chunks without mutating native provider state.
 
 The storage interface must be abstracted so a future central server can use PostgreSQL or another server database without changing the domain or MCP API.
 

@@ -49,6 +49,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - The Agent can optionally supervise a local Codex app-server runtime with `AMCP_AGENT_APP_SERVER_ENABLED=true`; it polls bounded thread metadata, emits deterministic `session.updated` events, persists no transcript deltas, and reconnects with exponential backoff.
 - The authenticated Agent protocol also exposes bounded `RuntimeListThreads` read pages with host-scope enforcement and provider-neutral metadata; raw app-server response objects and transcript content are not returned.
 - The macOS Agent runs a `notify`/FSEvents-backed watcher over the Codex root and emits bounded, path-relative `source.changed` events; sensitive `auth.json` paths are excluded and bursts are coalesced.
+- Central FTS5 search is maintained incrementally during collection, records projection runs, and supports bounded chunk rebuilds through `amcp-controller rebuild-index`.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/session-item/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.
 - `amcp-app-server` supervises the documented Codex app-server stdio protocol, captures bounded notification summaries, and supports initialization, thread/turn start, streamed notifications, and interruption.

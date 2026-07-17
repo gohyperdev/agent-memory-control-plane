@@ -171,6 +171,14 @@ enum CommandKind {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    RebuildIndex {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+        #[arg(long)]
+        json: bool,
+    },
     ProposeChange {
         #[arg(
             long,
@@ -545,6 +553,11 @@ async fn main() -> Result<()> {
             .await
         }
         CommandKind::Hosts { db } => list_hosts(db.unwrap_or_else(default_db_path)),
+        CommandKind::RebuildIndex {
+            db,
+            batch_size,
+            json,
+        } => rebuild_index(db.unwrap_or_else(default_db_path), batch_size, json),
         CommandKind::KeychainStore { host_id, token } => {
             store_keychain_credential(&host_id, &token)
         }
@@ -1159,6 +1172,20 @@ fn search(db: PathBuf, query: String, limit: usize) -> Result<()> {
     let catalog = CatalogService::open(&db)?;
     for hit in catalog.search(&query, limit)? {
         println!("{}\t{}\t{}", hit.title, hit.source_reference, hit.preview);
+    }
+    Ok(())
+}
+
+fn rebuild_index(db: PathBuf, batch_size: usize, json: bool) -> Result<()> {
+    let mut catalog = CatalogService::open(&db)?;
+    let run = catalog.rebuild_search_projection(batch_size)?;
+    if json {
+        println!("{}", serde_json::to_string(&run)?);
+    } else {
+        println!(
+            "Rebuilt search projection: {} artifact(s), run {}",
+            run.indexed_count, run.run_id
+        );
     }
     Ok(())
 }

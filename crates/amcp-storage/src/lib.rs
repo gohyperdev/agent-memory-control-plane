@@ -1,7 +1,7 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
     HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, ProviderRecord,
-    RuntimeEvent, SensitivityClass, SessionItem, SessionRecord,
+    RuntimeEvent, SensitivityClass, SessionItem, SessionRecord, new_id,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -20,6 +20,18 @@ pub struct SearchHit {
     pub source_hash: String,
     pub sensitivity: SensitivityClass,
     pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexRunRecord {
+    pub run_id: String,
+    pub mode: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub indexed_count: usize,
+    pub last_artifact_id: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct Catalog {
@@ -276,6 +288,18 @@ impl Catalog {
                 host_id UNINDEXED,
                 provider_id UNINDEXED
             );
+            CREATE TABLE IF NOT EXISTS index_runs (
+                run_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                indexed_count INTEGER NOT NULL,
+                last_artifact_id TEXT,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS index_runs_started_at_idx
+                ON index_runs(started_at DESC);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                 VALUES (1, datetime('now'));
             "#,
@@ -284,6 +308,8 @@ impl Catalog {
     }
 
     pub fn ingest(&mut self, batch: &CollectionBatch) -> Result<usize> {
+        let index_run_id = new_id("index-run");
+        let index_started_at = Utc::now();
         let transaction = self
             .connection
             .transaction()
@@ -548,10 +574,115 @@ impl Catalog {
                 params![host.host_id, provider.id, batch.next_cursor, batch.collection_run_id, Utc::now().to_rfc3339()],
             )?;
         }
+        if !batch.artifacts.is_empty() {
+            transaction.execute(
+                "INSERT INTO index_runs(run_id, mode, status, started_at, completed_at, indexed_count, last_artifact_id, error)
+                 VALUES (?1, 'incremental', 'completed', ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    index_run_id,
+                    index_started_at.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                    batch.artifacts.len() as i64,
+                    batch.artifacts.last().map(|artifact| artifact.artifact_id.as_str()),
+                ],
+            )?;
+        }
         transaction
             .commit()
             .context("commit collection transaction")?;
         Ok(inserted)
+    }
+
+    pub fn latest_index_run(&self) -> Result<Option<IndexRunRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, mode, status, started_at, completed_at, indexed_count, last_artifact_id, error
+             FROM index_runs ORDER BY started_at DESC LIMIT 1",
+        )?;
+        Ok(statement.query_row([], index_run_from_row).optional()?)
+    }
+
+    pub fn rebuild_search_projection(&mut self, batch_size: usize) -> Result<IndexRunRecord> {
+        let run_id = new_id("index-run");
+        let started_at = Utc::now();
+        self.connection.execute(
+            "INSERT INTO index_runs(run_id, mode, status, started_at, completed_at, indexed_count, last_artifact_id, error)
+             VALUES (?1, 'rebuild', 'running', ?2, NULL, 0, NULL, NULL)",
+            params![run_id, started_at.to_rfc3339()],
+        )?;
+        let operation = (|| -> Result<()> {
+            self.connection
+                .execute("DELETE FROM search_content", [])
+                .context("clear search projection")?;
+            let batch_size = batch_size.clamp(1, 1_000);
+            let mut last_artifact_id: Option<String> = None;
+            let mut indexed_count = 0usize;
+            loop {
+                let rows = {
+                    let mut statement = self.connection.prepare(
+                        "SELECT artifact_id, title, content, source_reference, host_id, provider_id
+                         FROM artifacts WHERE artifact_id > ?1 ORDER BY artifact_id LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(
+                        params![last_artifact_id.as_deref().unwrap_or(""), batch_size as i64],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        },
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                let transaction = self
+                    .connection
+                    .transaction()
+                    .context("start search projection chunk")?;
+                for (artifact_id, title, content, source_reference, host_id, provider_id) in &rows {
+                    transaction.execute(
+                        "INSERT INTO search_content(artifact_id, title, content, source_reference, host_id, provider_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            artifact_id,
+                            title,
+                            content,
+                            source_reference,
+                            host_id,
+                            provider_id,
+                        ],
+                    )?;
+                }
+                transaction
+                    .commit()
+                    .context("commit search projection chunk")?;
+                indexed_count += rows.len();
+                last_artifact_id = rows.last().map(|row| row.0.clone());
+                self.connection.execute(
+                    "UPDATE index_runs SET indexed_count = ?2, last_artifact_id = ?3 WHERE run_id = ?1",
+                    params![run_id, indexed_count as i64, last_artifact_id],
+                )?;
+            }
+            self.connection.execute(
+                "UPDATE index_runs SET status = 'completed', completed_at = ?2 WHERE run_id = ?1",
+                params![run_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let _ = self.connection.execute(
+                "UPDATE index_runs SET status = 'failed', completed_at = ?2, error = ?3 WHERE run_id = ?1",
+                params![run_id, Utc::now().to_rfc3339(), error.to_string()],
+            );
+            return Err(error);
+        }
+        self.latest_index_run()?
+            .context("completed index run disappeared")
     }
 
     pub fn ingest_runtime_events(&mut self, events: &[RuntimeEvent]) -> Result<usize> {
@@ -1157,6 +1288,21 @@ impl Catalog {
     }
 }
 
+fn index_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRunRecord> {
+    let started_at: String = row.get(3)?;
+    let completed_at: Option<String> = row.get(4)?;
+    Ok(IndexRunRecord {
+        run_id: row.get(0)?,
+        mode: row.get(1)?,
+        status: row.get(2)?,
+        started_at: parse_utc(&started_at).unwrap_or_else(Utc::now),
+        completed_at: completed_at.as_deref().and_then(parse_utc),
+        indexed_count: row.get::<_, i64>(5)?.max(0) as usize,
+        last_artifact_id: row.get(6)?,
+        error: row.get(7)?,
+    })
+}
+
 fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -1377,6 +1523,25 @@ mod tests {
                 .len(),
             1
         );
+        let incremental = catalog
+            .latest_index_run()
+            .expect("index run")
+            .expect("incremental index run");
+        assert_eq!(incremental.mode, "incremental");
+        assert_eq!(incremental.status, "completed");
+    }
+
+    #[test]
+    fn search_projection_rebuilds_in_bounded_chunks() {
+        let mut catalog = Catalog::open_in_memory().expect("catalog");
+        catalog.ingest(&batch()).expect("ingest");
+        let run = catalog
+            .rebuild_search_projection(1)
+            .expect("rebuild projection");
+        assert_eq!(run.mode, "rebuild");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.indexed_count, 1);
+        assert_eq!(catalog.search("sandbox", 10).expect("search").len(), 1);
     }
 
     #[test]

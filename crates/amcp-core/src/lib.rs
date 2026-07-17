@@ -113,6 +113,17 @@ impl CatalogService {
         self.catalog.ingest_runtime_events(events)
     }
 
+    pub fn latest_index_run(&self) -> Result<Option<amcp_storage::IndexRunRecord>> {
+        self.catalog.latest_index_run()
+    }
+
+    pub fn rebuild_search_projection(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<amcp_storage::IndexRunRecord> {
+        self.catalog.rebuild_search_projection(batch_size)
+    }
+
     pub fn latest_cursor(&self, host_id: &str, provider_id: &str) -> Result<Option<String>> {
         self.catalog.latest_cursor(host_id, provider_id)
     }
