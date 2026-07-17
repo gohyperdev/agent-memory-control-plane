@@ -13,7 +13,7 @@ use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
     ResponsePayload,
 };
-use amcp_provider_api::{ProviderAdapter, ProviderRegistry};
+use amcp_provider_api::{InventoryProviderAdapter, ProviderAdapter, ProviderRegistry};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
@@ -638,20 +638,22 @@ fn process_request(
                 host_id: host_identity().host_id,
                 timestamp: Utc::now().to_rfc3339(),
             }),
-            RequestMethod::Capabilities => Ok(ResponsePayload::Capabilities {
-                platform: host_identity().platform,
-                providers: provider_registry(codex_home.clone())
-                    .descriptors()
-                    .iter()
-                    .map(|provider| provider.id.clone())
-                    .collect(),
-                capabilities: provider_registry(codex_home.clone())
-                    .descriptors()
-                    .into_iter()
-                    .flat_map(|provider| provider.capabilities)
-                    .collect(),
-                agent_version: env!("CARGO_PKG_VERSION").into(),
-            }),
+            RequestMethod::Capabilities => {
+                let descriptors = provider_registry(codex_home.clone()).descriptors();
+                Ok(ResponsePayload::Capabilities {
+                    platform: host_identity().platform,
+                    providers: descriptors
+                        .iter()
+                        .map(|provider| provider.id.clone())
+                        .collect(),
+                    capabilities: descriptors
+                        .iter()
+                        .flat_map(|provider| provider.capabilities.clone())
+                        .collect(),
+                    provider_descriptors: descriptors,
+                    agent_version: env!("CARGO_PKG_VERSION").into(),
+                })
+            }
             RequestMethod::Collect { scope, cursor } => {
                 if let Some(scope) = &scope {
                     if scope.host_id.as_deref() != Some(host_identity().host_id.as_str()) {
@@ -1019,7 +1021,30 @@ fn runtime_event_page(
 fn provider_registry(codex_home: Option<PathBuf>) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     registry.register(Box::new(CodexAdapter::from_environment(codex_home)));
+    if env_flag("AMCP_ENABLE_FUTURE_PROVIDERS") {
+        registry.register(Box::new(InventoryProviderAdapter::new(
+            "claude-code",
+            "Claude Code",
+            "inventory-fixture-0.1.0",
+        )));
+        registry.register(Box::new(InventoryProviderAdapter::new(
+            "antigravity",
+            "Antigravity",
+            "inventory-fixture-0.1.0",
+        )));
+        registry.register(Box::new(InventoryProviderAdapter::new(
+            "kiro",
+            "Kiro",
+            "inventory-fixture-0.1.0",
+        )));
+    }
     registry
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 async fn write_response<W: AsyncWrite + Unpin>(

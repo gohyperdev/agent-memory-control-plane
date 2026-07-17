@@ -139,6 +139,15 @@ impl CatalogService {
             .register_connection(host, endpoint, agent_version, capabilities)
     }
 
+    pub fn register_provider_descriptors(
+        &mut self,
+        host: &amcp_domain::HostIdentity,
+        descriptors: &[amcp_domain::ProviderDescriptor],
+    ) -> Result<()> {
+        self.catalog
+            .register_provider_descriptors(host, descriptors)
+    }
+
     pub fn save_change_set(&mut self, change_set: &ChangeSet) -> Result<()> {
         self.catalog.save_change_set(change_set)
     }

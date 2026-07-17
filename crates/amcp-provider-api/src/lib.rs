@@ -5,6 +5,57 @@ use amcp_domain::{
 use anyhow::{Result, bail};
 use std::path::Path;
 
+/// A provider descriptor that can be registered before a provider has a full
+/// parser or mutation implementation. It makes capability negotiation and UI
+/// diagnostics provider-neutral without pretending that inventory-only state
+/// is writable.
+#[derive(Debug, Clone)]
+pub struct InventoryProviderAdapter {
+    descriptor: ProviderDescriptor,
+}
+
+impl InventoryProviderAdapter {
+    pub fn new(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        adapter_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            descriptor: ProviderDescriptor {
+                id: id.into(),
+                display_name: display_name.into(),
+                version: None,
+                adapter_version: adapter_version.into(),
+                capabilities: vec!["inventory".into()],
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for InventoryProviderAdapter {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn discover(&self, host: HostIdentity) -> Result<CollectionBatch> {
+        Ok(CollectionBatch {
+            collection_run_id: amcp_domain::new_id("run"),
+            host,
+            providers: vec![self.descriptor()],
+            projects: Vec::new(),
+            sessions: Vec::new(),
+            session_items: Vec::new(),
+            memory_records: Vec::new(),
+            config_layers: Vec::new(),
+            guidance_records: Vec::new(),
+            guidance_edges: Vec::new(),
+            runtime_events: Vec::new(),
+            artifacts: Vec::new(),
+            next_cursor: None,
+        })
+    }
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
     /// Return a cheap source-state cursor when the provider supports incremental discovery.
@@ -170,6 +221,32 @@ mod tests {
                     target: ArtifactRef {
                         host_id: "host".into(),
                         provider_id: "inventory-only".into(),
+                        native_id: "native".into(),
+                        source_reference: "fixture://native".into(),
+                    },
+                    expected_source_hash: None,
+                    operation: amcp_domain::ChangeOperationKind::ReplaceText,
+                    replacement_content: Some("content".into()),
+                    reason: "test".into(),
+                    evidence_ids: Vec::new(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inventory_adapter_reports_capability_without_mutation_claims() {
+        let adapter = InventoryProviderAdapter::new("claude-code", "Claude Code", "fixture");
+        assert_eq!(adapter.descriptor().id, "claude-code");
+        assert_eq!(adapter.descriptor().capabilities, vec!["inventory"]);
+        assert!(
+            adapter
+                .propose_change(&ChangeRequest {
+                    actor: "test".into(),
+                    scope: amcp_domain::Scope::host("host"),
+                    target: ArtifactRef {
+                        host_id: "host".into(),
+                        provider_id: "claude-code".into(),
                         native_id: "native".into(),
                         source_reference: "fixture://native".into(),
                     },

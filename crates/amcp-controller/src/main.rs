@@ -2,8 +2,8 @@
 
 use amcp_core::CatalogService;
 use amcp_domain::{
-    ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
-    change_set_operations_hash, new_id,
+    ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity,
+    ProviderDescriptor, Scope, change_set_operations_hash, new_id,
 };
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
@@ -484,7 +484,7 @@ async fn run_once(
     .await
     .context("connect to AMCP Agent")?;
     let mut client = AgentClient::new(stream);
-    let (registered_host, agent_version, capabilities) =
+    let (registered_host, agent_version, capabilities, provider_descriptors) =
         register_and_refresh(&mut client, &token).await?;
     let mut catalog = CatalogService::open(&db)?;
     let endpoint = agent_url
@@ -496,6 +496,7 @@ async fn run_once(
         Some(&agent_version),
         &capabilities,
     )?;
+    catalog.register_provider_descriptors(&registered_host, &provider_descriptors)?;
     let (replayed_events, persisted_events, replayed_event_ids) = match client
         .request(
             RequestMethod::SubscribeEvents {
@@ -757,15 +758,16 @@ async fn enroll(
             other => bail!("Agent returned unexpected enrollment response: {other:?}"),
         };
         let (host, credential, expires_at) = enrolled;
-        let (agent_version, capabilities) = match client
+        let (agent_version, capabilities, provider_descriptors) = match client
             .request(RequestMethod::Capabilities, &credential)
             .await?
         {
             ResponsePayload::Capabilities {
                 agent_version,
                 capabilities,
+                provider_descriptors,
                 ..
-            } => (agent_version, capabilities),
+            } => (agent_version, capabilities, provider_descriptors),
             other => bail!("Agent returned unexpected capabilities response: {other:?}"),
         };
         match client
@@ -781,6 +783,7 @@ async fn enroll(
             .unwrap_or_else(|| format!("unix://{}", socket.display()));
         let mut catalog = CatalogService::open(&db)?;
         catalog.register_connection(&host, Some(&endpoint), Some(&agent_version), &capabilities)?;
+        catalog.register_provider_descriptors(&host, &provider_descriptors)?;
         let _ = client.request(RequestMethod::Shutdown, &credential).await;
         Ok::<_, anyhow::Error>((host, expires_at))
     }
@@ -848,7 +851,7 @@ async fn propose_change(
         )
         .await?;
         let mut client = AgentClient::new(stream);
-        let (registered_host, agent_version, capabilities) =
+        let (registered_host, agent_version, capabilities, _provider_descriptors) =
             register_and_refresh(&mut client, &token).await?;
         let target_path = source
             .canonicalize()
@@ -1313,7 +1316,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
 async fn register_and_refresh<S>(
     client: &mut AgentClient<S>,
     token: &str,
-) -> Result<(HostIdentity, String, Vec<String>)>
+) -> Result<(HostIdentity, String, Vec<String>, Vec<ProviderDescriptor>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1329,13 +1332,14 @@ where
         ResponsePayload::Registered { host, .. } => host,
         other => bail!("Agent returned unexpected register response: {other:?}"),
     };
-    let (agent_version, capabilities) =
+    let (agent_version, capabilities, provider_descriptors) =
         match client.request(RequestMethod::Capabilities, token).await? {
             ResponsePayload::Capabilities {
                 agent_version,
                 capabilities,
+                provider_descriptors,
                 ..
-            } => (agent_version, capabilities),
+            } => (agent_version, capabilities, provider_descriptors),
             other => bail!("Agent returned unexpected capabilities response: {other:?}"),
         };
     match client.request(RequestMethod::Heartbeat, token).await? {
@@ -1345,7 +1349,7 @@ where
         }
         other => bail!("Agent returned unexpected heartbeat response: {other:?}"),
     }
-    Ok((host, agent_version, capabilities))
+    Ok((host, agent_version, capabilities, provider_descriptors))
 }
 
 fn default_db_path() -> PathBuf {

@@ -1,6 +1,6 @@
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
-    CollectionBatch, HostIdentity, RuntimeEvent, Scope,
+    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, Scope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -98,6 +98,8 @@ pub enum ResponsePayload {
     Capabilities {
         platform: String,
         providers: Vec<String>,
+        #[serde(default)]
+        provider_descriptors: Vec<ProviderDescriptor>,
         capabilities: Vec<String>,
         agent_version: String,
     },

@@ -381,6 +381,14 @@ health
 
 Provider discovery must be isolated. A malformed Claude Code file must not prevent Codex discovery on the same host.
 
+The macOS MVP keeps future provider registration behind the explicit
+`AMCP_ENABLE_FUTURE_PROVIDERS=true` host setting. When enabled, the Agent
+negotiates inventory-only descriptors for Claude Code, Antigravity, and Kiro;
+these descriptors are persisted centrally with their capability set and do
+not imply file reads, runtime access, or mutation support. Full adapters can
+replace the descriptors later without changing the Agent–Controller protocol,
+central schema, or UI contract.
+
 ### 8.3 Codex adapter for macOS
 
 The initial Codex adapter handles:

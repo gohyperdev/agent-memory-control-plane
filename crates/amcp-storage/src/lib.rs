@@ -992,6 +992,30 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn register_provider_descriptors(
+        &mut self,
+        host: &HostIdentity,
+        descriptors: &[amcp_domain::ProviderDescriptor],
+    ) -> Result<()> {
+        self.register_host(host)?;
+        for provider in descriptors {
+            self.connection.execute(
+                "INSERT INTO providers(provider_id, host_id, display_name, version, adapter_version, capabilities_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(provider_id, host_id) DO UPDATE SET display_name=excluded.display_name, version=excluded.version, adapter_version=excluded.adapter_version, capabilities_json=excluded.capabilities_json",
+                params![
+                    provider.id,
+                    host.host_id,
+                    provider.display_name,
+                    provider.version,
+                    provider.adapter_version,
+                    serde_json::to_string(&provider.capabilities)?,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn load_change_set(&self, change_set_id: &str) -> Result<Option<ChangeSet>> {
         let encoded: Option<String> = self
             .connection
@@ -1438,6 +1462,18 @@ mod tests {
                 &["inventory".into(), "read".into()],
             )
             .expect("connection");
+        catalog
+            .register_provider_descriptors(
+                &host,
+                &[amcp_domain::ProviderDescriptor {
+                    id: "claude-code".into(),
+                    display_name: "Claude Code".into(),
+                    version: None,
+                    adapter_version: "inventory-fixture".into(),
+                    capabilities: vec!["inventory".into()],
+                }],
+            )
+            .expect("provider descriptors");
         let hosts = catalog.list_hosts().expect("hosts");
         assert_eq!(hosts.len(), 1);
         assert_eq!(
@@ -1446,5 +1482,10 @@ mod tests {
         );
         assert_eq!(hosts[0].status, HostStatus::Connected);
         assert!(hosts[0].capabilities.contains(&"read".to_owned()));
+        let providers = catalog
+            .list_providers(Some("host_test"))
+            .expect("providers");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, "claude-code");
     }
 }
