@@ -17,6 +17,7 @@ pub struct SearchHit {
     pub preview: String,
     pub host_id: String,
     pub provider_id: String,
+    pub source_hash: String,
     pub sensitivity: SensitivityClass,
     pub observed_at: DateTime<Utc>,
 }
@@ -566,7 +567,7 @@ impl Catalog {
         project_id: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
         let mut statement = self.connection.prepare(
-            "SELECT a.artifact_id, a.title, a.source_reference, snippet(search_content, 2, '[', ']', '…', 24), a.host_id, a.provider_id, a.sensitivity, a.observed_at
+            "SELECT a.artifact_id, a.title, a.source_reference, snippet(search_content, 2, '[', ']', '…', 24), a.host_id, a.provider_id, a.sensitivity, a.observed_at, a.source_hash
              FROM search_content JOIN artifacts a ON a.artifact_id = search_content.artifact_id
              WHERE search_content MATCH ?1
                AND (?3 IS NULL OR a.host_id = ?3)
@@ -586,6 +587,7 @@ impl Catalog {
                     preview: row.get(3)?,
                     host_id: row.get(4)?,
                     provider_id: row.get(5)?,
+                    source_hash: row.get(8)?,
                     sensitivity: serde_json::from_str(&sensitivity)
                         .unwrap_or(SensitivityClass::Sensitive),
                     observed_at: DateTime::parse_from_rfc3339(&observed_at)

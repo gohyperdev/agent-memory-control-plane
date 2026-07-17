@@ -1,7 +1,7 @@
 use amcp_core::CatalogService;
-use amcp_domain::Scope;
+use amcp_domain::{LifecycleState, Scope};
 use amcp_platform::default_agent_socket_path;
-use amcp_rag::{DisabledRagManager, RagManager};
+use amcp_rag::{DisabledRagManager, LexicalRagManager, RagConfig, RagDocument, RagManager};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -244,7 +244,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "amcp_retrieve_context",
-                "description": "Retrieve optional RAG context. It is disabled by default and returns an explicit fallback warning with no uncited context.",
+                "description": "Retrieve optional cited context. It is disabled by default; when AMCP_RAG_ENABLED=true, AMCP uses bounded lexical chunks from redacted FTS evidence until an embedding provider is configured.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -386,10 +386,57 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                 .and_then(Value::as_u64)
                 .unwrap_or(5)
                 .clamp(1, 20) as usize;
-            let manager = DisabledRagManager::default();
-            Ok(serde_json::to_value(
-                manager.retrieve(query, &scope, limit)?,
-            )?)
+            if env::var("AMCP_RAG_ENABLED")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+            {
+                let hits = catalog.search_scoped(
+                    query,
+                    (limit * 3).min(50),
+                    scope.host_id.as_deref(),
+                    scope.provider_id.as_deref(),
+                    scope.project_id.as_deref(),
+                )?;
+                let allowed_scopes = if scope.host_id.is_some()
+                    || scope.provider_id.is_some()
+                    || scope.project_id.is_some()
+                {
+                    vec![scope.clone()]
+                } else {
+                    Vec::new()
+                };
+                let mut manager = LexicalRagManager::new(RagConfig {
+                    enabled: true,
+                    allowed_scopes,
+                    ..RagConfig::default()
+                });
+                let documents = hits
+                    .into_iter()
+                    .map(|hit| RagDocument {
+                        record_id: hit.artifact_id,
+                        scope: Scope {
+                            host_id: Some(hit.host_id),
+                            provider_id: Some(hit.provider_id),
+                            project_id: scope.project_id.clone(),
+                        },
+                        title: hit.title,
+                        content: hit.preview,
+                        source_reference: hit.source_reference,
+                        source_hash: hit.source_hash,
+                        sensitivity: hit.sensitivity,
+                        lifecycle: LifecycleState::Active,
+                    })
+                    .collect::<Vec<_>>();
+                manager.index(&documents)?;
+                Ok(serde_json::to_value(
+                    manager.retrieve(query, &scope, limit)?,
+                )?)
+            } else {
+                let manager = DisabledRagManager::default();
+                Ok(serde_json::to_value(
+                    manager.retrieve(query, &scope, limit)?,
+                )?)
+            }
         }
         "amcp_change_review" => {
             let change_set_id = arguments

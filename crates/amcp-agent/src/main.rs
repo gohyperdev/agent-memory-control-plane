@@ -160,11 +160,14 @@ async fn serve(args: Args) -> Result<()> {
 }
 
 async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
+    let secure_default_socket = args.socket == default_agent_socket_path();
     if let Some(parent) = args.socket.parent() {
         tokio::fs::create_dir_all(parent).await?;
-        #[cfg(unix)]
-        tokio::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .await?;
+        if secure_default_socket {
+            #[cfg(unix)]
+            tokio::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .await?;
+        }
     }
     if args.socket.exists() {
         tokio::fs::remove_file(&args.socket)
