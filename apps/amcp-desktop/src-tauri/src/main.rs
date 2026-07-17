@@ -122,10 +122,14 @@ fn list_runtime_events(
 }
 
 #[tauri::command]
-fn collect_local() -> Result<serde_json::Value, String> {
+fn collect_local(provider_id: Option<String>) -> Result<serde_json::Value, String> {
     let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
-    let output = Command::new(controller)
-        .args(["run-once", "--json"])
+    let mut command = Command::new(controller);
+    command.args(["run-once", "--json"]);
+    if let Some(provider_id) = provider_id {
+        command.args(["--provider-id", &provider_id]);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("start Controller collection: {error}"))?;
     if !output.status.success() {

@@ -171,7 +171,7 @@ function App() {
     try {
       setSyncing(true);
       setError(null);
-      await invoke("collect_local");
+      await invoke("collect_local", { providerId: selectedProviderId || "codex" });
       const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents] = await Promise.all([
         invoke<Host[]>("list_hosts"),
         invoke<Provider[]>("list_providers"),
