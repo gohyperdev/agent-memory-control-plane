@@ -1,6 +1,6 @@
 use amcp_codex::CodexAdapter;
-use amcp_domain::HostIdentity;
 use amcp_domain::change_set_operations_hash;
+use amcp_domain::{HostIdentity, new_id};
 use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
 use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
@@ -8,10 +8,16 @@ use amcp_protocol::{
 };
 use amcp_provider_api::ProviderRegistry;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use rustls::{ServerConfig, pki_types::PrivateKeyDer};
-use std::{env, fs::File, io::BufReader as StdBufReader, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    fs::File,
+    io::BufReader as StdBufReader,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener},
@@ -43,6 +49,54 @@ struct Args {
     tls_cert: Option<PathBuf>,
     #[arg(long, env = "AMCP_AGENT_TLS_KEY")]
     tls_key: Option<PathBuf>,
+    #[arg(long, env = "AMCP_AGENT_PAIRING_CODE")]
+    pairing_code: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "AMCP_AGENT_PAIRING_TIMEOUT_SECONDS"
+    )]
+    pairing_timeout_seconds: u64,
+}
+
+struct AgentAuth {
+    bootstrap_token: String,
+    enrolled_credential: Option<String>,
+    credential_expires_at: Option<chrono::DateTime<Utc>>,
+    pairing_code: Option<String>,
+    pairing_expires_at: chrono::DateTime<Utc>,
+}
+
+impl AgentAuth {
+    fn new(token: String, pairing_code: Option<String>, timeout_seconds: u64) -> Self {
+        let pairing_code = pairing_code.unwrap_or_else(|| {
+            new_id("pairing")
+                .split('_')
+                .nth(1)
+                .unwrap_or("00000000")
+                .chars()
+                .take(8)
+                .collect()
+        });
+        Self {
+            bootstrap_token: token,
+            enrolled_credential: None,
+            credential_expires_at: None,
+            pairing_code: Some(pairing_code),
+            pairing_expires_at: Utc::now() + Duration::seconds(timeout_seconds.max(1) as i64),
+        }
+    }
+
+    fn accepts(&self, token: Option<&str>) -> bool {
+        let Some(token) = token else { return false };
+        if token == self.bootstrap_token {
+            return true;
+        }
+        self.enrolled_credential.as_deref() == Some(token)
+            && self
+                .credential_expires_at
+                .is_some_and(|expires_at| Utc::now() <= expires_at)
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -82,13 +136,28 @@ fn collect_once(args: Args, json: bool) -> Result<()> {
 
 async fn serve(args: Args) -> Result<()> {
     let token = resolve_agent_token(&args.token);
+    let auth = Arc::new(Mutex::new(AgentAuth::new(
+        token,
+        args.pairing_code.clone(),
+        args.pairing_timeout_seconds,
+    )));
+    let pairing_code = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .pairing_code
+        .clone()
+        .unwrap_or_default();
+    eprintln!(
+        "AMCP Agent pairing code (expires in {}s): {pairing_code}",
+        args.pairing_timeout_seconds
+    );
     if let Some(bind) = args.tcp_bind.clone() {
-        return serve_tls(args, bind, token).await;
+        return serve_tls(args, bind, auth).await;
     }
-    serve_unix(args, token).await
+    serve_unix(args, auth).await
 }
 
-async fn serve_unix(args: Args, token: String) -> Result<()> {
+async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
     if let Some(parent) = args.socket.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -105,18 +174,21 @@ async fn serve_unix(args: Args, token: String) -> Result<()> {
             .accept()
             .await
             .context("accept Controller connection")?;
-        let token = token.clone();
+        let auth = auth.clone();
         let codex_home = args.codex_home.clone();
         let backup_dir = default_backup_dir();
+        let state_dir = default_state_dir();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, token, codex_home, backup_dir).await {
+            if let Err(error) =
+                handle_connection(stream, auth, codex_home, backup_dir, state_dir).await
+            {
                 eprintln!("AMCP Agent connection error: {error:#}");
             }
         });
     }
 }
 
-async fn serve_tls(args: Args, bind: String, token: String) -> Result<()> {
+async fn serve_tls(args: Args, bind: String, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
     let cert_path = args
         .tls_cert
         .as_deref()
@@ -134,14 +206,15 @@ async fn serve_tls(args: Args, bind: String, token: String) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        let token = token.clone();
+        let auth = auth.clone();
         let codex_home = args.codex_home.clone();
         let backup_dir = default_backup_dir();
+        let state_dir = default_state_dir();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(stream) => {
                     if let Err(error) =
-                        handle_connection(stream, token, codex_home, backup_dir).await
+                        handle_connection(stream, auth, codex_home, backup_dir, state_dir).await
                     {
                         eprintln!("AMCP Agent TLS connection error from {peer}: {error:#}");
                     }
@@ -154,9 +227,10 @@ async fn serve_tls(args: Args, bind: String, token: String) -> Result<()> {
 
 async fn handle_connection<S>(
     stream: S,
-    token: String,
+    auth: Arc<Mutex<AgentAuth>>,
     codex_home: Option<PathBuf>,
     backup_dir: PathBuf,
+    state_dir: PathBuf,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -179,7 +253,7 @@ where
                 continue;
             }
         };
-        let response = process_request(request, &token, codex_home.clone(), &backup_dir);
+        let response = process_request(request, &auth, codex_home.clone(), &backup_dir, &state_dir);
         let should_close = matches!(&response.result, Ok(ResponsePayload::ShutdownAck));
         write_response(&mut writer, response).await?;
         if should_close {
@@ -191,17 +265,29 @@ where
 
 fn process_request(
     request: RequestEnvelope,
-    expected_token: &str,
+    auth: &Arc<Mutex<AgentAuth>>,
     codex_home: Option<PathBuf>,
     backup_dir: &PathBuf,
+    state_dir: &Path,
 ) -> ResponseEnvelope {
     let request_id = request.request_id.clone();
+    let request_token = request.token.clone();
+    let is_enroll = matches!(&request.method, RequestMethod::Enroll { .. });
+    let authenticated = {
+        let guard = auth.lock().expect("Agent auth mutex");
+        if is_enroll {
+            guard.pairing_code.as_deref() == request.pairing_code.as_deref()
+                && Utc::now() <= guard.pairing_expires_at
+        } else {
+            guard.accepts(request.token.as_deref())
+        }
+    };
     let response = if request.protocol_version != PROTOCOL_VERSION {
         Err(ProtocolError::new(
             "protocol_version_mismatch",
             "unsupported protocol version",
         ))
-    } else if request.token.as_deref() != Some(expected_token) {
+    } else if !authenticated {
         Err(ProtocolError::new("unauthorized", "invalid Agent token"))
     } else {
         match request.method {
@@ -209,6 +295,26 @@ fn process_request(
                 agent_id: host_identity().host_id,
                 host: host_identity(),
             }),
+            RequestMethod::Enroll { .. } => {
+                let mut guard = auth.lock().expect("Agent auth mutex");
+                let credential = new_id("agent-credential");
+                let expires_at = Utc::now() + Duration::days(365);
+                guard.enrolled_credential = Some(credential.clone());
+                guard.credential_expires_at = Some(expires_at);
+                guard.pairing_code = None;
+                match persist_enrolled_credential(&credential) {
+                    Ok(()) => Ok(ResponsePayload::Enrolled {
+                        agent_id: host_identity().host_id,
+                        host: host_identity(),
+                        credential,
+                        expires_at: expires_at.to_rfc3339(),
+                    }),
+                    Err(error) => Err(ProtocolError::new(
+                        "credential_store_failed",
+                        error.to_string(),
+                    )),
+                }
+            }
             RequestMethod::Heartbeat => Ok(ResponsePayload::Heartbeat {
                 healthy: true,
                 host_id: host_identity().host_id,
@@ -249,8 +355,14 @@ fn process_request(
                     .get(provider_id)
                     .and_then(|provider| provider.discover(host_identity()))
                 {
-                    Ok(batch) => Ok(ResponsePayload::Collection(batch)),
-                    Err(error) => Err(ProtocolError::new("collection_failed", error.to_string())),
+                    Ok(batch) => {
+                        let _ = save_collection_cache(state_dir, provider_id, &batch);
+                        Ok(ResponsePayload::Collection(batch))
+                    }
+                    Err(error) => match load_collection_cache(state_dir, provider_id) {
+                        Ok(Some(batch)) => Ok(ResponsePayload::Collection(batch)),
+                        _ => Err(ProtocolError::new("collection_failed", error.to_string())),
+                    },
                 }
             }
             RequestMethod::ReadArtifact {
@@ -299,7 +411,7 @@ fn process_request(
                         )),
                     };
                 }
-                if !approval.is_valid(expected_token, Utc::now())
+                if !approval.is_valid(request_token.as_deref().unwrap_or_default(), Utc::now())
                     || approval.change_set_id != change_set.change_set_id
                     || approval.operations_hash != change_set_operations_hash(&change_set)
                 {
@@ -334,7 +446,7 @@ fn process_request(
                         )),
                     };
                 }
-                if !approval.is_valid(expected_token, Utc::now())
+                if !approval.is_valid(request_token.as_deref().unwrap_or_default(), Utc::now())
                     || approval.change_set_id != change_set.change_set_id
                     || approval.operations_hash != change_set_operations_hash(&change_set)
                 {
@@ -409,6 +521,112 @@ fn resolve_agent_token(token: &str) -> String {
         .unwrap_or_else(|| token.to_owned())
 }
 
+fn persist_enrolled_credential(credential: &str) -> Result<()> {
+    #[cfg(not(test))]
+    {
+        MacOsKeychain::new(keychain_account_for_host(&host_identity().host_id)).set(credential)?;
+    }
+    #[cfg(test)]
+    {
+        let _ = credential;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_code_enrolls_credential_and_allows_registered_session() {
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "bootstrap".into(),
+            Some("12345678".into()),
+            300,
+        )));
+        let enroll = RequestEnvelope::new(
+            RequestMethod::Enroll {
+                controller_id: "controller-test".into(),
+            },
+            None,
+        )
+        .with_pairing_code("12345678");
+        let response = process_request(
+            enroll,
+            &auth,
+            None,
+            &PathBuf::from("/tmp"),
+            Path::new("/tmp"),
+        );
+        let credential = match response.result.expect("enrollment should succeed") {
+            ResponsePayload::Enrolled { credential, .. } => credential,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let registered = RequestEnvelope::new(
+            RequestMethod::Register {
+                controller_id: "controller-test".into(),
+            },
+            Some(credential),
+        );
+        let response = process_request(
+            registered,
+            &auth,
+            None,
+            &PathBuf::from("/tmp"),
+            Path::new("/tmp"),
+        );
+        assert!(matches!(
+            response.result,
+            Ok(ResponsePayload::Registered { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_pairing_code_is_rejected() {
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "bootstrap".into(),
+            Some("12345678".into()),
+            300,
+        )));
+        let request = RequestEnvelope::new(
+            RequestMethod::Enroll {
+                controller_id: "controller-test".into(),
+            },
+            None,
+        )
+        .with_pairing_code("wrong");
+        let response = process_request(
+            request,
+            &auth,
+            None,
+            &PathBuf::from("/tmp"),
+            Path::new("/tmp"),
+        );
+        assert_eq!(response.result.unwrap_err().code, "unauthorized");
+    }
+
+    #[test]
+    fn redacted_collection_cache_round_trips() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let host = host_identity();
+        let batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host)
+        .expect("fixture collection");
+        save_collection_cache(directory.path(), "codex", &batch).expect("save cache");
+        let restored = load_collection_cache(directory.path(), "codex")
+            .expect("load cache")
+            .expect("cached batch");
+        assert_eq!(restored.artifacts.len(), batch.artifacts.len());
+        assert!(restored.artifacts.iter().all(|artifact| {
+            !artifact
+                .content
+                .contains("fixture-secret-must-not-be-indexed")
+        }));
+    }
+}
+
 fn default_backup_dir() -> PathBuf {
     env::var_os("AMCP_AGENT_BACKUP_DIR")
         .map(PathBuf::from)
@@ -418,6 +636,46 @@ fn default_backup_dir() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from(".amcp/agent-backups"))
+}
+
+fn default_state_dir() -> PathBuf {
+    env::var_os("AMCP_AGENT_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home).join("Library/Application Support/AMCP/agent-state")
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from(".amcp/agent-state"))
+}
+
+fn collection_cache_path(state_dir: &Path, provider_id: &str) -> PathBuf {
+    state_dir.join(format!("collection-{provider_id}.json"))
+}
+
+fn save_collection_cache(
+    state_dir: &Path,
+    provider_id: &str,
+    batch: &amcp_domain::CollectionBatch,
+) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = collection_cache_path(state_dir, provider_id);
+    let temporary = path.with_extension(format!("{}.tmp", new_id("cache")));
+    std::fs::write(&temporary, serde_json::to_vec(batch)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_collection_cache(
+    state_dir: &Path,
+    provider_id: &str,
+) -> Result<Option<amcp_domain::CollectionBatch>> {
+    let path = collection_cache_path(state_dir, provider_id);
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn load_server_config(

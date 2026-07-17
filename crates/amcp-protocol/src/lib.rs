@@ -15,6 +15,8 @@ pub struct RequestEnvelope {
     pub host_id: Option<String>,
     pub deadline_ms: Option<u64>,
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub pairing_code: Option<String>,
     pub method: RequestMethod,
     pub token: Option<String>,
 }
@@ -23,6 +25,9 @@ pub struct RequestEnvelope {
 #[serde(tag = "method", content = "params")]
 pub enum RequestMethod {
     Register {
+        controller_id: String,
+    },
+    Enroll {
         controller_id: String,
     },
     Heartbeat,
@@ -62,6 +67,12 @@ pub enum ResponsePayload {
     Registered {
         agent_id: String,
         host: HostIdentity,
+    },
+    Enrolled {
+        agent_id: String,
+        host: HostIdentity,
+        credential: String,
+        expires_at: String,
     },
     Heartbeat {
         healthy: bool,
@@ -105,9 +116,15 @@ impl RequestEnvelope {
             host_id: None,
             deadline_ms: None,
             idempotency_key: None,
+            pairing_code: None,
             method,
             token,
         }
+    }
+
+    pub fn with_pairing_code(mut self, pairing_code: impl Into<String>) -> Self {
+        self.pairing_code = Some(pairing_code.into());
+        self
     }
 }
 
@@ -129,5 +146,21 @@ mod tests {
             serde_json::from_str(&encoded).expect("request should deserialize");
         assert!(matches!(decoded.method, RequestMethod::Collect { .. }));
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn enrollment_request_round_trip_preserves_pairing_code() {
+        let request = RequestEnvelope::new(
+            RequestMethod::Enroll {
+                controller_id: "controller".into(),
+            },
+            None,
+        )
+        .with_pairing_code("12345678");
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode"))
+                .expect("decode");
+        assert_eq!(decoded.pairing_code.as_deref(), Some("12345678"));
+        assert!(matches!(decoded.method, RequestMethod::Enroll { .. }));
     }
 }

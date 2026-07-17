@@ -218,6 +218,40 @@ enum CommandKind {
         #[arg(long, env = "AMCP_AGENT_TOKEN")]
         token: String,
     },
+    Enroll {
+        #[arg(
+            long,
+            default_value = "/tmp/amcp-agent.sock",
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(long)]
+        pairing_code: String,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        bootstrap_token: String,
+        #[arg(long, default_value = "amcp-controller-local")]
+        controller_id: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -380,6 +414,36 @@ async fn main() -> Result<()> {
         CommandKind::KeychainStore { host_id, token } => {
             store_keychain_credential(&host_id, &token)
         }
+        CommandKind::Enroll {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            pairing_code,
+            bootstrap_token,
+            controller_id,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            json,
+        } => {
+            enroll(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                pairing_code,
+                bootstrap_token,
+                controller_id,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -536,6 +600,114 @@ async fn watch(
             _ = sleep(StdDuration::from_secs(interval_seconds.max(1))) => {}
         }
     }
+}
+
+async fn enroll(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    pairing_code: String,
+    bootstrap_token: String,
+    controller_id: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    json: bool,
+) -> Result<()> {
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).context("create Controller data directory")?;
+    }
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(
+            start_enrollment_agent(
+                &socket,
+                &bootstrap_token,
+                &pairing_code,
+                codex_home.as_ref(),
+                agent_bin,
+            )
+            .await?,
+        )
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await
+        .context("connect to Agent for enrollment")?;
+        let mut client = AgentClient::new(stream);
+        let enrolled = match client
+            .request_with_auth(
+                RequestMethod::Enroll { controller_id },
+                None,
+                Some(&pairing_code),
+            )
+            .await?
+        {
+            ResponsePayload::Enrolled {
+                host,
+                credential,
+                expires_at,
+                ..
+            } => (host, credential, expires_at),
+            other => bail!("Agent returned unexpected enrollment response: {other:?}"),
+        };
+        let (host, credential, expires_at) = enrolled;
+        let (agent_version, capabilities) = match client
+            .request(RequestMethod::Capabilities, &credential)
+            .await?
+        {
+            ResponsePayload::Capabilities {
+                agent_version,
+                capabilities,
+                ..
+            } => (agent_version, capabilities),
+            other => bail!("Agent returned unexpected capabilities response: {other:?}"),
+        };
+        match client
+            .request(RequestMethod::Heartbeat, &credential)
+            .await?
+        {
+            ResponsePayload::Heartbeat { healthy: true, .. } => {}
+            other => bail!("Agent returned unexpected heartbeat response: {other:?}"),
+        }
+        MacOsKeychain::new(keychain_account_for_host(&host.host_id)).set(&credential)?;
+        let endpoint = agent_url
+            .clone()
+            .unwrap_or_else(|| format!("unix://{}", socket.display()));
+        let mut catalog = Catalog::open(&db)?;
+        catalog.register_connection(&host, Some(&endpoint), Some(&agent_version), &capabilities)?;
+        let _ = client.request(RequestMethod::Shutdown, &credential).await;
+        Ok::<_, anyhow::Error>((host, expires_at))
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let (host, expires_at) = result?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "host_id": host.host_id,
+                "display_name": host.display_name,
+                "credential_stored": true,
+                "expires_at": expires_at,
+            })
+        );
+    } else {
+        println!("Enrolled host {} ({})", host.host_id, host.display_name);
+        println!("Credential stored in the macOS Keychain; expires at {expires_at}");
+    }
+    Ok(())
 }
 
 fn search(db: PathBuf, query: String, limit: usize) -> Result<()> {
@@ -901,6 +1073,32 @@ async fn start_agent(
     Ok(command.spawn().context("start AMCP Agent")?)
 }
 
+async fn start_enrollment_agent(
+    socket: &PathBuf,
+    token: &str,
+    pairing_code: &str,
+    codex_home: Option<&PathBuf>,
+    agent_bin: Option<PathBuf>,
+) -> Result<Child> {
+    let executable = agent_bin.unwrap_or_else(default_agent_binary);
+    let mut command = Command::new(executable);
+    command
+        .arg("--socket")
+        .arg(socket)
+        .arg("--token")
+        .arg(token)
+        .arg("--pairing-code")
+        .arg(pairing_code);
+    if let Some(codex_home) = codex_home {
+        command.arg("--codex-home").arg(codex_home);
+    }
+    command
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    Ok(command.spawn().context("start AMCP Agent for enrollment")?)
+}
+
 trait AgentStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> AgentStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -980,7 +1178,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
     }
 
     async fn request(&mut self, method: RequestMethod, token: &str) -> Result<ResponsePayload> {
-        let request = RequestEnvelope::new(method, Some(token.to_owned()));
+        self.request_with_auth(method, Some(token), None).await
+    }
+
+    async fn request_with_auth(
+        &mut self,
+        method: RequestMethod,
+        token: Option<&str>,
+        pairing_code: Option<&str>,
+    ) -> Result<ResponsePayload> {
+        let request = RequestEnvelope::new(method, token.map(str::to_owned));
+        let request = if let Some(code) = pairing_code {
+            request.with_pairing_code(code)
+        } else {
+            request
+        };
         let request_id = request.request_id.clone();
         let encoded = serde_json::to_string(&request)?;
         self.writer.write_all(encoded.as_bytes()).await?;

@@ -80,6 +80,19 @@ On macOS, the development/default token can be replaced by a host-scoped Keychai
 
 When the default token is used, Controller and Agent first look up `agent:<host_id>` (or `AMCP_AGENT_KEYCHAIN_ACCOUNT`) and fall back to the development token only when no Keychain entry exists.
 
+For first-time pairing, start a remote Agent with its displayed short-lived code and run:
+
+```bash
+./target/debug/amcp-controller enroll \
+  --agent-url tcp://mac-2.example:45432 \
+  --tls-ca /path/to/agent-ca.crt \
+  --tls-server-name mac-2.example \
+  --pairing-code 12345678 \
+  --json
+```
+
+Enrollment rotates the Agent credential, stores it in the macOS Keychain, and records the host/capabilities in the central catalog.
+
 Run the desktop shell from `apps/amcp-desktop` with `npm install` followed by `npm run tauri dev`. The bundled UI reads the same central catalog used by the CLI and MCP gateway.
 
 See [PLAN-IMPLEMENTACJI.md](PLAN-IMPLEMENTACJI.md) for the full implementation roadmap.
