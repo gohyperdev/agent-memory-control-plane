@@ -1,15 +1,29 @@
-use amcp_domain::Scope;
+use amcp_domain::{
+    ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
+    change_set_operations_hash, new_id,
+};
 use amcp_protocol::{RequestEnvelope, RequestMethod, ResponseEnvelope, ResponsePayload};
 use amcp_storage::Catalog;
 use anyhow::{Context, Result, bail};
+use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use std::{env, path::PathBuf, process::Stdio, time::Duration};
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use std::{
+    env,
+    fs::File,
+    io::BufReader as StdBufReader,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
+    net::{TcpStream, UnixStream},
     process::{Child, Command},
     time::sleep,
 };
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug, Parser)]
 #[command(name = "amcp-controller", about = "AMCP Collector/Controller")]
@@ -27,6 +41,12 @@ enum CommandKind {
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
         #[arg(
             long,
             default_value = "amcp-development-token",
@@ -53,6 +73,120 @@ enum CommandKind {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    ProposeChange {
+        #[arg(
+            long,
+            default_value = "/tmp/amcp-agent.sock",
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        replacement_file: PathBuf,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        host_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    ApproveChange {
+        #[arg(
+            long,
+            default_value = "/tmp/amcp-agent.sock",
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long)]
+        change_set_id: String,
+        #[arg(long, default_value = "human")]
+        approved_by: String,
+        #[arg(long, default_value_t = 10)]
+        expires_minutes: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    RollbackChange {
+        #[arg(
+            long,
+            default_value = "/tmp/amcp-agent.sock",
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long)]
+        change_set_id: String,
+        #[arg(long, default_value = "human")]
+        approved_by: String,
+        #[arg(long, default_value_t = 10)]
+        expires_minutes: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    Hosts {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -60,6 +194,9 @@ async fn main() -> Result<()> {
     match Args::parse().command {
         CommandKind::RunOnce {
             socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
             token,
             codex_home,
             db,
@@ -70,6 +207,9 @@ async fn main() -> Result<()> {
         } => {
             run_once(
                 socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
                 token,
                 codex_home,
                 db.unwrap_or_else(default_db_path),
@@ -83,11 +223,113 @@ async fn main() -> Result<()> {
         CommandKind::Search { query, db, limit } => {
             search(db.unwrap_or_else(default_db_path), query, limit)
         }
+        CommandKind::ProposeChange {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            source,
+            replacement_file,
+            reason,
+            host_id,
+            json,
+        } => {
+            propose_change(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                source,
+                replacement_file,
+                reason,
+                host_id.unwrap_or_else(host_id_from_env),
+                json,
+            )
+            .await
+        }
+        CommandKind::ApproveChange {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            change_set_id,
+            approved_by,
+            expires_minutes,
+            json,
+        } => {
+            approve_change(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                change_set_id,
+                approved_by,
+                expires_minutes,
+                json,
+            )
+            .await
+        }
+        CommandKind::RollbackChange {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            change_set_id,
+            approved_by,
+            expires_minutes,
+            json,
+        } => {
+            rollback_change(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                change_set_id,
+                approved_by,
+                expires_minutes,
+                json,
+            )
+            .await
+        }
+        CommandKind::Hosts { db } => list_hosts(db.unwrap_or_else(default_db_path)),
     }
 }
 
 async fn run_once(
     socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
     token: String,
     codex_home: Option<PathBuf>,
     db: PathBuf,
@@ -99,27 +341,30 @@ async fn run_once(
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent).context("create Controller data directory")?;
     }
-    let mut child = if no_start_agent {
+    let mut child = if no_start_agent || agent_url.is_some() {
         None
     } else {
         Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
     };
-    let stream = connect_with_retry(&socket)
-        .await
-        .context("connect to AMCP Agent")?;
+    let stream = connect_with_retry(
+        &socket,
+        agent_url.as_deref(),
+        tls_ca.as_deref(),
+        tls_server_name.as_deref(),
+    )
+    .await
+    .context("connect to AMCP Agent")?;
     let mut client = AgentClient::new(stream);
-    client
-        .request(
-            RequestMethod::Register {
-                controller_id: "amcp-controller-local".into(),
-            },
-            &token,
-        )
-        .await?;
+    let (registered_host, agent_version, capabilities) =
+        register_and_refresh(&mut client, &token).await?;
     let batch = match client
         .request(
             RequestMethod::Collect {
-                scope: Some(Scope::host(host_id_from_env())),
+                scope: if agent_url.is_some() {
+                    None
+                } else {
+                    Some(Scope::host(host_id_from_env()))
+                },
                 cursor: None,
             },
             &token,
@@ -131,6 +376,15 @@ async fn run_once(
     };
 
     let mut catalog = Catalog::open(&db)?;
+    let endpoint = agent_url
+        .clone()
+        .unwrap_or_else(|| format!("unix://{}", socket.display()));
+    catalog.register_connection(
+        &registered_host,
+        Some(&endpoint),
+        Some(&agent_version),
+        &capabilities,
+    )?;
     let inserted = catalog.ingest(&batch)?;
     let search_results = query
         .as_deref()
@@ -182,6 +436,329 @@ fn search(db: PathBuf, query: String, limit: usize) -> Result<()> {
     Ok(())
 }
 
+async fn propose_change(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    source: PathBuf,
+    replacement_file: PathBuf,
+    reason: String,
+    host_id: String,
+    json: bool,
+) -> Result<()> {
+    let replacement_content = std::fs::read_to_string(&replacement_file)
+        .with_context(|| format!("read replacement file {}", replacement_file.display()))?;
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await?;
+        let mut client = AgentClient::new(stream);
+        let (registered_host, agent_version, capabilities) =
+            register_and_refresh(&mut client, &token).await?;
+        let target_path = source
+            .canonicalize()
+            .unwrap_or(source)
+            .to_string_lossy()
+            .into_owned();
+        let request = ChangeRequest {
+            actor: "human-or-controller".into(),
+            scope: Scope::host(host_id.clone()),
+            target: ArtifactRef {
+                host_id,
+                provider_id: "codex".into(),
+                native_id: target_path.clone(),
+                source_reference: target_path,
+            },
+            expected_source_hash: None,
+            operation: amcp_domain::ChangeOperationKind::ReplaceText,
+            replacement_content: Some(replacement_content),
+            reason,
+            evidence_ids: Vec::new(),
+        };
+        let change_set = match client
+            .request(RequestMethod::ProposeChange { request }, &token)
+            .await?
+        {
+            ResponsePayload::ChangeSet(change_set) => change_set,
+            other => bail!("Agent returned unexpected proposal response: {other:?}"),
+        };
+        let mut catalog = Catalog::open(&db)?;
+        let endpoint = agent_url
+            .clone()
+            .unwrap_or_else(|| format!("unix://{}", socket.display()));
+        catalog.register_connection(
+            &registered_host,
+            Some(&endpoint),
+            Some(&agent_version),
+            &capabilities,
+        )?;
+        catalog.save_change_set(&change_set)?;
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        Ok::<_, anyhow::Error>(change_set)
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let change_set = result?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&change_set)?);
+    } else {
+        println!(
+            "Proposed {} with {} operation(s): {}",
+            change_set.change_set_id,
+            change_set.operations.len(),
+            change_set.reason
+        );
+        for operation in &change_set.operations {
+            println!("{}", operation.diff);
+        }
+    }
+    Ok(())
+}
+
+async fn approve_change(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    change_set_id: String,
+    approved_by: String,
+    expires_minutes: i64,
+    json: bool,
+) -> Result<()> {
+    let mut catalog = Catalog::open(&db)?;
+    let mut change_set = catalog
+        .load_change_set(&change_set_id)?
+        .with_context(|| format!("change set not found: {change_set_id}"))?;
+    let now = Utc::now();
+    let approval = ApprovalEnvelope::issue(
+        &token,
+        change_set.change_set_id.clone(),
+        approved_by.clone(),
+        now,
+        now + Duration::minutes(expires_minutes.max(1)),
+        new_id("idempotency"),
+        change_set_operations_hash(&change_set),
+    );
+    change_set.status = ChangeStatus::Approved;
+    change_set.updated_at = now;
+    catalog.save_change_set(&change_set)?;
+
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await?;
+        let mut client = AgentClient::new(stream);
+        register_and_refresh(&mut client, &token).await?;
+        let receipt = match client
+            .request(
+                RequestMethod::ApplyChange {
+                    change_set: change_set.clone(),
+                    approval,
+                },
+                &token,
+            )
+            .await?
+        {
+            ResponsePayload::ChangeReceipt(receipt) => receipt,
+            other => bail!("Agent returned unexpected apply response: {other:?}"),
+        };
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        Ok::<_, anyhow::Error>(receipt)
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            change_set.status = ChangeStatus::Failed;
+            change_set.updated_at = Utc::now();
+            catalog.save_change_set(&change_set)?;
+            return Err(error);
+        }
+    };
+    change_set.status = receipt.status.clone();
+    change_set.updated_at = receipt.applied_at;
+    catalog.save_change_set(&change_set)?;
+    catalog.record_audit(&AuditEvent {
+        audit_event_id: new_id("audit"),
+        actor: approved_by,
+        operation: "change.apply".into(),
+        target: change_set
+            .operations
+            .first()
+            .map(|operation| operation.target.source_reference.clone())
+            .unwrap_or_else(|| change_set.change_set_id.clone()),
+        host_id: change_set.scope.host_id.clone(),
+        provider_id: Some(change_set.provider_id.clone()),
+        before_hash: receipt.before_hashes.first().cloned(),
+        after_hash: receipt.after_hashes.first().cloned(),
+        result: format!("{:?}: {}", receipt.status, receipt.message),
+        correlation_id: new_id("correlation"),
+        timestamp: receipt.applied_at,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!("{:?}: {}", receipt.status, receipt.message);
+        for backup in receipt.backup_references {
+            println!("backup: {backup}");
+        }
+    }
+    Ok(())
+}
+
+async fn rollback_change(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    change_set_id: String,
+    approved_by: String,
+    expires_minutes: i64,
+    json: bool,
+) -> Result<()> {
+    let mut catalog = Catalog::open(&db)?;
+    let mut change_set = catalog
+        .load_change_set(&change_set_id)?
+        .with_context(|| format!("change set not found: {change_set_id}"))?;
+    let now = Utc::now();
+    let approval = ApprovalEnvelope::issue(
+        &token,
+        change_set.change_set_id.clone(),
+        approved_by.clone(),
+        now,
+        now + Duration::minutes(expires_minutes.max(1)),
+        new_id("idempotency"),
+        change_set_operations_hash(&change_set),
+    );
+    change_set.status = ChangeStatus::Approved;
+    change_set.updated_at = now;
+    catalog.save_change_set(&change_set)?;
+
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await?;
+        let mut client = AgentClient::new(stream);
+        register_and_refresh(&mut client, &token).await?;
+        let receipt = match client
+            .request(
+                RequestMethod::Rollback {
+                    change_set: change_set.clone(),
+                    approval,
+                },
+                &token,
+            )
+            .await?
+        {
+            ResponsePayload::ChangeReceipt(receipt) => receipt,
+            other => bail!("Agent returned unexpected rollback response: {other:?}"),
+        };
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        Ok::<_, anyhow::Error>(receipt)
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            change_set.status = ChangeStatus::Failed;
+            change_set.updated_at = Utc::now();
+            catalog.save_change_set(&change_set)?;
+            return Err(error);
+        }
+    };
+    change_set.status = receipt.status.clone();
+    change_set.updated_at = receipt.applied_at;
+    catalog.save_change_set(&change_set)?;
+    catalog.record_audit(&AuditEvent {
+        audit_event_id: new_id("audit"),
+        actor: approved_by,
+        operation: "change.rollback".into(),
+        target: change_set
+            .operations
+            .first()
+            .map(|operation| operation.target.source_reference.clone())
+            .unwrap_or_else(|| change_set.change_set_id.clone()),
+        host_id: change_set.scope.host_id.clone(),
+        provider_id: Some(change_set.provider_id.clone()),
+        before_hash: receipt.before_hashes.first().cloned(),
+        after_hash: receipt.after_hashes.first().cloned(),
+        result: format!("{:?}: {}", receipt.status, receipt.message),
+        correlation_id: new_id("correlation"),
+        timestamp: receipt.applied_at,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!("{:?}: {}", receipt.status, receipt.message);
+    }
+    Ok(())
+}
+
+fn list_hosts(db: PathBuf) -> Result<()> {
+    let catalog = Catalog::open(&db)?;
+    for host in catalog.list_hosts()? {
+        println!(
+            "{}\t{}\t{:?}\t{}",
+            host.identity.host_id, host.identity.platform, host.status, host.identity.hostname
+        );
+    }
+    Ok(())
+}
+
 async fn start_agent(
     socket: &PathBuf,
     token: &str,
@@ -205,11 +782,48 @@ async fn start_agent(
     Ok(command.spawn().context("start AMCP Agent")?)
 }
 
-async fn connect_with_retry(socket: &PathBuf) -> Result<UnixStream> {
+trait AgentStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AgentStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type DynAgentStream = Box<dyn AgentStream>;
+
+async fn connect_with_retry(
+    socket: &Path,
+    agent_url: Option<&str>,
+    tls_ca: Option<&Path>,
+    tls_server_name: Option<&str>,
+) -> Result<DynAgentStream> {
+    if let Some(agent_url) = agent_url {
+        let address = agent_url
+            .strip_prefix("tcp://")
+            .context("Agent URL must use tcp://")?;
+        let connector =
+            load_tls_connector(tls_ca.context("--tls-ca is required for remote Agents")?)?;
+        let default_server_name = address
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(address);
+        let server_name = tls_server_name.unwrap_or(default_server_name).to_owned();
+        for _ in 0..40 {
+            match TcpStream::connect(address).await {
+                Ok(stream) => {
+                    let name = ServerName::try_from(server_name.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid TLS server name: {server_name}"))?;
+                    match connector.connect(name, stream).await {
+                        Ok(stream) => return Ok(Box::new(stream)),
+                        Err(_) => sleep(StdDuration::from_millis(100)).await,
+                    }
+                }
+                Err(_) => sleep(StdDuration::from_millis(100)).await,
+            }
+        }
+        bail!("remote Agent did not become available: {agent_url}")
+    }
     for _ in 0..40 {
         match UnixStream::connect(socket).await {
-            Ok(stream) => return Ok(stream),
-            Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(stream) => return Ok(Box::new(stream)),
+            Err(_) => sleep(StdDuration::from_millis(100)).await,
         }
     }
     bail!(
@@ -218,14 +832,28 @@ async fn connect_with_retry(socket: &PathBuf) -> Result<UnixStream> {
     )
 }
 
-struct AgentClient {
-    reader: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+fn load_tls_connector(ca_path: &Path) -> Result<TlsConnector> {
+    let mut reader = StdBufReader::new(File::open(ca_path)?);
+    let certificates =
+        rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots.add(certificate)?;
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
-impl AgentClient {
-    fn new(stream: UnixStream) -> Self {
-        let (reader, writer) = stream.into_split();
+struct AgentClient<S: AsyncRead + AsyncWrite + Unpin> {
+    reader: tokio::io::Lines<BufReader<ReadHalf<S>>>,
+    writer: WriteHalf<S>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
+    fn new(stream: S) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
         Self {
             reader: BufReader::new(reader).lines(),
             writer,
@@ -252,6 +880,44 @@ impl AgentClient {
             .result
             .map_err(|error| anyhow::anyhow!("Agent {}: {}", error.code, error.message))
     }
+}
+
+async fn register_and_refresh<S>(
+    client: &mut AgentClient<S>,
+    token: &str,
+) -> Result<(HostIdentity, String, Vec<String>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let host = match client
+        .request(
+            RequestMethod::Register {
+                controller_id: "amcp-controller-local".into(),
+            },
+            token,
+        )
+        .await?
+    {
+        ResponsePayload::Registered { host, .. } => host,
+        other => bail!("Agent returned unexpected register response: {other:?}"),
+    };
+    let (agent_version, capabilities) =
+        match client.request(RequestMethod::Capabilities, token).await? {
+            ResponsePayload::Capabilities {
+                agent_version,
+                capabilities,
+                ..
+            } => (agent_version, capabilities),
+            other => bail!("Agent returned unexpected capabilities response: {other:?}"),
+        };
+    match client.request(RequestMethod::Heartbeat, token).await? {
+        ResponsePayload::Heartbeat { healthy: true, .. } => {}
+        ResponsePayload::Heartbeat { healthy: false, .. } => {
+            bail!("Agent heartbeat reported an unhealthy host")
+        }
+        other => bail!("Agent returned unexpected heartbeat response: {other:?}"),
+    }
+    Ok((host, agent_version, capabilities))
 }
 
 fn default_db_path() -> PathBuf {

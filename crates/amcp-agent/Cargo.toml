@@ -8,8 +8,13 @@ authors.workspace = true
 [dependencies]
 amcp-codex = { path = "../amcp-codex" }
 amcp-domain = { path = "../amcp-domain" }
+amcp-provider-api = { path = "../amcp-provider-api" }
 amcp-protocol = { path = "../amcp-protocol" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true

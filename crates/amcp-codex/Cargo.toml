@@ -7,8 +7,13 @@ authors.workspace = true
 
 [dependencies]
 amcp-domain = { path = "../amcp-domain" }
+amcp-provider-api = { path = "../amcp-provider-api" }
+anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true
 regex.workspace = true
 sha2.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"

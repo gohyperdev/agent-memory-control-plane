@@ -29,6 +29,34 @@ cargo run -p amcp-controller -- run-once \
   --json
 ```
 
-The first slice is read-only and does not read credentials or apply file changes. Session and memory files are currently collected as metadata-only evidence; configuration and instruction files are redacted before persistence.
+Discovery remains read-only and does not read credentials. Session and memory files are currently collected as metadata-only evidence; configuration and instruction files are redacted before persistence. A separate, explicit change workflow supports proposal, human approval, atomic apply, backup, conflict detection, and rollback for safe Codex text documents.
+
+## Current implementation surface
+
+- `amcp-agent` is a provider-registry based local process. Codex is the first adapter; the Agent can also expose an opt-in TLS TCP listener for a remote host.
+- `amcp-controller` supports local Unix IPC and `tcp://` Agent endpoints with a user-supplied CA, central host connection records, collection, FTS search, change proposal, approval, atomic apply, and rollback.
+- `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host listing, change review, and verified change-proposal tools. It never applies a change.
+- `amcp-app-server` supervises the documented Codex app-server stdio protocol and supports initialization, thread/turn start, streamed notifications, and interruption.
+- `apps/amcp-desktop` is the Tauri 2 + React desktop shell. It renders host/index/approval status, search evidence, provenance, safe local sync, and the human approval action for proposed changes.
+
+Remote Agent example (TLS is required for TCP mode):
+
+```bash
+AMCP_HOST_ID=mac-2 ./target/debug/amcp-agent \
+  --tcp-bind 0.0.0.0:45432 \
+  --tls-cert /path/to/agent.crt \
+  --tls-key /path/to/agent.key \
+  --token "$AMCP_AGENT_TOKEN" serve
+
+./target/debug/amcp-controller run-once \
+  --agent-url tcp://mac-2.example:45432 \
+  --tls-ca /path/to/agent-ca.crt \
+  --tls-server-name mac-2.example \
+  --token "$AMCP_AGENT_TOKEN" \
+  --db "$HOME/Library/Application Support/AMCP/controller.sqlite" \
+  --json
+```
+
+Run the desktop shell from `apps/amcp-desktop` with `npm install` followed by `npm run tauri dev`. The bundled UI reads the same central catalog used by the CLI and MCP gateway.
 
 See [PLAN-IMPLEMENTACJI.md](PLAN-IMPLEMENTACJI.md) for the full implementation roadmap.

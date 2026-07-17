@@ -1,4 +1,7 @@
-use amcp_domain::{CollectionBatch, Scope};
+use amcp_domain::{
+    ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
+    CollectionBatch, HostIdentity, Scope,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -9,6 +12,9 @@ pub struct RequestEnvelope {
     pub protocol_version: u32,
     pub request_id: String,
     pub correlation_id: String,
+    pub host_id: Option<String>,
+    pub deadline_ms: Option<u64>,
+    pub idempotency_key: Option<String>,
     pub method: RequestMethod,
     pub token: Option<String>,
 }
@@ -25,6 +31,21 @@ pub enum RequestMethod {
         scope: Option<Scope>,
         cursor: Option<String>,
     },
+    ReadArtifact {
+        target: ArtifactRef,
+        redacted: bool,
+    },
+    ProposeChange {
+        request: ChangeRequest,
+    },
+    ApplyChange {
+        change_set: ChangeSet,
+        approval: ApprovalEnvelope,
+    },
+    Rollback {
+        change_set: ChangeSet,
+        approval: ApprovalEnvelope,
+    },
     Shutdown,
 }
 
@@ -40,15 +61,23 @@ pub struct ResponseEnvelope {
 pub enum ResponsePayload {
     Registered {
         agent_id: String,
+        host: HostIdentity,
     },
     Heartbeat {
         healthy: bool,
+        host_id: String,
+        timestamp: String,
     },
     Capabilities {
         platform: String,
         providers: Vec<String>,
+        capabilities: Vec<String>,
+        agent_version: String,
     },
     Collection(CollectionBatch),
+    Artifact(ArtifactRecord),
+    ChangeSet(ChangeSet),
+    ChangeReceipt(ChangeReceipt),
     ShutdownAck,
 }
 
@@ -73,6 +102,9 @@ impl RequestEnvelope {
             protocol_version: PROTOCOL_VERSION,
             request_id: Uuid::new_v4().to_string(),
             correlation_id: Uuid::new_v4().to_string(),
+            host_id: None,
+            deadline_ms: None,
+            idempotency_key: None,
             method,
             token,
         }

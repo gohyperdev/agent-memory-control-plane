@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub type HostId = String;
@@ -8,6 +10,10 @@ pub type ProjectId = String;
 pub type ArtifactId = String;
 pub type ObservationId = String;
 pub type EvidenceId = String;
+pub type ChangeSetId = String;
+pub type ChangeOperationId = String;
+pub type ApprovalId = String;
+pub type AuditEventId = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SensitivityClass {
@@ -54,6 +60,44 @@ pub enum LifecycleState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HostStatus {
+    Enrolling,
+    Connected,
+    Disconnected,
+    Suspended,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Proposed,
+    Approved,
+    Applying,
+    Applied,
+    Rejected,
+    Conflict,
+    Failed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeOperationKind {
+    ReplaceText,
+    CreateText,
+    DeleteFile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PolicyDecision {
+    AllowRead,
+    AllowRedactedRead,
+    AllowProposal,
+    RequireApproval,
+    Deny,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Scope {
     pub host_id: Option<HostId>,
     pub provider_id: Option<ProviderId>,
@@ -68,6 +112,173 @@ impl Scope {
             project_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub native_id: String,
+    pub source_reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostRecord {
+    pub identity: HostIdentity,
+    pub endpoint: Option<String>,
+    pub agent_version: Option<String>,
+    pub status: HostStatus,
+    pub capabilities: Vec<String>,
+    pub enrolled_at: DateTime<Utc>,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionCursor {
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub cursor: Option<String>,
+    pub collection_run_id: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyTombstone {
+    pub tombstone_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub native_id: String,
+    pub source_hash: Option<String>,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeRequest {
+    pub actor: String,
+    pub scope: Scope,
+    pub target: ArtifactRef,
+    pub expected_source_hash: Option<String>,
+    pub operation: ChangeOperationKind,
+    pub replacement_content: Option<String>,
+    pub reason: String,
+    pub evidence_ids: Vec<EvidenceId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeOperation {
+    pub operation_id: ChangeOperationId,
+    pub target: ArtifactRef,
+    pub operation: ChangeOperationKind,
+    pub expected_source_hash: Option<String>,
+    pub before_hash: Option<String>,
+    pub after_hash: Option<String>,
+    pub replacement_content: Option<String>,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeSet {
+    pub change_set_id: ChangeSetId,
+    pub actor: String,
+    pub scope: Scope,
+    pub provider_id: ProviderId,
+    pub reason: String,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub status: ChangeStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub operations: Vec<ChangeOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalEnvelope {
+    pub approval_id: ApprovalId,
+    pub change_set_id: ChangeSetId,
+    pub approved_by: String,
+    pub approved_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub idempotency_key: String,
+    pub operations_hash: String,
+    pub approval_token: String,
+}
+
+impl ApprovalEnvelope {
+    pub fn issue(
+        secret: &str,
+        change_set_id: impl Into<ChangeSetId>,
+        approved_by: impl Into<String>,
+        approved_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        idempotency_key: impl Into<String>,
+        operations_hash: impl Into<String>,
+    ) -> Self {
+        let envelope = Self {
+            approval_id: new_id("approval"),
+            change_set_id: change_set_id.into(),
+            approved_by: approved_by.into(),
+            approved_at,
+            expires_at,
+            idempotency_key: idempotency_key.into(),
+            operations_hash: operations_hash.into(),
+            approval_token: String::new(),
+        };
+        let approval_token = envelope.signature(secret);
+        Self {
+            approval_token,
+            ..envelope
+        }
+    }
+
+    pub fn is_valid(&self, secret: &str, now: DateTime<Utc>) -> bool {
+        !self.approved_by.trim().is_empty()
+            && now >= self.approved_at
+            && now <= self.expires_at
+            && self.approval_token == self.signature(secret)
+    }
+
+    fn signature(&self, secret: &str) -> String {
+        let payload = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.approval_id,
+            self.change_set_id,
+            self.approved_by,
+            self.approved_at.to_rfc3339(),
+            self.expires_at.to_rfc3339(),
+            self.idempotency_key,
+            self.operations_hash,
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeReceipt {
+    pub change_set_id: ChangeSetId,
+    pub status: ChangeStatus,
+    pub applied_at: DateTime<Utc>,
+    pub backup_references: Vec<String>,
+    pub before_hashes: Vec<String>,
+    pub after_hashes: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub audit_event_id: AuditEventId,
+    pub actor: String,
+    pub operation: String,
+    pub target: String,
+    pub host_id: Option<HostId>,
+    pub provider_id: Option<ProviderId>,
+    pub before_hash: Option<String>,
+    pub after_hash: Option<String>,
+    pub result: String,
+    pub correlation_id: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +355,14 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+pub fn change_set_operations_hash(change_set: &ChangeSet) -> String {
+    let encoded = serde_json::to_vec(&change_set.operations)
+        .expect("change operations should always be serializable");
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +380,22 @@ mod tests {
         let scope = Scope::host("host_local");
         let json = serde_json::to_string(&scope).expect("scope should serialize");
         assert!(json.contains("host_local"));
+    }
+
+    #[test]
+    fn approval_envelope_is_bound_to_secret_and_expiry() {
+        let now = Utc::now();
+        let approval = ApprovalEnvelope::issue(
+            "shared-secret",
+            "change_1",
+            "human",
+            now,
+            now + chrono::Duration::minutes(5),
+            "idem_1",
+            "ops_hash",
+        );
+        assert!(approval.is_valid("shared-secret", now));
+        assert!(!approval.is_valid("wrong-secret", now));
+        assert!(!approval.is_valid("shared-secret", now + chrono::Duration::minutes(6)));
     }
 }

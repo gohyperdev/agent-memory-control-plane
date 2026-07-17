@@ -1,5 +1,5 @@
 [package]
-name = "amcp-controller"
+name = "amcp-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,9 @@ authors.workspace = true
 
 [dependencies]
 amcp-domain = { path = "../amcp-domain" }
-amcp-protocol = { path = "../amcp-protocol" }
 amcp-storage = { path = "../amcp-storage" }
 anyhow.workspace = true
-chrono.workspace = true
 clap.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
