@@ -1,12 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
 use amcp_domain::{
-    ArtifactKind, ArtifactRecord, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot,
-    GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
-    ProviderDescriptor, SensitivityClass, SourceObservation, new_id,
+    ArtifactKind, ArtifactRecord, ArtifactRef, CollectionBatch, ConfigLayerRecord,
+    EvidenceSnapshot, GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState,
+    ProjectRecord, ProviderDescriptor, SensitivityClass, SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -461,11 +461,104 @@ impl FileProviderAdapter {
             }
         }
     }
+
+    fn authorized_candidate(&self, source_reference: &str) -> Result<Candidate> {
+        let requested = PathBuf::from(source_reference);
+        if !requested.is_absolute() {
+            bail!("provider artifact reference must be an absolute path");
+        }
+        let metadata = fs::symlink_metadata(&requested)
+            .with_context(|| format!("stat provider artifact {source_reference}"))?;
+        if !metadata.file_type().is_file() {
+            bail!("provider artifact is not a regular file");
+        }
+        if metadata.file_type().is_symlink() || is_sensitive_path(&requested) {
+            bail!("provider artifact is not readable by policy");
+        }
+        let canonical = fs::canonicalize(&requested)?;
+        self.candidates()
+            .into_iter()
+            .find(|candidate| {
+                fs::canonicalize(&candidate.path)
+                    .map(|path| path == canonical)
+                    .unwrap_or(false)
+            })
+            .with_context(|| "provider artifact is outside discovered adapter roots")
+    }
+
+    fn live_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord> {
+        if target.provider_id != self.descriptor.id || target.host_id != host.host_id {
+            bail!("artifact target is outside this provider Agent scope");
+        }
+        let candidate = self.authorized_candidate(&target.source_reference)?;
+        let metadata = fs::metadata(&candidate.path)?;
+        if metadata.len() > 1_000_000 {
+            bail!("provider artifact exceeds the 1 MiB live-read safety limit");
+        }
+        let bytes = fs::read(&candidate.path)?;
+        let source_reference = candidate.path.to_string_lossy().into_owned();
+        let source_hash = hash_bytes(&bytes);
+        let observed_at = Utc::now();
+        let collection_run_id = new_id("read");
+        let observation_id = new_id("obs");
+        let content = redact_text(
+            &String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(4_000)
+                .collect::<String>(),
+        );
+        let sensitivity = classify(&content);
+        Ok(ArtifactRecord {
+            artifact_id: new_id("artifact"),
+            host_id: host.host_id.clone(),
+            provider_id: self.descriptor.id.clone(),
+            project_id: candidate.project_id,
+            native_id: source_reference.clone(),
+            kind: candidate.kind.to_artifact_kind(),
+            title: candidate
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("provider file")
+                .into(),
+            source_reference: source_reference.clone(),
+            content: content.clone(),
+            sensitivity: sensitivity.clone(),
+            lifecycle: LifecycleState::Active,
+            observation: SourceObservation {
+                observation_id: observation_id.clone(),
+                host_id: host.host_id.clone(),
+                provider_id: self.descriptor.id.clone(),
+                native_id: source_reference.clone(),
+                source_reference: source_reference.clone(),
+                source_hash: source_hash.clone(),
+                observed_at,
+                parser_version: ADAPTER_VERSION.into(),
+                schema_fingerprint: format!("file:{}", extension(&candidate.path)),
+                redaction_policy_version: "amcp-redaction-v1".into(),
+                collection_run_id,
+                state: ObservationState::Present,
+            },
+            evidence: Some(EvidenceSnapshot {
+                evidence_id: new_id("evidence"),
+                observation_id,
+                excerpt: content,
+                source_hash,
+                observed_at,
+                sensitivity,
+                retention_until: None,
+            }),
+        })
+    }
 }
 
 impl ProviderAdapter for FileProviderAdapter {
     fn descriptor(&self) -> ProviderDescriptor {
         self.descriptor.clone()
+    }
+
+    fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord> {
+        self.live_artifact(target, host)
     }
 
     fn discover(&self, host: HostIdentity) -> Result<CollectionBatch> {
@@ -765,6 +858,67 @@ mod tests {
                 .iter()
                 .any(|guidance| guidance.kind == "project")
         );
+    }
+
+    #[test]
+    fn future_file_providers_support_scoped_live_reads_without_mutation() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let host = host();
+        let providers = [
+            (
+                FileProviderAdapter::new(
+                    CLAUDE_CODE_PROVIDER_ID,
+                    "Claude Code",
+                    root.join("claude-code/.claude"),
+                    vec![root.join("claude-code/project")],
+                    ProviderFamily::ClaudeCode,
+                ),
+                "CLAUDE.md",
+            ),
+            (
+                FileProviderAdapter::new(
+                    KIRO_PROVIDER_ID,
+                    "Kiro",
+                    root.join("kiro/.kiro"),
+                    vec![root.join("kiro/project")],
+                    ProviderFamily::Kiro,
+                ),
+                "product.md",
+            ),
+            (
+                FileProviderAdapter::new(
+                    ANTIGRAVITY_PROVIDER_ID,
+                    "Google Antigravity",
+                    root.join("antigravity/.gemini/antigravity"),
+                    vec![root.join("antigravity/project")],
+                    ProviderFamily::Antigravity,
+                ),
+                "team.md",
+            ),
+        ];
+
+        for (adapter, title) in providers {
+            let batch = adapter.discover(host.clone()).expect("provider fixture");
+            let source_reference = batch
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.title == title)
+                .map(|artifact| artifact.source_reference.clone())
+                .expect("fixture artifact");
+            let artifact = adapter
+                .read_artifact(
+                    &ArtifactRef {
+                        host_id: host.host_id.clone(),
+                        provider_id: adapter.descriptor().id,
+                        native_id: source_reference.clone(),
+                        source_reference,
+                    },
+                    &host,
+                )
+                .expect("live provider read");
+            assert_eq!(artifact.title, title);
+            assert!(!artifact.content.contains("fixture-secret"));
+        }
     }
 
     #[test]

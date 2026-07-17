@@ -416,6 +416,13 @@ centrally and do not imply runtime access or mutation support. Full adapters can
 replace or extend these readers later without changing the Agent–Controller protocol,
 central schema, or UI contract.
 
+The file-backed adapters also implement the common bounded `read_artifact`
+capability for discovered files. A live read is limited to the adapter's
+discovered roots and candidate files, rejects symlinks/sensitive paths and
+oversized files, and returns redacted content with a fresh source observation.
+They do not implement `propose_change` or `apply_change`; read support must not
+be interpreted as write authority.
+
 Runtime support uses a separate capability descriptor with a named transport and
 operation set (`list`, `read`, `archive`, `unarchive`). The current Codex adapter
 declares `codex-app-server`; Claude Code, Kiro and Antigravity remain
