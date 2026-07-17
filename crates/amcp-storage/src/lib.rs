@@ -1,7 +1,7 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
     HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, SensitivityClass,
-    SessionRecord,
+    SessionItem, SessionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -665,6 +665,33 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn list_session_items(
+        &self,
+        session_id: &str,
+        host_id: Option<&str>,
+    ) -> Result<Vec<SessionItem>> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, host_id, provider_id, sequence, role, item_kind, content, source_reference, observed_at
+             FROM session_items WHERE session_id = ?1 AND (?2 IS NULL OR host_id = ?2)
+             ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(params![session_id, host_id], |row| {
+            let observed_at: String = row.get(8)?;
+            Ok(SessionItem {
+                session_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                sequence: row.get(3)?,
+                role: row.get(4)?,
+                item_kind: row.get(5)?,
+                content: row.get(6)?,
+                source_reference: row.get(7)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_config_layers(
         &self,
         host_id: Option<&str>,
@@ -942,7 +969,7 @@ mod tests {
     use amcp_domain::{
         ArtifactKind, ArtifactRecord, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
         GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState,
-        ProjectRecord, ProviderDescriptor, SessionRecord, SourceObservation, new_id,
+        ProjectRecord, ProviderDescriptor, SessionItem, SessionRecord, SourceObservation, new_id,
     };
 
     fn batch() -> CollectionBatch {
@@ -1006,7 +1033,17 @@ mod tests {
                 metadata_json: "{}".into(),
                 observed_at: now,
             }],
-            session_items: Vec::new(),
+            session_items: vec![SessionItem {
+                session_id: "session-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                sequence: 0,
+                role: Some("user".into()),
+                item_kind: "message".into(),
+                content: None,
+                source_reference: "/tmp/session.jsonl".into(),
+                observed_at: now,
+            }],
             memory_records: vec![MemoryRecord {
                 memory_record_id: "memory-test".into(),
                 host_id: "host_test".into(),
@@ -1099,6 +1136,13 @@ mod tests {
         );
         assert_eq!(
             catalog.list_sessions(None, None).expect("sessions").len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .list_session_items("session-test", None)
+                .expect("session items")
+                .len(),
             1
         );
         assert_eq!(

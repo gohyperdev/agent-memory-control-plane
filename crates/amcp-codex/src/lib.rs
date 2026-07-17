@@ -2,7 +2,7 @@ use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
     GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
-    ProviderDescriptor, SensitivityClass, SessionRecord, SourceObservation, new_id,
+    ProviderDescriptor, SensitivityClass, SessionItem, SessionRecord, SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -74,6 +74,7 @@ impl CodexAdapter {
         let mut artifacts = Vec::new();
         let mut projects = Vec::new();
         let mut sessions = Vec::new();
+        let mut session_items = Vec::new();
         let mut memory_records = Vec::new();
         let mut config_layers = Vec::new();
         let mut guidance_records = Vec::new();
@@ -90,6 +91,7 @@ impl CodexAdapter {
                 &mut artifacts,
                 &mut projects,
                 &mut sessions,
+                &mut session_items,
                 &mut memory_records,
                 &mut config_layers,
                 &mut guidance_records,
@@ -122,7 +124,7 @@ impl CodexAdapter {
             providers: vec![self.provider()],
             projects,
             sessions,
-            session_items: Vec::new(),
+            session_items,
             memory_records,
             config_layers,
             guidance_records,
@@ -423,6 +425,7 @@ impl CodexAdapter {
         artifacts: &mut Vec<ArtifactRecord>,
         projects: &mut Vec<ProjectRecord>,
         sessions: &mut Vec<SessionRecord>,
+        session_items: &mut Vec<SessionItem>,
         memory_records: &mut Vec<MemoryRecord>,
         config_layers: &mut Vec<ConfigLayerRecord>,
         guidance_records: &mut Vec<GuidanceRecord>,
@@ -450,7 +453,7 @@ impl CodexAdapter {
                     allow_content,
                 )?);
                 if kind == ArtifactKind::Session && relative != "history.jsonl" {
-                    self.discover_session_file(&path, host, sessions)?;
+                    self.discover_session_file(&path, host, sessions, session_items)?;
                 }
                 if kind == ArtifactKind::Configuration && relative != "projects.toml" {
                     if let Ok(layer) = self.config_layer(&path, host) {
@@ -468,7 +471,7 @@ impl CodexAdapter {
         let history = root.join("history.jsonl");
         let session_index = root.join("session_index.jsonl");
         if !session_index.is_file() && history.is_file() {
-            self.discover_session_file(&history, host, sessions)?;
+            self.discover_session_file(&history, host, sessions, session_items)?;
         }
 
         for directory in ["sessions", "archived_sessions", "memories"] {
@@ -480,6 +483,7 @@ impl CodexAdapter {
                     collection_run_id,
                     artifacts,
                     sessions,
+                    session_items,
                     memory_records,
                 )?;
             }
@@ -541,6 +545,7 @@ impl CodexAdapter {
         collection_run_id: &str,
         artifacts: &mut Vec<ArtifactRecord>,
         sessions: &mut Vec<SessionRecord>,
+        session_items: &mut Vec<SessionItem>,
         memory_records: &mut Vec<MemoryRecord>,
     ) -> io::Result<()> {
         for entry in WalkDir::new(directory).max_depth(2).follow_links(false) {
@@ -566,7 +571,7 @@ impl CodexAdapter {
                     memory_records.push(record);
                 }
             } else {
-                self.discover_session_file(entry.path(), host, sessions)?;
+                self.discover_session_file(entry.path(), host, sessions, session_items)?;
             }
         }
         Ok(())
@@ -641,6 +646,7 @@ impl CodexAdapter {
         path: &Path,
         host: &HostIdentity,
         sessions: &mut Vec<SessionRecord>,
+        session_items: &mut Vec<SessionItem>,
     ) -> io::Result<()> {
         let bytes = fs::read(path)?;
         let source_hash = hash_bytes(&bytes);
@@ -716,7 +722,7 @@ impl CodexAdapter {
             .and_then(|value| value.as_str())
             .map(str::to_owned);
         sessions.push(SessionRecord {
-            session_id,
+            session_id: session_id.clone(),
             host_id: host.host_id.clone(),
             provider_id: CODEX_PROVIDER_ID.to_owned(),
             project_id: cwd
@@ -739,11 +745,42 @@ impl CodexAdapter {
             started_at: metadata.get("started_at").and_then(parse_datetime),
             ended_at: metadata.get("ended_at").and_then(parse_datetime),
             archived: source_reference.contains("archived_sessions"),
-            source_reference,
+            source_reference: source_reference.clone(),
             source_hash,
             metadata_json: serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_owned()),
             observed_at: Utc::now(),
         });
+        for (sequence, line) in String::from_utf8_lossy(&bytes)
+            .lines()
+            .enumerate()
+            .take(1_000)
+        {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let item_kind = value
+                .get("type")
+                .or_else(|| value.get("kind"))
+                .or_else(|| value.get("event"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("event")
+                .to_owned();
+            let role = value
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            session_items.push(SessionItem {
+                session_id: session_id.clone(),
+                host_id: host.host_id.clone(),
+                provider_id: CODEX_PROVIDER_ID.to_owned(),
+                sequence: sequence as i64,
+                role,
+                item_kind,
+                content: None,
+                source_reference: source_reference.clone(),
+                observed_at: Utc::now(),
+            });
+        }
         Ok(())
     }
 
@@ -1221,6 +1258,8 @@ mod tests {
                     .source_reference
                     .ends_with("sessions/fixture-session-1.jsonl")
         }));
+        assert_eq!(batch.session_items.len(), 1);
+        assert!(batch.session_items[0].content.is_none());
         assert!(
             batch
                 .memory_records

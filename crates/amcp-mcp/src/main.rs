@@ -192,6 +192,19 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_session_items_list",
+                "description": "List metadata-only items for a normalized session. Transcript content is not returned by default.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "host_id": { "type": "string" }
+                    },
+                    "required": ["session_id"]
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_config_layers_list",
                 "description": "List normalized Codex configuration layers with scope, profile and precedence. Content is read through cited artifacts.",
                 "inputSchema": {
@@ -314,6 +327,14 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             let host_id = arguments.get("host_id").and_then(Value::as_str);
             let project_id = arguments.get("project_id").and_then(Value::as_str);
             Ok(json!({ "sessions": catalog.list_sessions(host_id, project_id)? }))
+        }
+        "amcp_session_items_list" => {
+            let session_id = arguments
+                .get("session_id")
+                .and_then(Value::as_str)
+                .context("amcp_session_items_list requires session_id")?;
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            Ok(json!({ "items": catalog.list_session_items(session_id, host_id)? }))
         }
         "amcp_memory_list" => {
             let host_id = arguments.get("host_id").and_then(Value::as_str);

@@ -1,6 +1,6 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
-    MemoryRecord, ProjectRecord, SessionRecord,
+    MemoryRecord, ProjectRecord, SessionItem, SessionRecord,
 };
 use amcp_storage::{Catalog, SearchHit};
 use anyhow::Result;
@@ -57,6 +57,14 @@ impl CatalogService {
         project_id: Option<&str>,
     ) -> Result<Vec<MemoryRecord>> {
         self.catalog.list_memory_records(host_id, project_id)
+    }
+
+    pub fn list_session_items(
+        &self,
+        session_id: &str,
+        host_id: Option<&str>,
+    ) -> Result<Vec<SessionItem>> {
+        self.catalog.list_session_items(session_id, host_id)
     }
 
     pub fn list_config_layers(
