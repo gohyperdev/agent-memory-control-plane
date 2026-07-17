@@ -6,6 +6,8 @@ Status: Draft for OpenAI Hackathon — Developer Tools
 
 Detailed component design: [AMCP Collector/Controller and Agent HLD](HLD-AMCP-COLLECTOR-CONTROLLER-AND-AGENT.md)
 
+Implementation roadmap: [AMCP implementation plan](PLAN-IMPLEMENTACJI.md)
+
 ## 1. Product brief
 
 ### Working name

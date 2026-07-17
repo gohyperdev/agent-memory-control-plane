@@ -8,6 +8,8 @@ Target platform: macOS first; Windows and Linux are planned extensions
 
 Related document: [Initial Brief and Specification](INITIAL-BRIEF-AND-SPEC.md)
 
+Implementation roadmap: [AMCP implementation plan](PLAN-IMPLEMENTACJI.md)
+
 ## 1. Purpose and scope
 
 This document defines the architecture of the two primary AMCP runtime components:
