@@ -88,6 +88,7 @@ dependencies = [
  "amcp-codex",
  "amcp-core",
  "amcp-domain",
+ "amcp-rag",
  "amcp-storage",
  "anyhow",
  "chrono",
@@ -119,6 +120,19 @@ dependencies = [
  "amcp-domain",
  "anyhow",
  "serde_json",
+]
+
+[[package]]
+name = "amcp-rag"
+version = "0.1.0"
+dependencies = [
+ "amcp-domain",
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

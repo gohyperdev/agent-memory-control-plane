@@ -3,6 +3,7 @@
 use amcp_app_server::AppServerClient;
 use amcp_codex::{hash_bytes, redact_text};
 use amcp_core::CatalogService;
+use amcp_rag::{PersistentRagIndex, RagClearReceipt, RagIndexStats};
 use amcp_domain::{
     ArtifactRecord, ChangeSet, CollectionBatch, ConfigLayerRecord, GuidanceRecord, HostIdentity,
     HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, ProviderRecord, RuntimeEvent,
@@ -183,6 +184,23 @@ fn list_runtime_events(
     CatalogService::open(database_path())
         .map_err(|error| error.to_string())?
         .list_runtime_events(host_id.as_deref(), provider_id.as_deref(), 40)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rag_status() -> Result<RagIndexStats, String> {
+    PersistentRagIndex::open(database_path())
+        .map_err(|error| error.to_string())?
+        .stats()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_rag_index() -> Result<RagClearReceipt, String> {
+    let mut index = PersistentRagIndex::open(database_path())
+        .map_err(|error| error.to_string())?;
+    index
+        .clear_derived_data()
         .map_err(|error| error.to_string())
 }
 
@@ -607,6 +625,8 @@ fn main() {
             read_artifact,
             propose_artifact_change,
             list_runtime_events,
+            rag_status,
+            clear_rag_index,
             collect_local,
             enroll_remote,
             sync_remote,

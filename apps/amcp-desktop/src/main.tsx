@@ -110,6 +110,14 @@ type RuntimeEvent = {
   occurred_at: string;
 };
 
+type RagStats = {
+  chunk_count: number;
+  source_count: number;
+  retrieval_run_count: number;
+  oldest_indexed_at?: string;
+  newest_indexed_at?: string;
+};
+
 function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -149,9 +157,10 @@ function App() {
   const [remoteToken, setRemoteToken] = useState("");
   const [remoteProviderId, setRemoteProviderId] = useState("codex");
   const [remoteBusy, setRemoteBusy] = useState(false);
+  const [ragStats, setRagStats] = useState<RagStats | null>(null);
 
   const refreshCatalog = async (hostId = selectedHostId, providerId = selectedProviderId) => {
-    const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents] = await Promise.all([
+    const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents, nextRagStats] = await Promise.all([
       invoke<Host[]>("list_hosts"),
       invoke<Provider[]>("list_providers"),
       invoke<ChangeSet[]>("list_changes"),
@@ -164,6 +173,7 @@ function App() {
         hostId: hostId || null,
         providerId: providerId || null,
       }),
+      invoke<RagStats>("rag_status"),
     ]);
     setHosts(nextHosts);
     setProviders(nextProviders);
@@ -174,6 +184,7 @@ function App() {
     setConfigLayers(nextConfigLayers);
     setGuidance(nextGuidance);
     setRuntimeEvents(nextRuntimeEvents);
+    setRagStats(nextRagStats);
   };
 
   useEffect(() => {
@@ -264,6 +275,17 @@ function App() {
         hostId: selectedHostId || null,
         providerId: selectedProviderId || null,
       }));
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const clearRagIndex = async () => {
+    if (!window.confirm("Delete the derived RAG chunks and retrieval history? Native provider files and the AMCP catalog will remain untouched.")) return;
+    try {
+      setError(null);
+      await invoke("clear_rag_index");
+      setRagStats(await invoke<RagStats>("rag_status"));
     } catch (reason) {
       setError(String(reason));
     }
@@ -448,6 +470,11 @@ function App() {
           <section className="runtime-section">
             <div className="section-heading"><div><span className="eyebrow">Runtime telemetry</span><h2>Recent agent activity</h2></div><button className="secondary refresh-button" onClick={() => void refreshRuntimeEvents()}>Refresh events</button></div>
             <div className="runtime-list">{runtimeEvents.slice(0, 8).map((event) => <article className="runtime-row" key={event.event_id}><span className="runtime-marker">●</span><div><strong>{event.event_type}</strong><small>{event.host_id} · {event.provider_id} · seq {event.sequence}</small></div><time>{new Date(event.occurred_at).toLocaleString()}</time><code>{event.payload_json}</code></article>)}{!runtimeEvents.length && <div className="change-empty">No runtime events in the selected scope.</div>}</div>
+          </section>
+
+          <section className="rag-section">
+            <div className="section-heading"><div><span className="eyebrow">Optional derived index</span><h2>RAG projection</h2></div><span className="scope-pill">Native provider state untouched</span></div>
+            <div className="rag-card"><div><strong>{ragStats?.chunk_count ?? 0} chunks</strong><small>{ragStats?.source_count ?? 0} source records · {ragStats?.retrieval_run_count ?? 0} retrieval runs</small></div><p>RAG stores only redacted, rebuildable derived data. Clearing it does not remove Codex files, the AMCP catalog, or lexical search.</p><button className="secondary" onClick={() => void clearRagIndex()} disabled={!ragStats?.chunk_count && !ragStats?.retrieval_run_count}>Delete derived index</button></div>
           </section>
 
           <section className="changes-section">

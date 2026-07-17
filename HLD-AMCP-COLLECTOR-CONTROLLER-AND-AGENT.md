@@ -493,7 +493,10 @@ while the desktop approval queue and MCP proposal tool use the same flow.
 
 RAG chunk retention is applied independently from native provider retention. A
 configured retention window purges derived chunks before retrieval; disabling or
-deleting RAG must not remove or mutate native provider state.
+deleting RAG must not remove or mutate native provider state. The Controller
+exposes a metadata-only `rag-status` operation and an explicit, acknowledged
+`rag-clear --yes` operation; clearing removes chunks and retrieval audit history
+only, never native provider files, the AMCP catalog, or lexical FTS data.
 
 The adapter emits one normalized configuration-layer record for each supported
 `config.toml`/profile source and one guidance record for each discovered

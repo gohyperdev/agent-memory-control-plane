@@ -9,6 +9,7 @@ use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
 };
 use amcp_protocol::{RequestEnvelope, RequestMethod, ResponseEnvelope, ResponsePayload};
+use amcp_rag::PersistentRagIndex;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
@@ -252,6 +253,22 @@ enum CommandKind {
         db: Option<PathBuf>,
         #[arg(long, default_value_t = 256)]
         batch_size: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    RagStatus {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    RagClear {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Required acknowledgement because this removes the complete
+        /// derived RAG projection and retrieval audit history.
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         json: bool,
     },
@@ -742,6 +759,10 @@ async fn main() -> Result<()> {
             batch_size,
             json,
         } => rebuild_index(db.unwrap_or_else(default_db_path), batch_size, json),
+        CommandKind::RagStatus { db, json } => rag_status(db.unwrap_or_else(default_db_path), json),
+        CommandKind::RagClear { db, yes, json } => {
+            rag_clear(db.unwrap_or_else(default_db_path), yes, json)
+        }
         CommandKind::ReadArtifact {
             socket,
             agent_url,
@@ -1590,6 +1611,37 @@ fn rebuild_index(db: PathBuf, batch_size: usize, json: bool) -> Result<()> {
         println!(
             "Rebuilt search projection: {} artifact(s), run {}",
             run.indexed_count, run.run_id
+        );
+    }
+    Ok(())
+}
+
+fn rag_status(db: PathBuf, json: bool) -> Result<()> {
+    let index = PersistentRagIndex::open(&db)?;
+    let stats = index.stats()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!(
+            "RAG derived index: {} chunk(s), {} source(s), {} retrieval run(s)",
+            stats.chunk_count, stats.source_count, stats.retrieval_run_count
+        );
+    }
+    Ok(())
+}
+
+fn rag_clear(db: PathBuf, yes: bool, json: bool) -> Result<()> {
+    if !yes {
+        bail!("refusing to clear RAG derived data without --yes")
+    }
+    let mut index = PersistentRagIndex::open(&db)?;
+    let receipt = index.clear_derived_data()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!(
+            "Cleared RAG derived data: {} chunk(s), {} retrieval run(s)",
+            receipt.deleted_chunks, receipt.deleted_retrieval_runs
         );
     }
     Ok(())

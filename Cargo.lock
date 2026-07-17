@@ -82,6 +82,7 @@ dependencies = [
  "amcp-domain",
  "amcp-platform",
  "amcp-protocol",
+ "amcp-rag",
  "amcp-storage",
  "anyhow",
  "chrono",

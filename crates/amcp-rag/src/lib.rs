@@ -85,6 +85,22 @@ pub struct EmbeddingProviderDescriptor {
     pub dimensions: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RagIndexStats {
+    pub chunk_count: usize,
+    pub source_count: usize,
+    pub retrieval_run_count: usize,
+    pub oldest_indexed_at: Option<DateTime<Utc>>,
+    pub newest_indexed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RagClearReceipt {
+    pub deleted_chunks: usize,
+    pub deleted_retrieval_runs: usize,
+    pub cleared_at: DateTime<Utc>,
+}
+
 /// Embedding providers are deliberately isolated from retrieval policy. A
 /// provider can be local or remote, but it must return only bounded vectors;
 /// the Controller decides whether the provider is allowed for a scope.
@@ -223,6 +239,58 @@ impl PersistentRagIndex {
             );",
         )?;
         Ok(())
+    }
+
+    /// Return only derived-index metadata. This intentionally excludes source
+    /// content, provider files and the central catalog.
+    pub fn stats(&self) -> Result<RagIndexStats> {
+        let (chunk_count, source_count, oldest_indexed_at, newest_indexed_at) =
+            self.connection.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT record_id), MIN(indexed_at), MAX(indexed_at)
+                 FROM rag_chunks",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?;
+        let retrieval_run_count =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM rag_retrieval_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        Ok(RagIndexStats {
+            chunk_count: usize::try_from(chunk_count)?,
+            source_count: usize::try_from(source_count)?,
+            retrieval_run_count: usize::try_from(retrieval_run_count)?,
+            oldest_indexed_at: oldest_indexed_at
+                .map(|value| DateTime::parse_from_rfc3339(&value))
+                .transpose()?
+                .map(|value| value.with_timezone(&Utc)),
+            newest_indexed_at: newest_indexed_at
+                .map(|value| DateTime::parse_from_rfc3339(&value))
+                .transpose()?
+                .map(|value| value.with_timezone(&Utc)),
+        })
+    }
+
+    /// Delete the complete AMCP-derived RAG projection and retrieval audit
+    /// runs. Native provider state, catalog records and lexical FTS content
+    /// are deliberately left untouched and can rebuild this projection.
+    pub fn clear_derived_data(&mut self) -> Result<RagClearReceipt> {
+        let transaction = self.connection.transaction()?;
+        let deleted_chunks = transaction.execute("DELETE FROM rag_chunks", [])?;
+        let deleted_retrieval_runs = transaction.execute("DELETE FROM rag_retrieval_runs", [])?;
+        transaction.commit()?;
+        Ok(RagClearReceipt {
+            deleted_chunks,
+            deleted_retrieval_runs,
+            cleared_at: Utc::now(),
+        })
     }
 
     fn load_chunks(&self) -> Result<Vec<IndexedChunk>> {
@@ -906,5 +974,42 @@ mod tests {
                 .context
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn persistent_index_reports_and_clears_only_derived_data() {
+        let mut index = PersistentRagIndex::open_in_memory().expect("persistent index");
+        let mut manager = LexicalRagManager::new(RagConfig {
+            enabled: true,
+            ..RagConfig::default()
+        });
+        manager
+            .index(&[RagDocument {
+                record_id: "artifact-clear".into(),
+                scope: Scope::host("host-test"),
+                title: "derived memory".into(),
+                content: "clearable context".into(),
+                source_reference: "/memory.md".into(),
+                source_hash: "clear-hash".into(),
+                sensitivity: SensitivityClass::Internal,
+                lifecycle: LifecycleState::Active,
+            }])
+            .expect("index document");
+        manager
+            .persist_to_index(&mut index)
+            .expect("persist chunks");
+        manager
+            .record_retrieval(&mut index, "clearable", &Scope::host("host-test"), 1)
+            .expect("record retrieval");
+
+        let stats = index.stats().expect("stats");
+        assert_eq!(stats.chunk_count, 1);
+        assert_eq!(stats.source_count, 1);
+        assert_eq!(stats.retrieval_run_count, 1);
+        let receipt = index.clear_derived_data().expect("clear derived data");
+        assert_eq!(receipt.deleted_chunks, 1);
+        assert_eq!(receipt.deleted_retrieval_runs, 1);
+        assert_eq!(index.stats().expect("empty stats").chunk_count, 0);
+        assert_eq!(index.stats().expect("empty stats").retrieval_run_count, 0);
     }
 }

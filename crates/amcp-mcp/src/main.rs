@@ -334,6 +334,12 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_rag_status",
+                "description": "Report metadata for the optional derived RAG projection. This never returns indexed content and never changes native provider state.",
+                "inputSchema": { "type": "object", "properties": {} },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_change_review",
                 "description": "Review an existing human-visible AMCP change set. This never applies a change.",
                 "inputSchema": {
@@ -454,6 +460,12 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
         "amcp_runtime_threads_list" => runtime_threads_list(args, arguments),
         "amcp_runtime_thread_read" => runtime_thread_read(args, arguments),
         "amcp_runtime_thread_change_propose" => runtime_thread_change_propose(args, arguments),
+        "amcp_rag_status" => {
+            let index = PersistentRagIndex::open(&args.db)?;
+            Ok(
+                json!({ "enabled": env::var("AMCP_RAG_ENABLED").ok().is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")), "index": index.stats()? }),
+            )
+        }
         "amcp_retrieve_context" => {
             let query = arguments
                 .get("query")
