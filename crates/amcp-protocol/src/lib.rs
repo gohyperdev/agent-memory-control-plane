@@ -44,6 +44,11 @@ pub enum RequestMethod {
         after_event_id: Option<String>,
         limit: usize,
     },
+    SubscribeEvents {
+        after_event_id: Option<String>,
+        limit: usize,
+        wait_ms: u64,
+    },
     AckEvents {
         event_ids: Vec<String>,
     },
@@ -102,6 +107,11 @@ pub enum ResponsePayload {
         batches: Vec<CollectionBatch>,
     },
     RuntimeEvents(Vec<RuntimeEvent>),
+    RuntimeEventPage {
+        events: Vec<RuntimeEvent>,
+        next_event_id: Option<String>,
+        timed_out: bool,
+    },
     RuntimeEventsAcked(usize),
     Artifact(ArtifactRecord),
     ChangeSet(ChangeSet),
@@ -234,6 +244,29 @@ mod tests {
         assert!(matches!(
             decoded.method,
             RequestMethod::AckEvents { event_ids } if event_ids.len() == 2
+        ));
+    }
+
+    #[test]
+    fn event_subscription_round_trip_preserves_wait_and_cursor() {
+        let request = RequestEnvelope::new(
+            RequestMethod::SubscribeEvents {
+                after_event_id: Some("event-1".into()),
+                limit: 16,
+                wait_ms: 250,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode subscription"))
+                .expect("decode subscription");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::SubscribeEvents {
+                after_event_id: Some(_),
+                limit: 16,
+                wait_ms: 250
+            }
         ));
     }
 }

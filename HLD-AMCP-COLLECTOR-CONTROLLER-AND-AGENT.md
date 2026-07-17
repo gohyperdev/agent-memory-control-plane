@@ -559,11 +559,18 @@ diagnostic.updated
 Events are at-least-once. The Controller deduplicates using event IDs and source observations.
 
 The macOS MVP implements the first transport increment as a bounded Agent event
-outbox plus authenticated `ReplayEvents` polling. The Controller accepts replayed
-events in a transaction and acknowledges their stable IDs only after persistence;
+outbox plus authenticated `SubscribeEvents` long-poll/replay. The Controller
+accepts replayed events in a transaction and acknowledges their stable IDs only after persistence;
 the Agent removes acknowledged records, while failed acknowledgements leave them
 available for safe at-least-once replay. Future streaming transports can reuse the
 same event envelope and deduplication semantics.
+
+`SubscribeEvents` is bounded by `limit <= 256` and `wait_ms <= 30s`. Empty waits
+return an explicit timeout page; a non-empty page returns a stable continuation
+event ID. This gives the Controller a backpressure-aware long-poll contract while
+leaving a future bidirectional stream free to reuse the same page and ACK model.
+The Controller `watch` loop supplies its interval as the long-poll wait budget,
+then reconciles the normal collection cursor after each page.
 
 The Agent also owns a local `notify` watcher over the provider root. On macOS this
 uses the platform FSEvents backend, coalesces notification bursts, emits relative

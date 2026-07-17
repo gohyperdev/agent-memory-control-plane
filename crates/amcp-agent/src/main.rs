@@ -25,10 +25,12 @@ use std::{
     io::BufReader as StdBufReader,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener},
+    time::sleep,
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -382,7 +384,11 @@ where
                 continue;
             }
         };
-        let response = process_request(request, &auth, codex_home.clone(), &backup_dir, &state_dir);
+        let response = if matches!(&request.method, RequestMethod::SubscribeEvents { .. }) {
+            process_subscribe_request(request, &auth, &state_dir).await
+        } else {
+            process_request(request, &auth, codex_home.clone(), &backup_dir, &state_dir)
+        };
         let should_close = matches!(&response.result, Ok(ResponsePayload::ShutdownAck));
         write_response(&mut writer, response).await?;
         if should_close {
@@ -556,6 +562,21 @@ fn process_request(
                 }
                 Err(error) => Err(ProtocolError::new("event_replay_failed", error.to_string())),
             },
+            RequestMethod::SubscribeEvents {
+                after_event_id,
+                limit,
+                wait_ms: _,
+            } => match runtime_event_page(state_dir, after_event_id.as_deref(), limit) {
+                Ok((events, next_event_id)) => Ok(ResponsePayload::RuntimeEventPage {
+                    events,
+                    next_event_id,
+                    timed_out: false,
+                }),
+                Err(error) => Err(ProtocolError::new(
+                    "event_subscribe_failed",
+                    error.to_string(),
+                )),
+            },
             RequestMethod::AckEvents { event_ids } => {
                 match acknowledge_runtime_events(state_dir, &event_ids) {
                     Ok(removed) => Ok(ResponsePayload::RuntimeEventsAcked(removed)),
@@ -714,6 +735,102 @@ fn process_request(
         request_id,
         result: response,
     }
+}
+
+async fn process_subscribe_request(
+    request: RequestEnvelope,
+    auth: &Arc<Mutex<AgentAuth>>,
+    state_dir: &Path,
+) -> ResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let (after_event_id, limit, wait_ms) = match request.method {
+        RequestMethod::SubscribeEvents {
+            after_event_id,
+            limit,
+            wait_ms,
+        } => (after_event_id, limit, wait_ms.min(30_000)),
+        _ => {
+            return ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "invalid_subscription",
+                    "not an event subscription",
+                )),
+            };
+        }
+    };
+    let authenticated = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .accepts(request.token.as_deref());
+    if request.protocol_version != PROTOCOL_VERSION {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "protocol_version_mismatch",
+                "unsupported protocol version",
+            )),
+        };
+    }
+    if !authenticated {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+        };
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
+    loop {
+        match runtime_event_page(state_dir, after_event_id.as_deref(), limit) {
+            Ok((events, next_event_id)) if !events.is_empty() || Instant::now() >= deadline => {
+                return ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Ok(ResponsePayload::RuntimeEventPage {
+                        timed_out: events.is_empty() && wait_ms > 0,
+                        events,
+                        next_event_id,
+                    }),
+                };
+            }
+            Ok(_) => sleep(std::time::Duration::from_millis(50)).await,
+            Err(error) => {
+                return ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        "event_subscribe_failed",
+                        error.to_string(),
+                    )),
+                };
+            }
+        }
+    }
+}
+
+fn runtime_event_page(
+    state_dir: &Path,
+    after_event_id: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<RuntimeEvent>, Option<String>)> {
+    let events = load_runtime_event_outbox(state_dir)?;
+    let start = after_event_id
+        .and_then(|event_id| {
+            events
+                .iter()
+                .position(|event| event.event_id == event_id)
+                .map(|position| position + 1)
+        })
+        .unwrap_or(0);
+    let events = events
+        .into_iter()
+        .skip(start)
+        .take(limit.clamp(1, 256))
+        .collect::<Vec<_>>();
+    let next_event_id = events.last().map(|event| event.event_id.clone());
+    Ok((events, next_event_id))
 }
 
 fn provider_registry(codex_home: Option<PathBuf>) -> ProviderRegistry {
@@ -931,6 +1048,119 @@ mod tests {
         let remaining = load_runtime_event_outbox(directory.path()).expect("load events");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_id, "event-keep");
+    }
+
+    #[tokio::test]
+    async fn event_subscription_times_out_and_returns_bounded_pages() {
+        let directory = tempfile::tempdir().expect("subscription directory");
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "subscription-token".into(),
+            None,
+            300,
+        )));
+        let empty = process_subscribe_request(
+            RequestEnvelope::new(
+                RequestMethod::SubscribeEvents {
+                    after_event_id: None,
+                    limit: 4,
+                    wait_ms: 1,
+                },
+                Some("subscription-token".into()),
+            ),
+            &auth,
+            directory.path(),
+        )
+        .await;
+        assert!(matches!(
+            empty.result,
+            Ok(ResponsePayload::RuntimeEventPage {
+                events,
+                timed_out: true,
+                ..
+            }) if events.is_empty()
+        ));
+        append_runtime_event_outbox(
+            directory.path(),
+            &[RuntimeEvent {
+                event_id: "event-subscribe".into(),
+                host_id: "host-subscribe".into(),
+                provider_id: "codex".into(),
+                event_type: "source.changed".into(),
+                sequence: 1,
+                payload_json: "{}".into(),
+                occurred_at: Utc::now(),
+            }],
+        )
+        .expect("append subscription event");
+        let page = process_subscribe_request(
+            RequestEnvelope::new(
+                RequestMethod::SubscribeEvents {
+                    after_event_id: None,
+                    limit: 1,
+                    wait_ms: 0,
+                },
+                Some("subscription-token".into()),
+            ),
+            &auth,
+            directory.path(),
+        )
+        .await;
+        let next_event_id = match page.result.expect("subscription page") {
+            ResponsePayload::RuntimeEventPage {
+                events,
+                next_event_id: Some(next_event_id),
+                timed_out: false,
+            } => {
+                assert_eq!(events.len(), 1);
+                next_event_id
+            }
+            other => panic!("unexpected subscription page: {other:?}"),
+        };
+        append_runtime_event_outbox(
+            directory.path(),
+            &[
+                RuntimeEvent {
+                    event_id: "event-subscribe-2".into(),
+                    host_id: "host-subscribe".into(),
+                    provider_id: "codex".into(),
+                    event_type: "source.changed".into(),
+                    sequence: 2,
+                    payload_json: "{}".into(),
+                    occurred_at: Utc::now(),
+                },
+                RuntimeEvent {
+                    event_id: "event-subscribe-3".into(),
+                    host_id: "host-subscribe".into(),
+                    provider_id: "codex".into(),
+                    event_type: "source.changed".into(),
+                    sequence: 3,
+                    payload_json: "{}".into(),
+                    occurred_at: Utc::now(),
+                },
+            ],
+        )
+        .expect("append ordered subscription events");
+        let continued = process_subscribe_request(
+            RequestEnvelope::new(
+                RequestMethod::SubscribeEvents {
+                    after_event_id: Some(next_event_id),
+                    limit: 2,
+                    wait_ms: 0,
+                },
+                Some("subscription-token".into()),
+            ),
+            &auth,
+            directory.path(),
+        )
+        .await;
+        match continued.result.expect("continued subscription page") {
+            ResponsePayload::RuntimeEventPage { events, .. } => {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].event_id, "event-subscribe-2");
+                assert_eq!(events[1].event_id, "event-subscribe-3");
+            }
+            other => panic!("unexpected continued subscription page: {other:?}"),
+        }
     }
 
     #[test]

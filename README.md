@@ -42,6 +42,8 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - The Agent keeps a bounded, redacted collection outbox. On reconnect, the Controller replays it idempotently before requesting a fresh snapshot; cursors advance only after central persistence.
 - Collection batches emit persisted runtime events with stable IDs; SQLite deduplicates replayed events, while the MCP diagnostics tool exposes the resulting event history.
 - Runtime events also have a separate bounded Agent outbox and authenticated replay/ack endpoint; the Controller acknowledges event IDs only after central persistence, and repeated delivery remains safe because central persistence deduplicates IDs.
+- The Agent additionally exposes bounded `SubscribeEvents` long-poll pages (maximum 256 events / 30 seconds) with continuation IDs and explicit timeout semantics, allowing a future streaming transport to reuse the same event/ACK contract.
+- `amcp-controller watch` uses the long-poll wait budget before reconciling each host/provider cursor, while preserving the bounded reconnect behavior.
 - The macOS Agent runs a `notify`/FSEvents-backed watcher over the Codex root and emits bounded, path-relative `source.changed` events; sensitive `auth.json` paths are excluded and bursts are coalesced.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/session-item/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.

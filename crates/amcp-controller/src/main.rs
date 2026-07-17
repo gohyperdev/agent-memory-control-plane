@@ -286,6 +286,7 @@ async fn main() -> Result<()> {
                 no_start_agent,
                 query,
                 json,
+                0,
             )
             .await
         }
@@ -463,6 +464,7 @@ async fn run_once(
     no_start_agent: bool,
     query: Option<String>,
     json: bool,
+    event_wait_ms: u64,
 ) -> Result<()> {
     let token = resolve_agent_token(&token);
     if let Some(parent) = db.parent() {
@@ -496,15 +498,17 @@ async fn run_once(
     )?;
     let (replayed_events, persisted_events, replayed_event_ids) = match client
         .request(
-            RequestMethod::ReplayEvents {
+            RequestMethod::SubscribeEvents {
                 after_event_id: None,
                 limit: 256,
+                wait_ms: event_wait_ms,
             },
             &token,
         )
         .await
     {
-        Ok(ResponsePayload::RuntimeEvents(events)) => {
+        Ok(ResponsePayload::RuntimeEventPage { events, .. })
+        | Ok(ResponsePayload::RuntimeEvents(events)) => {
             let received = events.len();
             let persisted = catalog.ingest_runtime_events(&events)?;
             let event_ids = events
@@ -677,6 +681,7 @@ async fn watch(
                 endpoint.is_some(),
                 None,
                 true,
+                interval_seconds.saturating_mul(1_000).min(30_000),
             )
             .await;
             if let Err(error) = result {
