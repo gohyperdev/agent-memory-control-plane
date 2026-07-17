@@ -8,7 +8,7 @@ Stan implementacji na 2026-07-17:
 
 - zrealizowane: Rust workspace, osobny macOS Agent, hardened per-user LaunchAgent lifecycle z chronionym state/log directory, restart throttling i redacted diagnostic export, platformowy resolver endpointów z chronionym domyślnym Unix socket, macOS LaunchAgent installer/uninstaller, wspólny `amcp-core` catalog service dla UI/MCP/Controller, Codex discovery/redaction z incremental metadata cursor, central SQLite/FTS5, provider registry, normalized projects/sessions/session-items/memory/configuration/guidance, persisted collection cursors, bounded redacted collection outbox/replay, persisted deduplicated runtime events, local `notify`/FSEvents watcher with burst coalescing and safe relative paths, redacted embedded Codex session persistence, scoped live artifact read przez Codex i file-backed future providers z redakcją/scope/limitem rozmiaru, Controller/MCP/desktop inspector, provider-validated change proposals z UI, opt-in cited lexical RAG over redacted previews, persistent SQLite `rag_chunks`/`rag_retrieval_runs` projection with source/model invalidation, signed nonce-based one-time approval replay store, proposal/apply/rollback z backupem i hash-conflict, approved Codex runtime archive/unarchive through app-server with runtime-state hash verification, MCP read/proposal/RAG-fallback gateway, Codex app-server client z UI bridge, TLS remote Agent transport z desktop enrollment/resync i host-scoped collection, pairing/enrollment z rotowanym credentialem w Keychain, redacted Agent collection cache, watch/reconnect polling, register-capabilities-heartbeat handshake oraz Tauri/React shell z approval queue;
 - zrealizowane częściowo: modularne, file-backed adaptery Claude Code/Kiro/Antigravity działają w trybie inventory/read-only z fixtures; production-ready provider runtime operations i provider-specific mutation support pozostają poza zakresem Codex MVP;
-- następne: richer provider runtime operations, evaluated/consented model-backed or remote embedding providers oraz cross-platform ports.
+- następne: richer provider runtime operations, additional evaluated/consented embedding backends oraz cross-platform ports.
 
 Dokumenty referencyjne:
 
@@ -551,11 +551,11 @@ Dodać semantyczne wyszukiwanie i context retrieval dopiero po działającym lex
 
 1. Chunking policy i testowy evaluation set.
 2. Redacted approved records only.
-3. Local embedding provider (deterministic `local-hash` baseline is available; model-backed providers remain opt-in).
+3. Local embedding provider (deterministic `local-hash` baseline) and one opt-in OpenAI-compatible provider with explicit egress consent.
 4. Embedding metadata i source-hash invalidation.
 5. Hybrid lexical + vector retrieval.
 6. Citation packet dla Codex.
-7. Opcjonalny remote embedding provider po egress consent.
+7. Additional remote embedding providers after separate egress consent and evaluation.
 
 ### Kontrole
 

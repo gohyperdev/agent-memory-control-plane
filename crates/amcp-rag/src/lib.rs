@@ -1,11 +1,12 @@
 use amcp_domain::{LifecycleState, Scope, SensitivityClass};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    time::Duration as StdDuration,
 };
 
 pub const RAG_POLICY_VERSION: &str = "amcp-rag-v1";
@@ -107,6 +108,176 @@ pub struct RagClearReceipt {
 pub trait EmbeddingProvider: Send + Sync {
     fn descriptor(&self) -> EmbeddingProviderDescriptor;
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+#[derive(Serialize)]
+struct OpenAiEmbeddingRequest<'a> {
+    input: &'a str,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+    encoding_format: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbeddingItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingItem {
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+/// OpenAI-compatible remote embeddings with explicit caller-controlled
+/// egress. The API key is kept in memory only and is never serialized,
+/// included in errors, or written to the RAG index.
+pub struct OpenAiEmbeddingProvider {
+    descriptor: EmbeddingProviderDescriptor,
+    endpoint: String,
+    api_key: String,
+    dimensions_requested: Option<usize>,
+    client: reqwest::blocking::Client,
+}
+
+impl OpenAiEmbeddingProvider {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        dimensions: Option<usize>,
+    ) -> Result<Self> {
+        Self::with_endpoint(
+            api_key,
+            model,
+            dimensions,
+            "https://api.openai.com/v1/embeddings",
+        )
+    }
+
+    /// Construct an OpenAI-compatible provider for a TLS endpoint. Plain HTTP
+    /// is accepted only for loopback test/development endpoints.
+    pub fn with_endpoint(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        dimensions: Option<usize>,
+        endpoint: impl Into<String>,
+    ) -> Result<Self> {
+        let api_key = api_key.into();
+        if api_key.trim().is_empty() {
+            bail!("OpenAI embedding provider requires a non-empty API key")
+        }
+        let model = model.into();
+        if model.trim().is_empty() {
+            bail!("OpenAI embedding provider requires a model")
+        }
+        let endpoint = endpoint.into();
+        let parsed_endpoint =
+            reqwest::Url::parse(&endpoint).with_context(|| "parse OpenAI embedding endpoint")?;
+        let is_loopback_http = parsed_endpoint.scheme() == "http"
+            && parsed_endpoint
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
+        if parsed_endpoint.scheme() != "https" && !is_loopback_http {
+            bail!("OpenAI embedding endpoint must use HTTPS (loopback HTTP is allowed for tests)")
+        }
+        if !parsed_endpoint.username().is_empty()
+            || parsed_endpoint.password().is_some()
+            || parsed_endpoint.query().is_some()
+            || parsed_endpoint.fragment().is_some()
+        {
+            bail!("embedding endpoint must not contain credentials, query or fragment")
+        }
+        let dimensions_requested = dimensions.map(|value| value.clamp(1, 8_192));
+        let descriptor_dimensions =
+            dimensions_requested.unwrap_or_else(|| default_embedding_dimensions(&model));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(StdDuration::from_secs(30))
+            .build()
+            .context("build embedding HTTP client")?;
+        Ok(Self {
+            descriptor: EmbeddingProviderDescriptor {
+                id: "openai".into(),
+                model,
+                dimensions: descriptor_dimensions,
+            },
+            endpoint,
+            api_key,
+            dimensions_requested,
+            client,
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl EmbeddingProvider for OpenAiEmbeddingProvider {
+    fn descriptor(&self) -> EmbeddingProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        if text.trim().is_empty() {
+            bail!("embedding input must not be empty")
+        }
+        if text.len() > 32_000 {
+            bail!("embedding input exceeds the 32,000-byte AMCP bound")
+        }
+        let request = OpenAiEmbeddingRequest {
+            input: text,
+            model: &self.descriptor.model,
+            dimensions: if self.descriptor.model.starts_with("text-embedding-3") {
+                self.dimensions_requested
+            } else {
+                None
+            },
+            encoding_format: "float",
+        };
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .context("send bounded embedding request")?;
+        let status = response.status();
+        let body = response.text().context("read bounded embedding response")?;
+        if !status.is_success() {
+            bail!("embedding provider returned HTTP {status}")
+        }
+        decode_embedding_response(&body, self.descriptor.dimensions)
+    }
+}
+
+fn default_embedding_dimensions(model: &str) -> usize {
+    if model == "text-embedding-3-large" {
+        3_072
+    } else {
+        1_536
+    }
+}
+
+fn decode_embedding_response(body: &str, expected_dimensions: usize) -> Result<Vec<f32>> {
+    let response: OpenAiEmbeddingResponse =
+        serde_json::from_str(body).context("decode embedding response")?;
+    let item = response
+        .data
+        .into_iter()
+        .find(|item| item.index == 0)
+        .context("embedding response did not contain item index 0")?;
+    if item.embedding.len() != expected_dimensions {
+        bail!(
+            "embedding dimension mismatch: expected {}, got {}",
+            expected_dimensions,
+            item.embedding.len()
+        )
+    }
+    if item.embedding.iter().any(|value| !value.is_finite()) {
+        bail!("embedding response contained a non-finite value")
+    }
+    Ok(item.embedding)
 }
 
 /// Small deterministic local baseline used for development and evaluation.
@@ -763,6 +934,11 @@ impl RagManager for DisabledRagManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[test]
     fn rag_is_disabled_by_default_and_returns_explicit_warning() {
@@ -1011,5 +1187,57 @@ mod tests {
         assert_eq!(receipt.deleted_retrieval_runs, 1);
         assert_eq!(index.stats().expect("empty stats").chunk_count, 0);
         assert_eq!(index.stats().expect("empty stats").retrieval_run_count, 0);
+    }
+
+    #[test]
+    fn openai_embedding_provider_uses_bounded_authenticated_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock embedding endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = [0_u8; 8_192];
+            let read = stream.read(&mut request).expect("read embedding request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-key")
+            );
+            assert!(request.contains("\"model\":\"text-embedding-3-small\""));
+            let body = r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2,0.3],"index":0}],"model":"text-embedding-3-small"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write embedding response");
+        });
+        let provider = OpenAiEmbeddingProvider::with_endpoint(
+            "test-key",
+            "text-embedding-3-small",
+            Some(3),
+            format!("http://127.0.0.1:{}", address.port()),
+        )
+        .expect("provider");
+        assert_eq!(
+            provider.embed("redacted context").expect("embedding"),
+            vec![0.1, 0.2, 0.3]
+        );
+        server.join().expect("mock endpoint");
+    }
+
+    #[test]
+    fn openai_embedding_provider_rejects_insecure_non_loopback_endpoint() {
+        assert!(
+            OpenAiEmbeddingProvider::with_endpoint(
+                "test-key",
+                "text-embedding-3-small",
+                Some(3),
+                "http://embedding.example/v1/embeddings",
+            )
+            .is_err()
+        );
+        assert!(OpenAiEmbeddingProvider::new("", "text-embedding-3-small", Some(3)).is_err());
     }
 }

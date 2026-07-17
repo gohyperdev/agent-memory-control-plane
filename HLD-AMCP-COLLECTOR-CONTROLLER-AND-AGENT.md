@@ -336,7 +336,13 @@ and an optional deterministic local feature-hashing provider (`local-hash`) for
 development and evaluation. This provider is not presented as a semantic model
 and performs no network egress. Lexical search must remain fully useful without
 embeddings; remote or model-backed providers require a separate consent and
-egress policy.
+egress policy. The first remote implementation is an OpenAI-compatible
+embeddings provider. It is activated only when `AMCP_RAG_EGRESS_CONSENT=true`,
+`OPENAI_API_KEY` is available, and the provider is selected explicitly. The
+default endpoint is `https://api.openai.com/v1/embeddings`; endpoint URLs must
+use TLS except for loopback test endpoints. The API key is process memory only,
+and AMCP sends bounded redacted chunks rather than native provider files.
+The request/response contract follows the [OpenAI embeddings API reference](https://developers.openai.com/api/reference/resources/embeddings/methods/create).
 
 The Controller stores the derived projection in SQLite `rag_chunks` and records
 each context request in `rag_retrieval_runs`. A retrieval load invalidates chunks

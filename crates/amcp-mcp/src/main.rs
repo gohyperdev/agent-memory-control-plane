@@ -3,7 +3,7 @@ use amcp_domain::{LifecycleState, Scope};
 use amcp_platform::default_agent_socket_path;
 use amcp_rag::{
     DisabledRagManager, EmbeddingProvider, HashedEmbeddingProvider, LexicalRagManager,
-    PersistentRagIndex, RagConfig, RagDocument, RagManager,
+    OpenAiEmbeddingProvider, PersistentRagIndex, RagConfig, RagDocument, RagManager,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -314,7 +314,7 @@ fn tool_list() -> Value {
             },
             {
                 "name": "amcp_retrieve_context",
-                "description": "Retrieve optional cited context. It is disabled by default; when AMCP_RAG_ENABLED=true, AMCP uses bounded lexical chunks from redacted FTS evidence, with optional local-hash vector ranking via AMCP_RAG_EMBEDDING_PROVIDER=local-hash.",
+                "description": "Retrieve optional cited context. It is disabled by default; AMCP uses bounded lexical chunks from redacted FTS evidence. local-hash is offline; OpenAI embeddings require AMCP_RAG_EMBEDDING_PROVIDER=openai, OPENAI_API_KEY and explicit AMCP_RAG_EGRESS_CONSENT=true.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -462,9 +462,12 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
         "amcp_runtime_thread_change_propose" => runtime_thread_change_propose(args, arguments),
         "amcp_rag_status" => {
             let index = PersistentRagIndex::open(&args.db)?;
-            Ok(
-                json!({ "enabled": env::var("AMCP_RAG_ENABLED").ok().is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")), "index": index.stats()? }),
-            )
+            Ok(json!({
+                "enabled": env::var("AMCP_RAG_ENABLED").ok().is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
+                "embedding_provider": env::var("AMCP_RAG_EMBEDDING_PROVIDER").ok(),
+                "egress_consent": env::var("AMCP_RAG_EGRESS_CONSENT").ok().is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE")),
+                "index": index.stats()?
+            }))
         }
         "amcp_retrieve_context" => {
             let query = arguments
@@ -521,6 +524,26 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                             .clone()
                             .unwrap_or_else(|| "hash-v1".into()),
                         dimensions,
+                    )?;
+                    Some(Box::new(provider))
+                } else if rag_config.embedding_provider.as_deref() == Some("openai")
+                    && env::var("AMCP_RAG_EGRESS_CONSENT")
+                        .ok()
+                        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+                {
+                    let api_key = env::var("OPENAI_API_KEY")
+                        .context("OPENAI_API_KEY is required when OpenAI RAG egress is enabled")?;
+                    let model = rag_config
+                        .embedding_model
+                        .clone()
+                        .unwrap_or_else(|| "text-embedding-3-small".into());
+                    let dimensions = env::var("AMCP_RAG_EMBEDDING_DIMENSIONS")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok());
+                    let endpoint = env::var("AMCP_RAG_EMBEDDING_ENDPOINT")
+                        .unwrap_or_else(|_| "https://api.openai.com/v1/embeddings".into());
+                    let provider = OpenAiEmbeddingProvider::with_endpoint(
+                        api_key, model, dimensions, endpoint,
                     )?;
                     Some(Box::new(provider))
                 } else {
