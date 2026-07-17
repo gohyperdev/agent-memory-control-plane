@@ -4,8 +4,11 @@
 
 use amcp_app_server::AppServerClient;
 use amcp_codex::CodexAdapter;
-use amcp_domain::change_set_operations_hash;
-use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, RuntimeThreadSnapshot, new_id};
+use amcp_domain::{
+    ApprovalEnvelope, ArtifactRef, ChangeOperation, ChangeOperationKind, ChangeReceipt, ChangeSet,
+    ChangeStatus, HostIdentity, RuntimeEvent, RuntimeThreadSnapshot, new_id,
+};
+use amcp_domain::{change_set_operations_hash, runtime_thread_state_hash};
 use amcp_file_providers::{AntigravityAdapter, ClaudeCodeAdapter, KiroAdapter};
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
@@ -691,6 +694,20 @@ where
                 runtime_cwd.as_deref(),
             )
             .await
+        } else if matches!(
+            &request.method,
+            RequestMethod::RuntimeProposeThreadChange { .. }
+                | RequestMethod::RuntimeApplyThreadChange { .. }
+        ) {
+            process_runtime_change_request(
+                request,
+                &auth,
+                codex_home.clone(),
+                &codex_bin,
+                runtime_cwd.as_deref(),
+                &state_dir,
+            )
+            .await
         } else {
             process_request(request, &auth, codex_home.clone(), &backup_dir, &state_dir)
         };
@@ -1189,6 +1206,8 @@ fn process_request(
             },
             RequestMethod::RuntimeListThreads { .. }
             | RequestMethod::RuntimeReadThread { .. }
+            | RequestMethod::RuntimeProposeThreadChange { .. }
+            | RequestMethod::RuntimeApplyThreadChange { .. }
             | RequestMethod::OpenEventStream { .. }
             | RequestMethod::CloseEventStream { .. } => Err(ProtocolError::new(
                 "runtime_request_requires_async_handler",
@@ -1732,6 +1751,381 @@ async fn process_runtime_read_request(
             result: Err(ProtocolError::new("runtime_read_failed", error.to_string())),
         },
     }
+}
+
+async fn process_runtime_change_request(
+    request: RequestEnvelope,
+    auth: &Arc<Mutex<AgentAuth>>,
+    codex_home: Option<PathBuf>,
+    codex_bin: &Path,
+    runtime_cwd: Option<&Path>,
+    state_dir: &Path,
+) -> ResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let request_token = request.token.clone();
+    let authenticated = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .accepts(request.token.as_deref());
+    if request.protocol_version != PROTOCOL_VERSION {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "protocol_version_mismatch",
+                "unsupported protocol version",
+            )),
+        };
+    }
+    if !authenticated {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+        };
+    }
+    match request.method {
+        RequestMethod::RuntimeProposeThreadChange { request } => {
+            let (thread_id, desired_archived) = match runtime_change_parts(
+                &request.scope,
+                &request.target,
+                &request.operation,
+                &host_identity().host_id,
+            ) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "runtime_change_denied",
+                            error.to_string(),
+                        )),
+                    };
+                }
+            };
+            let registry = provider_registry(codex_home.clone());
+            let provider = match registry.get(&request.target.provider_id) {
+                Ok(provider)
+                    if provider
+                        .descriptor()
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "runtime") =>
+                {
+                    provider
+                }
+                _ => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "runtime_unavailable",
+                            "provider does not expose runtime capability",
+                        )),
+                    };
+                }
+            };
+            let result = async {
+                let mut client =
+                    AppServerClient::spawn(codex_bin, codex_home.as_deref(), runtime_cwd)
+                        .await
+                        .context("start Codex app-server for runtime change proposal")?;
+                client
+                    .initialize(
+                        "amcp-agent-runtime-change-proposal",
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                    .await
+                    .context("initialize Codex app-server for runtime change proposal")?;
+                let response = client.read_thread(&thread_id).await?;
+                let thread = extract_runtime_thread_value(&response)
+                    .context("Codex runtime read returned no thread metadata")?;
+                let record = provider
+                    .map_runtime_thread_record(&host_identity(), &thread)?
+                    .context("Codex runtime read returned an unmappable thread")?;
+                let before_hash = runtime_thread_state_hash(record.archived);
+                if let Some(expected) = &request.expected_source_hash
+                    && expected != &before_hash
+                {
+                    anyhow::bail!(
+                        "runtime state conflict: expected {expected}, found {before_hash}"
+                    );
+                }
+                if record.archived == desired_archived {
+                    anyhow::bail!("runtime thread is already in the requested archive state");
+                }
+                let _ = client.shutdown().await;
+                let now = Utc::now();
+                Ok::<_, anyhow::Error>(ChangeSet {
+                    change_set_id: new_id("change"),
+                    actor: request.actor.clone(),
+                    scope: request.scope.clone(),
+                    provider_id: request.target.provider_id.clone(),
+                    reason: request.reason.clone(),
+                    evidence_ids: request.evidence_ids.clone(),
+                    status: ChangeStatus::Proposed,
+                    created_at: now,
+                    updated_at: now,
+                    operations: vec![ChangeOperation {
+                        operation_id: new_id("op"),
+                        target: request.target.clone(),
+                        operation: request.operation.clone(),
+                        expected_source_hash: Some(before_hash.clone()),
+                        before_hash: Some(before_hash),
+                        after_hash: Some(runtime_thread_state_hash(desired_archived)),
+                        replacement_content: None,
+                        diff: format!(
+                            "Codex runtime thread {thread_id}: {} -> {}",
+                            if record.archived {
+                                "archived"
+                            } else {
+                                "active"
+                            },
+                            if desired_archived {
+                                "archived"
+                            } else {
+                                "active"
+                            }
+                        ),
+                    }],
+                })
+            }
+            .await;
+            match result {
+                Ok(change_set) => ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Ok(ResponsePayload::ChangeSet(change_set)),
+                },
+                Err(error) => ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        "runtime_change_proposal_failed",
+                        error.to_string(),
+                    )),
+                },
+            }
+        }
+        RequestMethod::RuntimeApplyThreadChange {
+            change_set,
+            approval,
+        } => {
+            let operation = match change_set.operations.as_slice() {
+                [operation] => operation,
+                _ => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "runtime_change_denied",
+                            "runtime change must contain exactly one operation",
+                        )),
+                    };
+                }
+            };
+            let (thread_id, desired_archived) = match runtime_change_parts(
+                &change_set.scope,
+                &operation.target,
+                &operation.operation,
+                &host_identity().host_id,
+            ) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "runtime_change_denied",
+                            error.to_string(),
+                        )),
+                    };
+                }
+            };
+            let operations_hash = change_set_operations_hash(&change_set);
+            let approval_valid = match consume_approval(
+                auth,
+                state_dir,
+                &approval,
+                request_token.as_deref().unwrap_or_default(),
+                &change_set.change_set_id,
+                &operations_hash,
+            ) {
+                Ok(valid) => valid,
+                Err(error) => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "approval_replay_store_failed",
+                            error.to_string(),
+                        )),
+                    };
+                }
+            };
+            if !approval_valid
+                || approval.change_set_id != change_set.change_set_id
+                || approval.operations_hash != operations_hash
+            {
+                return ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        "approval_invalid",
+                        "approval envelope is invalid, expired, or not bound to runtime change",
+                    )),
+                };
+            }
+            let registry = provider_registry(codex_home.clone());
+            let provider = match registry.get(&change_set.provider_id) {
+                Ok(provider)
+                    if provider
+                        .descriptor()
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "runtime") =>
+                {
+                    provider
+                }
+                _ => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new(
+                            "runtime_unavailable",
+                            "provider does not expose runtime capability",
+                        )),
+                    };
+                }
+            };
+            let result = async {
+                let mut client =
+                    AppServerClient::spawn(codex_bin, codex_home.as_deref(), runtime_cwd)
+                        .await
+                        .context("start Codex app-server for runtime change")?;
+                client
+                    .initialize("amcp-agent-runtime-change", env!("CARGO_PKG_VERSION"))
+                    .await
+                    .context("initialize Codex app-server for runtime change")?;
+                let before_response = client.read_thread(&thread_id).await?;
+                let before_thread = extract_runtime_thread_value(&before_response)
+                    .context("Codex runtime read returned no thread metadata")?;
+                let before = provider
+                    .map_runtime_thread_record(&host_identity(), &before_thread)?
+                    .context("Codex runtime read returned an unmappable thread")?;
+                let before_hash = runtime_thread_state_hash(before.archived);
+                if operation.expected_source_hash.as_deref() != Some(before_hash.as_str()) {
+                    let _ = client.shutdown().await;
+                    return Ok::<_, anyhow::Error>(ChangeReceipt {
+                        change_set_id: change_set.change_set_id.clone(),
+                        status: ChangeStatus::Conflict,
+                        applied_at: Utc::now(),
+                        backup_references: Vec::new(),
+                        before_hashes: vec![before_hash],
+                        after_hashes: Vec::new(),
+                        message: "runtime thread state changed before apply".into(),
+                    });
+                }
+                if before.archived == desired_archived {
+                    let _ = client.shutdown().await;
+                    return Ok::<_, anyhow::Error>(ChangeReceipt {
+                        change_set_id: change_set.change_set_id.clone(),
+                        status: ChangeStatus::Conflict,
+                        applied_at: Utc::now(),
+                        backup_references: Vec::new(),
+                        before_hashes: vec![before_hash],
+                        after_hashes: Vec::new(),
+                        message: "runtime thread is already in the requested archive state".into(),
+                    });
+                }
+                if desired_archived {
+                    client.archive_thread(&thread_id).await?;
+                } else {
+                    client.unarchive_thread(&thread_id).await?;
+                }
+                let after_response = client.read_thread(&thread_id).await?;
+                let after_thread = extract_runtime_thread_value(&after_response)
+                    .context("Codex runtime read returned no thread metadata after apply")?;
+                let after = provider
+                    .map_runtime_thread_record(&host_identity(), &after_thread)?
+                    .context("Codex runtime apply returned an unmappable thread")?;
+                let after_hash = runtime_thread_state_hash(after.archived);
+                let _ = client.shutdown().await;
+                if after.archived != desired_archived
+                    || operation.after_hash.as_deref() != Some(after_hash.as_str())
+                {
+                    anyhow::bail!("runtime thread post-apply state verification failed");
+                }
+                Ok::<_, anyhow::Error>(ChangeReceipt {
+                    change_set_id: change_set.change_set_id.clone(),
+                    status: ChangeStatus::Applied,
+                    applied_at: Utc::now(),
+                    backup_references: Vec::new(),
+                    before_hashes: vec![before_hash],
+                    after_hashes: vec![after_hash],
+                    message: "runtime thread archive state applied and verified".into(),
+                })
+            }
+            .await;
+            match result {
+                Ok(receipt) => ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Ok(ResponsePayload::ChangeReceipt(receipt)),
+                },
+                Err(error) => ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        "runtime_change_apply_failed",
+                        error.to_string(),
+                    )),
+                },
+            }
+        }
+        _ => ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "invalid_runtime_request",
+                "not a runtime change request",
+            )),
+        },
+    }
+}
+
+fn runtime_change_parts(
+    scope: &amcp_domain::Scope,
+    target: &ArtifactRef,
+    operation: &ChangeOperationKind,
+    host_id: &str,
+) -> Result<(String, bool)> {
+    if target.provider_id != "codex" {
+        anyhow::bail!("runtime mutation is not implemented for this provider");
+    }
+    if target.host_id != host_id || scope.host_id.as_deref() != Some(host_id) {
+        anyhow::bail!("runtime mutation target is outside this Agent host");
+    }
+    if scope
+        .provider_id
+        .as_deref()
+        .is_some_and(|provider_id| provider_id != target.provider_id)
+    {
+        anyhow::bail!("runtime mutation provider scope does not match target");
+    }
+    if target.native_id.trim().is_empty() || target.native_id.len() > 512 {
+        anyhow::bail!("runtime thread id must be non-empty and bounded");
+    }
+    if target.source_reference != format!("codex://thread/{}", target.native_id) {
+        anyhow::bail!("runtime mutation source reference is invalid");
+    }
+    let desired_archived = match operation {
+        ChangeOperationKind::RuntimeArchive => true,
+        ChangeOperationKind::RuntimeUnarchive => false,
+        _ => anyhow::bail!("change operation is not a runtime archive operation"),
+    };
+    Ok((target.native_id.clone(), desired_archived))
 }
 
 fn runtime_event_page(
@@ -2370,6 +2764,87 @@ mod tests {
         assert!(!encoded.contains("secret transcript"));
         assert!(!encoded.contains("secret delta"));
         assert!(!encoded.contains("secret answer"));
+    }
+
+    #[tokio::test]
+    async fn runtime_archive_proposal_and_apply_use_approval_and_verify_state() {
+        let directory = tempfile::tempdir().expect("runtime change directory");
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "runtime-token".into(),
+            None,
+            300,
+        )));
+        let host = host_identity();
+        let request = RequestEnvelope::new(
+            RequestMethod::RuntimeProposeThreadChange {
+                request: amcp_domain::ChangeRequest {
+                    actor: "test-human".into(),
+                    scope: amcp_domain::Scope {
+                        host_id: Some(host.host_id.clone()),
+                        provider_id: Some("codex".into()),
+                        project_id: None,
+                    },
+                    target: ArtifactRef {
+                        host_id: host.host_id.clone(),
+                        provider_id: "codex".into(),
+                        native_id: "thread-fixture".into(),
+                        source_reference: "codex://thread/thread-fixture".into(),
+                    },
+                    expected_source_hash: None,
+                    operation: ChangeOperationKind::RuntimeArchive,
+                    replacement_content: None,
+                    reason: "archive completed fixture session".into(),
+                    evidence_ids: Vec::new(),
+                },
+            },
+            Some("runtime-token".into()),
+        );
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/fake-codex-app-server.py");
+        let response =
+            process_runtime_change_request(request, &auth, None, &fixture, None, directory.path())
+                .await;
+        let change_set = match response.result.expect("proposal should succeed") {
+            ResponsePayload::ChangeSet(change_set) => change_set,
+            other => panic!("unexpected proposal response: {other:?}"),
+        };
+        assert!(matches!(
+            change_set.operations[0].operation,
+            ChangeOperationKind::RuntimeArchive
+        ));
+        assert!(!change_set.operations[0].diff.contains("secret"));
+        let now = Utc::now();
+        let approval = ApprovalEnvelope::issue(
+            "runtime-token",
+            change_set.change_set_id.clone(),
+            "test-human",
+            now,
+            now + chrono::Duration::minutes(5),
+            "runtime-approval-1",
+            change_set_operations_hash(&change_set),
+        );
+        let response = process_runtime_change_request(
+            RequestEnvelope::new(
+                RequestMethod::RuntimeApplyThreadChange {
+                    change_set,
+                    approval,
+                },
+                Some("runtime-token".into()),
+            ),
+            &auth,
+            None,
+            &fixture,
+            None,
+            directory.path(),
+        )
+        .await;
+        match response.result.expect("runtime apply should succeed") {
+            ResponsePayload::ChangeReceipt(receipt) => {
+                assert_eq!(receipt.status, ChangeStatus::Applied);
+                assert!(receipt.backup_references.is_empty());
+            }
+            other => panic!("unexpected apply response: {other:?}"),
+        }
     }
 
     #[test]

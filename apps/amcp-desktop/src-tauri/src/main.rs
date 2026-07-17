@@ -162,6 +162,30 @@ fn approve_change(
 }
 
 #[tauri::command]
+fn propose_runtime_change(thread_id: String, archived: bool) -> Result<serde_json::Value, String> {
+    let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
+    let mut command = Command::new(controller);
+    command
+        .args(["runtime-propose", "--provider-id", "codex", "--reason"])
+        .arg(if archived {
+            "Archive runtime session from AMCP desktop"
+        } else {
+            "Unarchive runtime session from AMCP desktop"
+        })
+        .arg(if archived { "--archive" } else { "--unarchive" })
+        .arg(&thread_id)
+        .arg("--json");
+    let output = command
+        .output()
+        .map_err(|error| format!("start Controller runtime proposal: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode runtime proposal result: {error}"))
+}
+
+#[tauri::command]
 async fn ask_codex(prompt: String) -> Result<serde_json::Value, String> {
     let executable = env::var_os("AMCP_CODEX_BIN").unwrap_or_else(|| "codex".into());
     let mcp_command =
@@ -420,6 +444,7 @@ fn main() {
             list_runtime_events,
             collect_local,
             approve_change,
+            propose_runtime_change,
             ask_codex
         ])
         .run(tauri::generate_context!())

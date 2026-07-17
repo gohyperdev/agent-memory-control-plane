@@ -1,7 +1,10 @@
 use amcp_core::CatalogService;
 use amcp_domain::{LifecycleState, Scope};
 use amcp_platform::default_agent_socket_path;
-use amcp_rag::{DisabledRagManager, LexicalRagManager, RagConfig, RagDocument, RagManager};
+use amcp_rag::{
+    DisabledRagManager, HashedEmbeddingProvider, LexicalRagManager, RagConfig, RagDocument,
+    RagManager,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
@@ -280,8 +283,24 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_runtime_thread_change_propose",
+                "description": "Propose a Codex runtime archive/unarchive operation for human review. This creates an AMCP change set but does not mutate the provider.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "thread_id": { "type": "string" },
+                        "provider_id": { "type": "string", "default": "codex" },
+                        "archived": { "type": "boolean" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["thread_id", "archived", "reason"]
+                },
+                "annotations": { "readOnlyHint": false, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_retrieve_context",
-                "description": "Retrieve optional cited context. It is disabled by default; when AMCP_RAG_ENABLED=true, AMCP uses bounded lexical chunks from redacted FTS evidence until an embedding provider is configured.",
+                "description": "Retrieve optional cited context. It is disabled by default; when AMCP_RAG_ENABLED=true, AMCP uses bounded lexical chunks from redacted FTS evidence, with optional local-hash vector ranking via AMCP_RAG_EMBEDDING_PROVIDER=local-hash.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -418,6 +437,7 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
         }
         "amcp_runtime_threads_list" => runtime_threads_list(args, arguments),
         "amcp_runtime_thread_read" => runtime_thread_read(args, arguments),
+        "amcp_runtime_thread_change_propose" => runtime_thread_change_propose(args, arguments),
         "amcp_retrieve_context" => {
             let query = arguments
                 .get("query")
@@ -448,14 +468,36 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                 } else {
                     Vec::new()
                 };
-                let mut manager = LexicalRagManager::new(RagConfig {
+                let rag_config = RagConfig {
                     enabled: true,
                     allowed_scopes,
+                    embedding_provider: env::var("AMCP_RAG_EMBEDDING_PROVIDER").ok(),
+                    embedding_model: env::var("AMCP_RAG_EMBEDDING_MODEL").ok(),
                     retention_days: env::var("AMCP_RAG_RETENTION_DAYS")
                         .ok()
                         .and_then(|value| value.parse::<u32>().ok()),
                     ..RagConfig::default()
-                });
+                };
+                let mut manager = if rag_config
+                    .embedding_provider
+                    .as_deref()
+                    .is_some_and(|provider| matches!(provider, "local-hash" | "hash"))
+                {
+                    let dimensions = env::var("AMCP_RAG_EMBEDDING_DIMENSIONS")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(256);
+                    let provider = HashedEmbeddingProvider::new(
+                        rag_config
+                            .embedding_model
+                            .clone()
+                            .unwrap_or_else(|| "hash-v1".into()),
+                        dimensions,
+                    )?;
+                    LexicalRagManager::with_embedding_provider(rag_config, Box::new(provider))
+                } else {
+                    LexicalRagManager::new(rag_config)
+                };
                 let documents = hits
                     .into_iter()
                     .map(|hit| RagDocument {
@@ -603,6 +645,70 @@ fn runtime_thread_read(args: &Args, arguments: Value) -> Result<Value> {
         .is_some_and(|host_id| result.get("host_id").and_then(Value::as_str) != Some(host_id))
     {
         anyhow::bail!("runtime response host does not match requested host scope");
+    }
+    Ok(result)
+}
+
+fn runtime_thread_change_propose(args: &Args, arguments: Value) -> Result<Value> {
+    let requested_host = arguments.get("host_id").and_then(Value::as_str);
+    let thread_id = arguments
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .context("amcp_runtime_thread_change_propose requires thread_id")?;
+    let archived = arguments
+        .get("archived")
+        .and_then(Value::as_bool)
+        .context("amcp_runtime_thread_change_propose requires archived")?;
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .context("amcp_runtime_thread_change_propose requires reason")?;
+    let provider_id = arguments
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let mut command = Command::new(&args.controller_bin);
+    command
+        .args(["runtime-propose", "--socket"])
+        .arg(&args.agent_socket)
+        .args(["--provider-id", provider_id, "--db"])
+        .arg(&args.db)
+        .args(["--token", &args.agent_token, "--reason", reason])
+        .arg(if archived { "--archive" } else { "--unarchive" })
+        .arg(thread_id)
+        .arg("--json")
+        .arg("--no-start-agent");
+    if let Some(agent_url) = &args.agent_url {
+        command.args(["--agent-url", agent_url]);
+    }
+    if let Some(tls_ca) = &args.tls_ca {
+        command.args(["--tls-ca"]).arg(tls_ca);
+    }
+    if let Some(server_name) = &args.tls_server_name {
+        command.args(["--tls-server-name", server_name]);
+    }
+    if let Some(codex_home) = &args.codex_home {
+        command.args(["--codex-home"]).arg(codex_home);
+    }
+    let output = command
+        .output()
+        .context("start Controller runtime change proposal")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Controller runtime change proposal failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let result: Value =
+        serde_json::from_slice(&output.stdout).context("decode runtime change proposal")?;
+    if requested_host.is_some_and(|host_id| {
+        result
+            .get("scope")
+            .and_then(|scope| scope.get("host_id"))
+            .and_then(Value::as_str)
+            != Some(host_id)
+    }) {
+        anyhow::bail!("runtime proposal does not match requested host scope");
     }
     Ok(result)
 }

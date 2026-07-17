@@ -82,6 +82,8 @@ pub enum ChangeOperationKind {
     ReplaceText,
     CreateText,
     DeleteFile,
+    RuntimeArchive,
+    RuntimeUnarchive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +532,20 @@ pub fn change_set_operations_hash(change_set: &ChangeSet) -> String {
     .expect("change operations should always be serializable");
     let mut hasher = Sha256::new();
     hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
+/// Optimistic-concurrency hash for provider runtime lifecycle state. It binds
+/// an approval to the state observed during proposal without exposing the
+/// provider-native thread payload.
+pub fn runtime_thread_state_hash(archived: bool) -> String {
+    let mut hasher = Sha256::new();
+    let state: &[u8] = if archived {
+        b"amcp-runtime-thread:archived"
+    } else {
+        b"amcp-runtime-thread:active"
+    };
+    hasher.update(state);
     hex::encode(hasher.finalize())
 }
 

@@ -70,6 +70,13 @@ pub enum RequestMethod {
         scope: Option<Scope>,
         thread_id: String,
     },
+    RuntimeProposeThreadChange {
+        request: ChangeRequest,
+    },
+    RuntimeApplyThreadChange {
+        change_set: ChangeSet,
+        approval: ApprovalEnvelope,
+    },
     AckEvents {
         event_ids: Vec<String>,
     },

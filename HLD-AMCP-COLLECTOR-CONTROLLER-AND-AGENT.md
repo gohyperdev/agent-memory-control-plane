@@ -324,7 +324,12 @@ The RAG Manager is disabled by default and operates only on approved, redacted r
 - Never returns uncited generated memory as if it were source data.
 - Supports deletion propagation across content, chunks, embeddings, caches, and references.
 
-The first release can ship with the RAG Manager interface and a disabled implementation. Lexical search must remain fully useful without embeddings.
+The first release ships with the RAG Manager interface, a disabled implementation,
+and an optional deterministic local feature-hashing provider (`local-hash`) for
+development and evaluation. This provider is not presented as a semantic model
+and performs no network egress. Lexical search must remain fully useful without
+embeddings; remote or model-backed providers require a separate consent and
+egress policy.
 
 ### 7.7 Embedded Codex integration
 
@@ -443,9 +448,13 @@ transcript-read API: item text, deltas, tool arguments, provider-native fields,
 and raw app-server response objects are discarded on the Agent. The Controller
 CLI exposes this as `runtime-read`, and the embedded MCP gateway exposes it as
 `amcp_runtime_thread_read`, both with the same host/provider scope checks. A
-future `RuntimeSetThreadArchived` operation must use the existing human
-approval/replay mechanism before calling the provider's archive or unarchive
-runtime method.
+Runtime lifecycle changes are now represented as the existing `ChangeSet` with
+`RuntimeArchive` or `RuntimeUnarchive` operation kinds. `RuntimeProposeThreadChange`
+reads the current state and binds the proposal to a runtime-state hash;
+`RuntimeApplyThreadChange` requires the existing short-lived, single-use human
+approval envelope, re-reads the thread, calls the provider runtime API, and
+verifies the post-operation state. The Controller exposes `runtime-propose`,
+while the desktop approval queue and MCP proposal tool use the same flow.
 
 RAG chunk retention is applied independently from native provider retention. A
 configured retention window purges derived chunks before retrieval; disabling or

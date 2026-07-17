@@ -6,6 +6,8 @@ import sys
 
 
 def main() -> None:
+    archived = False
+
     for line in sys.stdin:
         message = json.loads(line)
         request_id = message.get("id")
@@ -23,10 +25,31 @@ def main() -> None:
                         "cwd": "/tmp/amcp-fixture-project",
                         "model": "gpt-fixture",
                         "status": "idle",
-                        "archived": False,
+                        "archived": archived,
                     }
                 ]
             }
+        elif method == "thread/read":
+            result = {
+                "thread": {
+                    "id": "thread-fixture",
+                    "title": "Fixture session api_key=fixture-secret",
+                    "cwd": "/tmp/amcp-fixture-project",
+                    "model": "gpt-fixture",
+                    "status": "idle",
+                    "archived": archived,
+                },
+                "items": [
+                    {"type": "userMessage", "role": "user", "text": "secret transcript"},
+                    {"type": "agentMessage", "role": "assistant", "delta": "secret delta"},
+                ],
+            }
+        elif method == "thread/archive":
+            archived = True
+            result = {"threadId": "thread-fixture", "archived": True}
+        elif method == "thread/unarchive":
+            archived = False
+            result = {"threadId": "thread-fixture", "archived": False}
         else:
             result = {}
         sys.stdout.write(json.dumps({"id": request_id, "result": result}) + "\n")

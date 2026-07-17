@@ -181,6 +181,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "serde",
+ "sha2",
 ]
 
 [[package]]

@@ -163,6 +163,45 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    RuntimePropose {
+        #[arg(
+            long,
+            default_value_os_t = default_agent_socket_path(),
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long, default_value = "codex", env = "AMCP_PROVIDER_ID")]
+        provider_id: String,
+        #[arg(long, conflicts_with = "unarchive")]
+        archive: bool,
+        #[arg(long, conflicts_with = "archive")]
+        unarchive: bool,
+        thread_id: String,
+        #[arg(long, default_value = "runtime thread lifecycle change")]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
     StreamEvents {
         #[arg(
             long,
@@ -487,6 +526,42 @@ async fn main() -> Result<()> {
                 no_start_agent,
                 provider_id,
                 thread_id,
+                json,
+            )
+            .await
+        }
+        CommandKind::RuntimePropose {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            provider_id,
+            archive,
+            unarchive,
+            thread_id,
+            reason,
+            json,
+        } => {
+            runtime_propose(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                provider_id,
+                archive,
+                unarchive,
+                thread_id,
+                reason,
                 json,
             )
             .await
@@ -1214,6 +1289,109 @@ async fn runtime_read(
     Ok(())
 }
 
+async fn runtime_propose(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    provider_id: String,
+    archive: bool,
+    unarchive: bool,
+    thread_id: String,
+    reason: String,
+    json: bool,
+) -> Result<()> {
+    if archive == unarchive {
+        bail!("exactly one of --archive or --unarchive is required");
+    }
+    let token = resolve_agent_token(&token);
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await
+        .context("connect to AMCP Agent")?;
+        let mut client = AgentClient::new(stream);
+        let (host, agent_version, capabilities, _) =
+            register_and_refresh(&mut client, &token).await?;
+        let operation = if archive {
+            amcp_domain::ChangeOperationKind::RuntimeArchive
+        } else {
+            amcp_domain::ChangeOperationKind::RuntimeUnarchive
+        };
+        let request = ChangeRequest {
+            actor: "human-or-controller".into(),
+            scope: Scope {
+                host_id: Some(host.host_id.clone()),
+                provider_id: Some(provider_id.clone()),
+                project_id: None,
+            },
+            target: ArtifactRef {
+                host_id: host.host_id.clone(),
+                provider_id: provider_id.clone(),
+                native_id: thread_id.clone(),
+                source_reference: format!("codex://thread/{thread_id}"),
+            },
+            expected_source_hash: None,
+            operation,
+            replacement_content: None,
+            reason,
+            evidence_ids: Vec::new(),
+        };
+        let change_set = match client
+            .request(
+                RequestMethod::RuntimeProposeThreadChange { request },
+                &token,
+            )
+            .await?
+        {
+            ResponsePayload::ChangeSet(change_set) => change_set,
+            other => bail!("Agent returned unexpected runtime proposal response: {other:?}"),
+        };
+        let mut catalog = CatalogService::open(&db)?;
+        let endpoint = agent_url
+            .clone()
+            .unwrap_or_else(|| format!("unix://{}", socket.display()));
+        catalog.register_connection(&host, Some(&endpoint), Some(&agent_version), &capabilities)?;
+        catalog.save_change_set(&change_set)?;
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        Ok::<_, anyhow::Error>(change_set)
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let change_set = result?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&change_set)?);
+    } else {
+        println!(
+            "Proposed runtime {} with {} operation(s): {}",
+            change_set.change_set_id,
+            change_set.operations.len(),
+            change_set.reason
+        );
+        for operation in &change_set.operations {
+            println!("{}", operation.diff);
+        }
+    }
+    Ok(())
+}
+
 async fn enroll(
     socket: PathBuf,
     agent_url: Option<String>,
@@ -1493,11 +1671,25 @@ async fn approve_change(
         .await?;
         let mut client = AgentClient::new(stream);
         register_and_refresh(&mut client, &token).await?;
+        let runtime_change = change_set.operations.iter().any(|operation| {
+            matches!(
+                operation.operation,
+                amcp_domain::ChangeOperationKind::RuntimeArchive
+                    | amcp_domain::ChangeOperationKind::RuntimeUnarchive
+            )
+        });
         let receipt = match client
             .request(
-                RequestMethod::ApplyChange {
-                    change_set: change_set.clone(),
-                    approval,
+                if runtime_change {
+                    RequestMethod::RuntimeApplyThreadChange {
+                        change_set: change_set.clone(),
+                        approval,
+                    }
+                } else {
+                    RequestMethod::ApplyChange {
+                        change_set: change_set.clone(),
+                        approval,
+                    }
                 },
                 &token,
             )

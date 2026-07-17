@@ -10,3 +10,4 @@ amcp-domain = { path = "../amcp-domain" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
+sha2.workspace = true

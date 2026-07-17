@@ -123,6 +123,7 @@ function App() {
   const [codexPrompt, setCodexPrompt] = useState("Summarize the most important configuration and memory signals in AMCP.");
   const [codexReply, setCodexReply] = useState<string | null>(null);
   const [askingCodex, setAskingCodex] = useState(false);
+  const [proposingRuntime, setProposingRuntime] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -254,6 +255,22 @@ function App() {
     }
   };
 
+  const proposeRuntimeChange = async (session: Session) => {
+    try {
+      setProposingRuntime(session.session_id);
+      setError(null);
+      await invoke("propose_runtime_change", {
+        threadId: session.session_id,
+        archived: !session.archived,
+      });
+      setChanges(await invoke<ChangeSet[]>("list_changes"));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setProposingRuntime(null);
+    }
+  };
+
   const connectedHosts = useMemo(() => hosts.filter((host) => host.status === "Connected"), [hosts]);
 
   const navigation = [
@@ -342,7 +359,7 @@ function App() {
               <div className="inventory-card"><div className="inventory-card-head"><strong>Guidance chain</strong><span>{guidance.length}</span></div>{guidance.slice(0, 4).map((item) => <div className="inventory-item" key={item.guidance_id}><span className="inventory-symbol">☷</span><div><strong>{item.kind}</strong><small>precedence {item.precedence_rank} · {item.source_reference}</small></div></div>)}{!guidance.length && <div className="change-empty">No AGENTS guidance discovered yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Projects</strong><span>{projects.length}</span></div>{projects.slice(0, 4).map((project) => <div className="inventory-item" key={project.project_id}><span className="inventory-symbol">◈</span><div><strong>{project.display_name}</strong><small>{project.trust_level ?? "trust unknown"} · {project.root_path}</small></div></div>)}{!projects.length && <div className="change-empty">No normalized projects yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Memories</strong><span>{memories.length}</span></div>{memories.slice(0, 4).map((memory) => <div className="inventory-item" key={memory.memory_record_id}><span className="inventory-symbol">✦</span><div><strong>{memory.title}</strong><small>{memory.lifecycle} · {memory.source_reference}</small></div></div>)}{!memories.length && <div className="change-empty">No normalized memories yet.</div>}</div>
-              <div className="inventory-card"><div className="inventory-card-head"><strong>Sessions</strong><span>{sessions.length}</span></div>{sessions.slice(0, 4).map((session) => <button className={selectedSessionId === session.session_id ? "inventory-item session-item selected" : "inventory-item session-item"} key={session.session_id} onClick={() => void inspectSession(session)}><span className="inventory-symbol">◌</span><div><strong>{session.title ?? session.session_id}</strong><small>{session.model ?? "model unknown"} · {session.archived ? "archived" : "active"}</small></div></button>)}{!sessions.length && <div className="change-empty">No normalized sessions yet.</div>}</div>
+              <div className="inventory-card"><div className="inventory-card-head"><strong>Sessions</strong><span>{sessions.length}</span></div>{sessions.slice(0, 4).map((session) => <div className="session-entry" key={session.session_id}><button className={selectedSessionId === session.session_id ? "inventory-item session-item selected" : "inventory-item session-item"} onClick={() => void inspectSession(session)}><span className="inventory-symbol">◌</span><div><strong>{session.title ?? session.session_id}</strong><small>{session.model ?? "model unknown"} · {session.archived ? "archived" : "active"}</small></div></button><button className="session-action" onClick={() => void proposeRuntimeChange(session)} disabled={proposingRuntime === session.session_id}>{proposingRuntime === session.session_id ? "…" : session.archived ? "Unarchive" : "Archive"}</button></div>)}{!sessions.length && <div className="change-empty">No normalized sessions yet.</div>}</div>
             </div>
             {selectedSessionId && <div className="session-inspector"><div className="section-heading"><div><span className="eyebrow">Session evidence</span><h2>{selectedSessionId}</h2></div><span className="scope-pill">{sessionItems.length} bounded items</span></div><div className="session-item-list">{sessionItems.map((item) => <article className="session-event" key={`${item.session_id}-${item.sequence}`}><div><span className="type-chip">{item.role ?? "event"}</span><strong>{item.item_kind}</strong><time>{new Date(item.observed_at).toLocaleString()}</time></div>{item.content ? <pre>{item.content}</pre> : <small>Metadata-only event; transcript payload is not stored.</small>}</article>)}{!sessionItems.length && <div className="change-empty">No session items available.</div>}</div></div>}
           </section>
