@@ -352,6 +352,14 @@ For a selected task scope, the gateway:
 
 Codex does not receive direct access to remote filesystem paths. It receives AMCP tool results and must use evidence references to request more detail.
 
+The same boundary exposes a scoped `read-artifact` operation for safe provider
+documents. The Controller passes the host/provider/source reference to the
+owning Agent; the Agent resolves the provider-owned path, applies its redaction
+policy, bounds the returned content, and rejects unsupported or out-of-scope
+targets. The desktop inspector and `amcp_artifact_read` MCP tool use this live
+read path. Human editing starts from the returned content and creates a normal
+`ChangeSet`; it never writes directly from the UI or MCP.
+
 ## 8. AMCP Agent design
 
 ### 8.1 Internal modules

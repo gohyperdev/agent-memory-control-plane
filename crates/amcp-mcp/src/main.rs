@@ -164,6 +164,20 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_artifact_read",
+                "description": "Read one bounded, redacted provider document from its owning Agent. The host and provider scope are mandatory; native credentials and unsupported documents are never returned.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "provider_id": { "type": "string", "default": "codex" },
+                        "source_reference": { "type": "string", "description": "Provider-owned source reference returned by AMCP search." }
+                    },
+                    "required": ["host_id", "source_reference"]
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_providers_list",
                 "description": "List provider adapters and negotiated capabilities by host. Inventory-only providers are valid and expose no mutation capability.",
                 "inputSchema": {
@@ -336,6 +350,7 @@ fn tool_list() -> Value {
                     "type": "object",
                     "properties": {
                         "host_id": { "type": "string" },
+                        "provider_id": { "type": "string", "default": "codex" },
                         "source": { "type": "string", "description": "Absolute path to an allowed provider document." },
                         "replacement": { "type": "string" },
                         "reason": { "type": "string" }
@@ -388,6 +403,7 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                 })).collect::<Vec<_>>()
             }))
         }
+        "amcp_artifact_read" => read_artifact(args, arguments),
         "amcp_hosts_list" => Ok(json!({ "hosts": catalog.list_hosts()? })),
         "amcp_providers_list" => {
             let host_id = arguments.get("host_id").and_then(Value::as_str);
@@ -560,6 +576,69 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
         "amcp_change_propose" => propose_change(args, arguments),
         _ => anyhow::bail!("unknown AMCP tool: {name}"),
     }
+}
+
+fn read_artifact(args: &Args, arguments: Value) -> Result<Value> {
+    let host_id = arguments
+        .get("host_id")
+        .and_then(Value::as_str)
+        .context("amcp_artifact_read requires host_id")?;
+    let provider_id = arguments
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let source_reference = arguments
+        .get("source_reference")
+        .and_then(Value::as_str)
+        .context("amcp_artifact_read requires source_reference")?;
+    if source_reference.len() > 4_096 {
+        anyhow::bail!("source_reference exceeds the safety limit");
+    }
+    let mut command = Command::new(&args.controller_bin);
+    command
+        .args(["read-artifact", "--socket"])
+        .arg(&args.agent_socket)
+        .args([
+            "--host-id",
+            host_id,
+            "--provider-id",
+            provider_id,
+            "--source",
+            source_reference,
+            "--token",
+            &args.agent_token,
+            "--json",
+            "--no-start-agent",
+        ]);
+    if let Some(agent_url) = &args.agent_url {
+        command.args(["--agent-url", agent_url]);
+    }
+    if let Some(tls_ca) = &args.tls_ca {
+        command.args(["--tls-ca", tls_ca.to_string_lossy().as_ref()]);
+    }
+    if let Some(server_name) = &args.tls_server_name {
+        command.args(["--tls-server-name", server_name]);
+    }
+    if let Some(codex_home) = &args.codex_home {
+        command.args(["--codex-home", codex_home.to_string_lossy().as_ref()]);
+    }
+    let output = command.output().context("start Controller artifact read")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Controller artifact read failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let artifact: Value =
+        serde_json::from_slice(&output.stdout).context("decode Controller artifact response")?;
+    Ok(json!({
+        "artifact": artifact,
+        "host_id": host_id,
+        "provider_id": provider_id,
+        "source_reference": source_reference,
+        "redacted": true,
+        "citation": format!("{source_reference}#live-read")
+    }))
 }
 
 fn runtime_threads_list(args: &Args, arguments: Value) -> Result<Value> {
@@ -737,6 +816,10 @@ fn propose_change(args: &Args, arguments: Value) -> Result<Value> {
         .get("source")
         .and_then(Value::as_str)
         .context("amcp_change_propose requires source")?;
+    let provider_id = arguments
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
     let replacement = arguments
         .get("replacement")
         .and_then(Value::as_str)
@@ -759,7 +842,13 @@ fn propose_change(args: &Args, arguments: Value) -> Result<Value> {
     command
         .args(["propose-change", "--socket"])
         .arg(&args.agent_socket)
-        .args(["--source", source, "--replacement-file"])
+        .args([
+            "--provider-id",
+            provider_id,
+            "--source",
+            source,
+            "--replacement-file",
+        ])
         .arg(&replacement_file)
         .args(["--reason", reason, "--host-id", host_id, "--db"])
         .arg(&args.db)

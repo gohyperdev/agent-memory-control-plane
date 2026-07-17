@@ -255,6 +255,40 @@ enum CommandKind {
         #[arg(long)]
         json: bool,
     },
+    ReadArtifact {
+        #[arg(
+            long,
+            default_value_os_t = default_agent_socket_path(),
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long, default_value = "codex", env = "AMCP_PROVIDER_ID")]
+        provider_id: String,
+        #[arg(long)]
+        host_id: Option<String>,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        json: bool,
+    },
     ProposeChange {
         #[arg(
             long,
@@ -288,6 +322,8 @@ enum CommandKind {
         replacement_file: PathBuf,
         #[arg(long)]
         reason: String,
+        #[arg(long, default_value = "codex", env = "AMCP_PROVIDER_ID")]
+        provider_id: String,
         #[arg(long)]
         host_id: Option<String>,
         #[arg(long)]
@@ -613,6 +649,7 @@ async fn main() -> Result<()> {
             source,
             replacement_file,
             reason,
+            provider_id,
             host_id,
             json,
         } => {
@@ -629,6 +666,7 @@ async fn main() -> Result<()> {
                 source,
                 replacement_file,
                 reason,
+                provider_id,
                 host_id.unwrap_or_else(host_id_from_env),
                 json,
             )
@@ -704,6 +742,36 @@ async fn main() -> Result<()> {
             batch_size,
             json,
         } => rebuild_index(db.unwrap_or_else(default_db_path), batch_size, json),
+        CommandKind::ReadArtifact {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            agent_bin,
+            no_start_agent,
+            provider_id,
+            host_id,
+            source,
+            json,
+        } => {
+            read_artifact(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                agent_bin,
+                no_start_agent,
+                provider_id,
+                host_id,
+                source,
+                json,
+            )
+            .await
+        }
         CommandKind::KeychainStore { host_id, token } => {
             store_keychain_credential(&host_id, &token)
         }
@@ -1535,6 +1603,82 @@ fn rebuild_index(db: PathBuf, batch_size: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
+async fn read_artifact(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    provider_id: String,
+    requested_host_id: Option<String>,
+    source: String,
+    json: bool,
+) -> Result<()> {
+    let token = resolve_agent_token(&token);
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await
+        .context("connect to AMCP Agent")?;
+        let mut client = AgentClient::new(stream);
+        let (host, _, _, _) = register_and_refresh(&mut client, &token).await?;
+        let host_id = requested_host_id.unwrap_or_else(|| host.host_id.clone());
+        if host_id != host.host_id {
+            bail!(
+                "requested host scope {host_id} does not match connected Agent host {}",
+                host.host_id
+            );
+        }
+        let response = client
+            .request(
+                RequestMethod::ReadArtifact {
+                    target: ArtifactRef {
+                        host_id: host_id.clone(),
+                        provider_id: provider_id.clone(),
+                        native_id: source.clone(),
+                        source_reference: source.clone(),
+                    },
+                    redacted: true,
+                },
+                &token,
+            )
+            .await?;
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        match response {
+            ResponsePayload::Artifact(artifact) => Ok::<_, anyhow::Error>(artifact),
+            other => bail!("Agent returned unexpected artifact response: {other:?}"),
+        }
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let artifact = result?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&artifact)?);
+    } else {
+        println!(
+            "{} [{}] {}",
+            artifact.title, artifact.provider_id, artifact.source_reference
+        );
+        println!("{}", artifact.content);
+    }
+    Ok(())
+}
+
 async fn propose_change(
     socket: PathBuf,
     agent_url: Option<String>,
@@ -1548,6 +1692,7 @@ async fn propose_change(
     source: PathBuf,
     replacement_file: PathBuf,
     reason: String,
+    provider_id: String,
     host_id: String,
     json: bool,
 ) -> Result<()> {
@@ -1580,7 +1725,7 @@ async fn propose_change(
             scope: Scope::host(host_id.clone()),
             target: ArtifactRef {
                 host_id,
-                provider_id: "codex".into(),
+                provider_id,
                 native_id: target_path.clone(),
                 source_reference: target_path,
             },

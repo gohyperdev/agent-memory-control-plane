@@ -234,6 +234,10 @@ impl CodexAdapter {
             Some("config.toml") => ArtifactKind::Configuration,
             _ => bail!("artifact is not a supported safe Codex document"),
         };
+        let metadata = fs::metadata(&path)?;
+        if metadata.len() > 1_000_000 {
+            bail!("artifact exceeds the 1 MiB live-read safety limit");
+        }
         Ok(self.file_artifact(&path, kind, host, &new_id("read"), true)?)
     }
 
@@ -1635,6 +1639,46 @@ mod tests {
         )
         .expect("change project config");
         assert_ne!(before_cursor, adapter.discovery_cursor());
+    }
+
+    #[test]
+    fn live_artifact_read_is_bounded_redacted_and_host_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "model = \"gpt-test\"\napi_key = \"fixture-secret\"\n",
+        )
+        .expect("write config");
+        let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));
+        let host = HostIdentity {
+            host_id: "host-live-read".into(),
+            display_name: "Live read fixture".into(),
+            platform: "macos".into(),
+            hostname: "fixture.local".into(),
+        };
+        let target = ArtifactRef {
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.into(),
+            native_id: config.to_string_lossy().into_owned(),
+            source_reference: config.to_string_lossy().into_owned(),
+        };
+        let artifact = adapter
+            .read_artifact(&target, &host)
+            .expect("read artifact");
+        assert!(artifact.content.contains("[REDACTED]"));
+        assert!(!artifact.content.contains("fixture-secret"));
+        assert!(
+            adapter
+                .read_artifact(
+                    &ArtifactRef {
+                        host_id: "other-host".into(),
+                        ..target
+                    },
+                    &host
+                )
+                .is_err()
+        );
     }
 
     #[test]

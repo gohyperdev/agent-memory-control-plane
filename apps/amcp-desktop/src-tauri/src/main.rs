@@ -6,7 +6,7 @@ use amcp_core::CatalogService;
 use amcp_domain::{
     ArtifactRecord, ChangeSet, CollectionBatch, ConfigLayerRecord, GuidanceRecord, HostIdentity,
     HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, ProviderRecord, RuntimeEvent,
-    SessionItem, SessionRecord,
+    SessionItem, SessionRecord, new_id,
 };
 use amcp_storage::SearchHit;
 use chrono::Utc;
@@ -108,6 +108,71 @@ fn search_catalog(
         .map_err(|error| error.to_string())?
         .search_scoped(&query, 50, host_id.as_deref(), provider_id.as_deref(), None)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn read_artifact(
+    host_id: String,
+    provider_id: String,
+    source_reference: String,
+) -> Result<ArtifactRecord, String> {
+    let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
+    let output = Command::new(controller)
+        .args([
+            "read-artifact",
+            "--host-id",
+            &host_id,
+            "--provider-id",
+            &provider_id,
+            "--source",
+            &source_reference,
+            "--json",
+        ])
+        .output()
+        .map_err(|error| format!("start Controller artifact read: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode artifact read result: {error}"))
+}
+
+#[tauri::command]
+fn propose_artifact_change(
+    host_id: String,
+    provider_id: String,
+    source_reference: String,
+    replacement: String,
+    reason: String,
+) -> Result<serde_json::Value, String> {
+    let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
+    let replacement_file = env::temp_dir().join(format!("amcp-ui-replacement-{}.txt", new_id("file")));
+    std::fs::write(&replacement_file, replacement)
+        .map_err(|error| format!("write ephemeral proposal input: {error}"))?;
+    let output = Command::new(controller)
+        .args([
+            "propose-change",
+            "--provider-id",
+            &provider_id,
+            "--source",
+            &source_reference,
+            "--replacement-file",
+            replacement_file.to_string_lossy().as_ref(),
+            "--reason",
+            &reason,
+            "--host-id",
+            &host_id,
+            "--json",
+        ])
+        .output()
+        .map_err(|error| format!("start Controller proposal: {error}"));
+    let _ = std::fs::remove_file(&replacement_file);
+    let output = output?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode proposal result: {error}"))
 }
 
 #[tauri::command]
@@ -441,6 +506,8 @@ fn main() {
             list_config_layers,
             list_guidance,
             search_catalog,
+            read_artifact,
+            propose_artifact_change,
             list_runtime_events,
             collect_local,
             approve_change,

@@ -31,6 +31,17 @@ type SearchHit = {
   observed_at: string;
 };
 
+type ArtifactRecord = {
+  artifact_id: string;
+  host_id: string;
+  provider_id: string;
+  title: string;
+  source_reference: string;
+  content: string;
+  sensitivity: string;
+  observed_at: string;
+};
+
 type ChangeSet = {
   change_set_id: string;
   reason: string;
@@ -116,6 +127,11 @@ function App() {
   const [query, setQuery] = useState("sandbox");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [selected, setSelected] = useState<SearchHit | null>(null);
+  const [artifactDetail, setArtifactDetail] = useState<ArtifactRecord | null>(null);
+  const [readingArtifact, setReadingArtifact] = useState(false);
+  const [replacementText, setReplacementText] = useState("");
+  const [changeReason, setChangeReason] = useState("Update agent document from AMCP");
+  const [proposingArtifact, setProposingArtifact] = useState(false);
   const [activeNav, setActiveNav] = useState("System map");
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -245,6 +261,47 @@ function App() {
     }
   };
 
+  const inspectArtifact = async (hit: SearchHit) => {
+    setSelected(hit);
+    setArtifactDetail(null);
+    try {
+      setReadingArtifact(true);
+      setError(null);
+      const artifact = await invoke<ArtifactRecord>("read_artifact", {
+        hostId: hit.host_id,
+        providerId: hit.provider_id,
+        sourceReference: hit.source_reference,
+      });
+      setArtifactDetail(artifact);
+      setReplacementText(artifact.content);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setReadingArtifact(false);
+    }
+  };
+
+  const proposeArtifactChange = async () => {
+    if (!selected || !artifactDetail || !replacementText.trim()) return;
+    try {
+      setProposingArtifact(true);
+      setError(null);
+      await invoke("propose_artifact_change", {
+        hostId: selected.host_id,
+        providerId: selected.provider_id,
+        sourceReference: selected.source_reference,
+        replacement: replacementText,
+        reason: changeReason,
+      });
+      setChanges(await invoke<ChangeSet[]>("list_changes"));
+      setReplacementText("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setProposingArtifact(false);
+    }
+  };
+
   const inspectSession = async (session: Session) => {
     try {
       setError(null);
@@ -327,11 +384,11 @@ function App() {
           <div className="explorer">
             <div className="results-panel">
               <div className="panel-toolbar"><span>{hits.length ? `${hits.length} results` : "Run a search to inspect indexed evidence"}</span><button>Filters ˅</button></div>
-              {hits.map((hit) => <button className={selected?.artifact_id === hit.artifact_id ? "result selected" : "result"} key={hit.artifact_id} onClick={() => setSelected(hit)}><div className="result-top"><span className="type-chip">{hit.provider_id}</span><time>{new Date(hit.observed_at).toLocaleDateString()}</time></div><strong>{hit.title}</strong><p>{hit.preview}</p><small>{hit.source_reference}</small></button>)}
+              {hits.map((hit) => <button className={selected?.artifact_id === hit.artifact_id ? "result selected" : "result"} key={hit.artifact_id} onClick={() => void inspectArtifact(hit)}><div className="result-top"><span className="type-chip">{hit.provider_id}</span><time>{new Date(hit.observed_at).toLocaleDateString()}</time></div><strong>{hit.title}</strong><p>{hit.preview}</p><small>{hit.source_reference}</small></button>)}
               {!hits.length && <div className="empty-state"><div className="empty-glyph">⌁</div><strong>Search the AMCP catalog</strong><p>Results are redacted, source-linked, and scoped to the connected hosts.</p><button className="primary" onClick={() => void search()}>Search “{query}”</button></div>}
             </div>
             <aside className="inspector">
-              {selected ? <><div className="inspector-header"><span className="type-chip">{selected.provider_id}</span><button>•••</button></div><h3>{selected.title}</h3><p className="path">{selected.source_reference}</p><div className="meta-grid"><div><small>Host</small><strong>{selected.host_id}</strong></div><div><small>Sensitivity</small><strong>{selected.sensitivity}</strong></div><div><small>Artifact</small><strong>{selected.artifact_id.slice(0, 16)}</strong></div><div><small>Observed</small><strong>{new Date(selected.observed_at).toLocaleString()}</strong></div></div><div className="evidence"><div className="evidence-heading"><span>Evidence preview</span><span className="verified">✓ redacted</span></div><pre>{selected.preview}</pre></div><button className="secondary">Open in explorer</button></> : <div className="inspector-empty"><span>◌</span><p>Select an evidence record to inspect provenance, scope, and safe content.</p></div>}
+              {selected ? <><div className="inspector-header"><span className="type-chip">{selected.provider_id}</span><span className="verified">{readingArtifact ? "Reading live…" : artifactDetail ? "✓ live redacted read" : "indexed preview"}</span></div><h3>{selected.title}</h3><p className="path">{selected.source_reference}</p><div className="meta-grid"><div><small>Host</small><strong>{selected.host_id}</strong></div><div><small>Sensitivity</small><strong>{selected.sensitivity}</strong></div><div><small>Artifact</small><strong>{selected.artifact_id.slice(0, 16)}</strong></div><div><small>Observed</small><strong>{new Date(selected.observed_at).toLocaleString()}</strong></div></div><div className="evidence"><div className="evidence-heading"><span>{artifactDetail ? "Live artifact content" : "Evidence preview"}</span><span className="verified">✓ redacted</span></div><pre>{artifactDetail?.content ?? selected.preview}</pre></div><button className="secondary" onClick={() => void inspectArtifact(selected)} disabled={readingArtifact}>{readingArtifact ? "Reading…" : "Read from Agent"}</button>{artifactDetail && <div className="proposal-editor"><div className="evidence-heading"><span>Propose replacement</span><span className="verified">Approval required</span></div><textarea value={replacementText} onChange={(event) => setReplacementText(event.target.value)} /><input value={changeReason} onChange={(event) => setChangeReason(event.target.value)} aria-label="Change reason" /><button className="primary" onClick={() => void proposeArtifactChange()} disabled={proposingArtifact || !replacementText.trim()}>{proposingArtifact ? "Creating proposal…" : "Create change proposal"}</button></div>}</> : <div className="inspector-empty"><span>◌</span><p>Select an evidence record to inspect provenance, scope, and safe content.</p></div>}
             </aside>
           </div>
 

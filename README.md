@@ -54,6 +54,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - Central FTS5 search is maintained incrementally during collection, records projection runs, and supports bounded chunk rebuilds through `amcp-controller rebuild-index`.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/session-item/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.
+- The Controller exposes a scoped `read-artifact` path used by MCP `amcp_artifact_read` and the desktop inspector for live, bounded, redacted reads from the owning Agent. The inspector can turn that content into a provider-validated change proposal; it never writes directly.
 - `amcp-app-server` supervises the documented Codex app-server stdio protocol, captures bounded notification summaries, and supports initialization, thread/turn start, streamed notifications, and interruption.
 - The app-server client also exposes thread list/read/archive/unarchive primitives; the desktop session explorer displays bounded session items and metadata-only event summaries.
 - Embedded desktop Codex turns are persisted as bounded, redacted session items and `session.event` runtime events, while delta/transcript payloads are excluded from event items and native Codex state remains authoritative.
