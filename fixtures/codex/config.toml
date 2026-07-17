@@ -1,0 +1,3 @@
+model = "gpt-5-codex"
+approval_policy = "on-request"
+api_key = "fixture-secret-must-not-be-indexed"

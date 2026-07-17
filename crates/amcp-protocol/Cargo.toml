@@ -1,0 +1,12 @@
+[package]
+name = "amcp-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+amcp-domain = { path = "../amcp-domain" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

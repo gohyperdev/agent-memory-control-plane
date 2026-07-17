@@ -1,0 +1,15 @@
+[package]
+name = "amcp-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+amcp-codex = { path = "../amcp-codex" }
+amcp-domain = { path = "../amcp-domain" }
+amcp-protocol = { path = "../amcp-protocol" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
