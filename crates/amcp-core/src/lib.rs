@@ -105,6 +105,10 @@ impl CatalogService {
         self.catalog.ingest(batch)
     }
 
+    pub fn ingest_runtime_events(&mut self, events: &[RuntimeEvent]) -> Result<usize> {
+        self.catalog.ingest_runtime_events(events)
+    }
+
     pub fn latest_cursor(&self, host_id: &str, provider_id: &str) -> Result<Option<String>> {
         self.catalog.latest_cursor(host_id, provider_id)
     }

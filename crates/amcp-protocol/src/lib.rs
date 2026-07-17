@@ -1,6 +1,6 @@
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
-    CollectionBatch, HostIdentity, Scope,
+    CollectionBatch, HostIdentity, RuntimeEvent, Scope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,6 +39,13 @@ pub enum RequestMethod {
     ReplayCollection {
         provider_id: String,
         limit: usize,
+    },
+    ReplayEvents {
+        after_event_id: Option<String>,
+        limit: usize,
+    },
+    AckEvents {
+        event_ids: Vec<String>,
     },
     ReadArtifact {
         target: ArtifactRef,
@@ -94,6 +101,8 @@ pub enum ResponsePayload {
         provider_id: String,
         batches: Vec<CollectionBatch>,
     },
+    RuntimeEvents(Vec<RuntimeEvent>),
+    RuntimeEventsAcked(usize),
     Artifact(ArtifactRecord),
     ChangeSet(ChangeSet),
     ChangeReceipt(ChangeReceipt),
@@ -187,6 +196,44 @@ mod tests {
         assert!(matches!(
             decoded.method,
             RequestMethod::ReplayCollection { limit: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn event_replay_request_round_trip_preserves_cursor() {
+        let request = RequestEnvelope::new(
+            RequestMethod::ReplayEvents {
+                after_event_id: Some("event-1".into()),
+                limit: 32,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode event request"))
+                .expect("decode event request");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::ReplayEvents {
+                after_event_id: Some(_),
+                limit: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn event_ack_request_round_trip_preserves_ids() {
+        let request = RequestEnvelope::new(
+            RequestMethod::AckEvents {
+                event_ids: vec!["event-1".into(), "event-2".into()],
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode ack request"))
+                .expect("decode ack request");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::AckEvents { event_ids } if event_ids.len() == 2
         ));
     }
 }

@@ -1,6 +1,10 @@
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::items_after_test_module)]
+#![allow(clippy::ptr_arg)]
+
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
-use amcp_domain::{HostIdentity, new_id};
+use amcp_domain::{HostIdentity, RuntimeEvent, new_id};
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
 };
@@ -395,7 +399,12 @@ fn process_request(
                         batch.next_cursor = current_cursor;
                         let _ = save_collection_cache(state_dir, provider_id, &batch);
                         let _ = append_collection_outbox(state_dir, provider_id, &batch);
-                        Ok(ResponsePayload::Collection(batch))
+                        match append_runtime_event_outbox(state_dir, &batch.runtime_events) {
+                            Ok(()) => Ok(ResponsePayload::Collection(batch)),
+                            Err(error) => {
+                                Err(ProtocolError::new("event_outbox_failed", error.to_string()))
+                            }
+                        }
                     }
                     Err(error) => match load_collection_cache(state_dir, provider_id) {
                         Ok(Some(batch)) => Ok(ResponsePayload::Collection(batch)),
@@ -410,6 +419,36 @@ fn process_request(
                         batches: batches.into_iter().rev().take(limit.clamp(1, 32)).collect(),
                     }),
                     Err(error) => Err(ProtocolError::new("replay_failed", error.to_string())),
+                }
+            }
+            RequestMethod::ReplayEvents {
+                after_event_id,
+                limit,
+            } => match load_runtime_event_outbox(state_dir) {
+                Ok(events) => {
+                    let start = after_event_id
+                        .as_deref()
+                        .and_then(|event_id| {
+                            events
+                                .iter()
+                                .position(|event| event.event_id == event_id)
+                                .map(|position| position + 1)
+                        })
+                        .unwrap_or(0);
+                    Ok(ResponsePayload::RuntimeEvents(
+                        events
+                            .into_iter()
+                            .skip(start)
+                            .take(limit.clamp(1, 256))
+                            .collect(),
+                    ))
+                }
+                Err(error) => Err(ProtocolError::new("event_replay_failed", error.to_string())),
+            },
+            RequestMethod::AckEvents { event_ids } => {
+                match acknowledge_runtime_events(state_dir, &event_ids) {
+                    Ok(removed) => Ok(ResponsePayload::RuntimeEventsAcked(removed)),
+                    Err(error) => Err(ProtocolError::new("event_ack_failed", error.to_string())),
                 }
             }
             RequestMethod::ReadArtifact {
@@ -691,6 +730,55 @@ mod tests {
         assert_eq!(queued.len(), 2);
         assert_eq!(queued[1].collection_run_id, "second-run");
     }
+
+    #[test]
+    fn runtime_event_outbox_deduplicates_stable_event_ids() {
+        let directory = tempfile::tempdir().expect("event outbox directory");
+        let host = host_identity();
+        let batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host)
+        .expect("fixture collection");
+        append_runtime_event_outbox(directory.path(), &batch.runtime_events)
+            .expect("append events");
+        append_runtime_event_outbox(directory.path(), &batch.runtime_events)
+            .expect("deduplicate events");
+        let events = load_runtime_event_outbox(directory.path()).expect("load events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "inventory.completed");
+    }
+
+    #[test]
+    fn runtime_event_outbox_acknowledges_only_requested_ids() {
+        let directory = tempfile::tempdir().expect("event outbox directory");
+        let host = host_identity();
+        let mut batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host)
+        .expect("fixture collection");
+        batch.runtime_events.push(RuntimeEvent {
+            event_id: "event-keep".into(),
+            host_id: "fixture-host".into(),
+            provider_id: "codex".into(),
+            event_type: "diagnostic.updated".into(),
+            sequence: 2,
+            payload_json: "{}".into(),
+            occurred_at: Utc::now(),
+        });
+        append_runtime_event_outbox(directory.path(), &batch.runtime_events)
+            .expect("append events");
+        let removed = acknowledge_runtime_events(
+            directory.path(),
+            &[batch.runtime_events[0].event_id.clone()],
+        )
+        .expect("ack events");
+        assert_eq!(removed, 1);
+        let remaining = load_runtime_event_outbox(directory.path()).expect("load events");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_id, "event-keep");
+    }
 }
 
 fn default_backup_dir() -> PathBuf {
@@ -721,6 +809,10 @@ fn collection_cache_path(state_dir: &Path, provider_id: &str) -> PathBuf {
 
 fn collection_outbox_path(state_dir: &Path, provider_id: &str) -> PathBuf {
     state_dir.join(format!("collection-outbox-{provider_id}.json"))
+}
+
+fn runtime_event_outbox_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("runtime-events-outbox.json")
 }
 
 fn save_collection_cache(
@@ -777,6 +869,59 @@ fn load_collection_outbox(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn append_runtime_event_outbox(state_dir: &Path, events: &[RuntimeEvent]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(state_dir)?;
+    let path = runtime_event_outbox_path(state_dir);
+    let mut queued = load_runtime_event_outbox(state_dir)?;
+    for event in events {
+        if !queued
+            .iter()
+            .any(|existing| existing.event_id == event.event_id)
+        {
+            queued.push(event.clone());
+        }
+    }
+    if queued.len() > 256 {
+        let keep_from = queued.len() - 256;
+        queued.drain(..keep_from);
+    }
+    let temporary = path.with_extension(format!("{}.tmp", new_id("events")));
+    std::fs::write(&temporary, serde_json::to_vec(&queued)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_runtime_event_outbox(state_dir: &Path) -> Result<Vec<RuntimeEvent>> {
+    match std::fs::read(runtime_event_outbox_path(state_dir)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn acknowledge_runtime_events(state_dir: &Path, event_ids: &[String]) -> Result<usize> {
+    if event_ids.is_empty() {
+        return Ok(0);
+    }
+    let path = runtime_event_outbox_path(state_dir);
+    let queued = load_runtime_event_outbox(state_dir)?;
+    let before = queued.len();
+    let acknowledged = queued
+        .into_iter()
+        .filter(|event| !event_ids.iter().any(|id| id == &event.event_id))
+        .collect::<Vec<_>>();
+    if acknowledged.len() == before {
+        return Ok(0);
+    }
+    let temporary = path.with_extension(format!("{}.tmp", new_id("events")));
+    std::fs::write(&temporary, serde_json::to_vec(&acknowledged)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(before - acknowledged.len())
 }
 
 fn load_server_config(

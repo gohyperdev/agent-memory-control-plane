@@ -548,6 +548,13 @@ diagnostic.updated
 
 Events are at-least-once. The Controller deduplicates using event IDs and source observations.
 
+The macOS MVP implements the first transport increment as a bounded Agent event
+outbox plus authenticated `ReplayEvents` polling. The Controller accepts replayed
+events in a transaction and acknowledges their stable IDs only after persistence;
+the Agent removes acknowledged records, while failed acknowledgements leave them
+available for safe at-least-once replay. Future streaming transports can reuse the
+same event envelope and deduplication semantics.
+
 ## 10. Data flow sequences
 
 ### 10.1 Initial host enrollment

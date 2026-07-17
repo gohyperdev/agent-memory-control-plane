@@ -554,6 +554,33 @@ impl Catalog {
         Ok(inserted)
     }
 
+    pub fn ingest_runtime_events(&mut self, events: &[RuntimeEvent]) -> Result<usize> {
+        let transaction = self
+            .connection
+            .transaction()
+            .context("start runtime event transaction")?;
+        let mut inserted = 0;
+        for event in events {
+            inserted += transaction.execute(
+                "INSERT OR IGNORE INTO runtime_events(event_id, host_id, provider_id, event_type, sequence, payload_json, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.event_id,
+                    event.host_id,
+                    event.provider_id,
+                    event.event_type,
+                    event.sequence,
+                    event.payload_json,
+                    event.occurred_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        transaction
+            .commit()
+            .context("commit runtime event transaction")?;
+        Ok(inserted)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         self.search_scoped(query, limit, None, None, None)
     }

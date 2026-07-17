@@ -17,18 +17,13 @@ pub type ChangeOperationId = String;
 pub type ApprovalId = String;
 pub type AuditEventId = String;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SensitivityClass {
     Public,
+    #[default]
     Internal,
     Sensitive,
     SecretLike,
-}
-
-impl Default for SensitivityClass {
-    fn default() -> Self {
-        Self::Internal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

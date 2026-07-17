@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
@@ -165,13 +167,13 @@ impl CodexAdapter {
         }
         let current = read_optional(&path)?;
         let before_hash = current.as_deref().map(hash_bytes);
-        if let Some(expected) = &request.expected_source_hash {
-            if before_hash.as_deref() != Some(expected.as_str()) {
-                bail!(
-                    "source hash conflict: expected {expected}, found {:?}",
-                    before_hash
-                );
-            }
+        if let Some(expected) = &request.expected_source_hash
+            && before_hash.as_deref() != Some(expected.as_str())
+        {
+            bail!(
+                "source hash conflict: expected {expected}, found {:?}",
+                before_hash
+            );
         }
         let replacement = request
             .replacement_content
@@ -473,15 +475,16 @@ impl CodexAdapter {
                 if kind == ArtifactKind::Session && relative != "history.jsonl" {
                     self.discover_session_file(&path, host, sessions, session_items)?;
                 }
-                if kind == ArtifactKind::Configuration && relative != "projects.toml" {
-                    if let Ok(layer) = self.config_layer(&path, host) {
-                        config_layers.push(layer);
-                    }
+                if kind == ArtifactKind::Configuration
+                    && relative != "projects.toml"
+                    && let Ok(layer) = self.config_layer(&path, host)
+                {
+                    config_layers.push(layer);
                 }
-                if kind == ArtifactKind::Instruction {
-                    if let Ok(guidance) = self.guidance_record(&path, host) {
-                        guidance_records.push(guidance);
-                    }
+                if kind == ArtifactKind::Instruction
+                    && let Ok(guidance) = self.guidance_record(&path, host)
+                {
+                    guidance_records.push(guidance);
                 }
             }
         }
@@ -604,30 +607,30 @@ impl CodexAdapter {
         let projects_file = root.join("projects.toml");
         if projects_file.is_file() {
             let content = fs::read_to_string(&projects_file)?;
-            if let Ok(document) = content.parse::<toml::Value>() {
-                if let Some(entries) = document.get("projects").and_then(toml::Value::as_table) {
-                    for (path, metadata) in entries {
-                        let root_path = PathBuf::from(path);
-                        let project_id = canonical_project_path(&root_path);
-                        let trust_level = metadata
-                            .get("trust_level")
-                            .and_then(toml::Value::as_str)
-                            .map(str::to_owned);
-                        projects.push(ProjectRecord {
-                            project_id,
-                            host_id: host.host_id.clone(),
-                            provider_id: CODEX_PROVIDER_ID.to_owned(),
-                            root_path: path.clone(),
-                            display_name: root_path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or(path)
-                                .to_owned(),
-                            trust_level,
-                            discovered_from: projects_file.to_string_lossy().into_owned(),
-                            observed_at: Utc::now(),
-                        });
-                    }
+            if let Ok(document) = content.parse::<toml::Value>()
+                && let Some(entries) = document.get("projects").and_then(toml::Value::as_table)
+            {
+                for (path, metadata) in entries {
+                    let root_path = PathBuf::from(path);
+                    let project_id = canonical_project_path(&root_path);
+                    let trust_level = metadata
+                        .get("trust_level")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned);
+                    projects.push(ProjectRecord {
+                        project_id,
+                        host_id: host.host_id.clone(),
+                        provider_id: CODEX_PROVIDER_ID.to_owned(),
+                        root_path: path.clone(),
+                        display_name: root_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(path)
+                            .to_owned(),
+                        trust_level,
+                        discovered_from: projects_file.to_string_lossy().into_owned(),
+                        observed_at: Utc::now(),
+                    });
                 }
             }
         }
@@ -717,11 +720,11 @@ impl CodexAdapter {
 
         let mut metadata = serde_json::Value::Object(serde_json::Map::new());
         for line in String::from_utf8_lossy(&bytes).lines().take(8) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                if value.get("session_id").is_some() || value.get("thread_id").is_some() {
-                    metadata = value;
-                    break;
-                }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && (value.get("session_id").is_some() || value.get("thread_id").is_some())
+            {
+                metadata = value;
+                break;
             }
         }
         let session_id = metadata
@@ -921,17 +924,16 @@ impl CodexAdapter {
         let mut roots = vec![self.codex_home.clone()];
         roots.extend(self.scan_roots.iter().cloned());
         let projects_file = self.codex_home.join("projects.toml");
-        if let Ok(content) = fs::read_to_string(projects_file) {
-            if let Ok(document) = content.parse::<toml::Value>() {
-                if let Some(entries) = document.get("projects").and_then(toml::Value::as_table) {
-                    roots.extend(
-                        entries
-                            .keys()
-                            .map(PathBuf::from)
-                            .filter(|path| path.is_dir()),
-                    );
-                }
-            }
+        if let Ok(content) = fs::read_to_string(projects_file)
+            && let Ok(document) = content.parse::<toml::Value>()
+            && let Some(entries) = document.get("projects").and_then(toml::Value::as_table)
+        {
+            roots.extend(
+                entries
+                    .keys()
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir()),
+            );
         }
         let mut unique = Vec::new();
         for root in roots {
@@ -1292,17 +1294,17 @@ fn is_cursor_file(path: &Path, root: &Path) -> bool {
     if path == root {
         return false;
     }
-    match path.file_name().and_then(|name| name.to_str()) {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
         Some(
             "config.toml"
-            | "projects.toml"
-            | "AGENTS.md"
-            | "AGENTS.override.md"
-            | "history.jsonl"
-            | "session_index.jsonl",
-        ) => true,
-        _ => false,
-    }
+                | "projects.toml"
+                | "AGENTS.md"
+                | "AGENTS.override.md"
+                | "history.jsonl"
+                | "session_index.jsonl",
+        )
+    )
 }
 
 #[cfg(test)]

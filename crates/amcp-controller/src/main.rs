@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use amcp_core::CatalogService;
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
@@ -483,6 +485,57 @@ async fn run_once(
     let (registered_host, agent_version, capabilities) =
         register_and_refresh(&mut client, &token).await?;
     let mut catalog = CatalogService::open(&db)?;
+    let endpoint = agent_url
+        .clone()
+        .unwrap_or_else(|| format!("unix://{}", socket.display()));
+    catalog.register_connection(
+        &registered_host,
+        Some(&endpoint),
+        Some(&agent_version),
+        &capabilities,
+    )?;
+    let (replayed_events, persisted_events, replayed_event_ids) = match client
+        .request(
+            RequestMethod::ReplayEvents {
+                after_event_id: None,
+                limit: 256,
+            },
+            &token,
+        )
+        .await
+    {
+        Ok(ResponsePayload::RuntimeEvents(events)) => {
+            let received = events.len();
+            let persisted = catalog.ingest_runtime_events(&events)?;
+            let event_ids = events
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>();
+            (received, persisted, event_ids)
+        }
+        Ok(_) => (0, 0, Vec::new()),
+        Err(error) => {
+            eprintln!("AMCP event replay unavailable; continuing: {error:#}");
+            (0, 0, Vec::new())
+        }
+    };
+    if !replayed_event_ids.is_empty() {
+        match client
+            .request(
+                RequestMethod::AckEvents {
+                    event_ids: replayed_event_ids,
+                },
+                &token,
+            )
+            .await
+        {
+            Ok(ResponsePayload::RuntimeEventsAcked(_)) => {}
+            Ok(_) => eprintln!("AMCP Agent returned an unexpected event ack response"),
+            Err(error) => {
+                eprintln!("AMCP event acknowledgement unavailable; will replay safely: {error:#}")
+            }
+        }
+    }
     let replayed = match client
         .request(
             RequestMethod::ReplayCollection {
@@ -535,15 +588,6 @@ async fn run_once(
         other => bail!("Agent returned unexpected collection response: {other:?}"),
     };
 
-    let endpoint = agent_url
-        .clone()
-        .unwrap_or_else(|| format!("unix://{}", socket.display()));
-    catalog.register_connection(
-        &registered_host,
-        Some(&endpoint),
-        Some(&agent_version),
-        &capabilities,
-    )?;
     let inserted = catalog.ingest(&batch)?;
     catalog.save_cursor(
         &batch.host.host_id,
@@ -568,6 +612,8 @@ async fn run_once(
                 "discovered": batch.artifacts.len(),
                 "inserted": inserted,
                 "replayed": replayed,
+                "replayed_events": replayed_events,
+                "persisted_events": persisted_events,
                 "search": search_results.as_ref().map(|hits| hits.iter().map(|hit| serde_json::json!({"title": hit.title, "source": hit.source_reference, "preview": hit.preview})).collect::<Vec<_>>())
             })
         );
@@ -1116,7 +1162,7 @@ async fn start_agent(
         .arg("serve")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    Ok(command.spawn().context("start AMCP Agent")?)
+    command.spawn().context("start AMCP Agent")
 }
 
 async fn start_enrollment_agent(
@@ -1142,7 +1188,7 @@ async fn start_enrollment_agent(
         .arg("serve")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    Ok(command.spawn().context("start AMCP Agent for enrollment")?)
+    command.spawn().context("start AMCP Agent for enrollment")
 }
 
 trait AgentStream: AsyncRead + AsyncWrite + Unpin + Send {}
