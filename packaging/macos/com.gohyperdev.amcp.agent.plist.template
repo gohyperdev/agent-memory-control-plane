@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gohyperdev.amcp.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AMCP_AGENT_BIN__</string>
+        <string>--socket</string>
+        <string>__AMCP_SOCKET__</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CODEX_HOME</key>
+        <string>__CODEX_HOME__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>__AMCP_LOG_DIR__/agent.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__AMCP_LOG_DIR__/agent.stderr.log</string>
+</dict>
+</plist>

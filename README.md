@@ -104,4 +104,13 @@ Enrollment rotates the Agent credential, stores it in the macOS Keychain, and re
 
 Run the desktop shell from `apps/amcp-desktop` with `npm install` followed by `npm run tauri dev`. The bundled UI reads the same central catalog used by the CLI and MCP gateway.
 
+Install the Agent as a per-user macOS LaunchAgent after building the binaries:
+
+```bash
+AMCP_AGENT_BIN="$PWD/target/debug/amcp-agent" \
+  ./scripts/install-launch-agent.sh
+```
+
+Use `./scripts/uninstall-launch-agent.sh` to stop and remove it. The installer keeps the Agent in the user session and does not create a network listener.
+
 See [PLAN-IMPLEMENTACJI.md](PLAN-IMPLEMENTACJI.md) for the full implementation roadmap.
