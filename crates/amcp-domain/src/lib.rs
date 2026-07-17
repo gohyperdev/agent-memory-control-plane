@@ -196,6 +196,8 @@ pub struct ApprovalEnvelope {
     pub approved_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub idempotency_key: String,
+    pub nonce: String,
+    pub one_time_use: bool,
     pub operations_hash: String,
     pub approval_token: String,
 }
@@ -217,6 +219,8 @@ impl ApprovalEnvelope {
             approved_at,
             expires_at,
             idempotency_key: idempotency_key.into(),
+            nonce: new_id("nonce"),
+            one_time_use: true,
             operations_hash: operations_hash.into(),
             approval_token: String::new(),
         };
@@ -229,6 +233,8 @@ impl ApprovalEnvelope {
 
     pub fn is_valid(&self, secret: &str, now: DateTime<Utc>) -> bool {
         !self.approved_by.trim().is_empty()
+            && !self.nonce.trim().is_empty()
+            && self.one_time_use
             && now >= self.approved_at
             && now <= self.expires_at
             && self.approval_token == self.signature(secret)
@@ -236,13 +242,15 @@ impl ApprovalEnvelope {
 
     fn signature(&self, secret: &str) -> String {
         let payload = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             self.approval_id,
             self.change_set_id,
             self.approved_by,
             self.approved_at.to_rfc3339(),
             self.expires_at.to_rfc3339(),
             self.idempotency_key,
+            self.nonce,
+            self.one_time_use,
             self.operations_hash,
         );
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
@@ -439,6 +447,16 @@ pub struct ProviderDescriptor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub display_name: String,
+    pub version: Option<String>,
+    pub adapter_version: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostIdentity {
     pub host_id: HostId,
     pub display_name: String,
@@ -476,8 +494,15 @@ pub fn new_id(prefix: &str) -> String {
 }
 
 pub fn change_set_operations_hash(change_set: &ChangeSet) -> String {
-    let encoded = serde_json::to_vec(&change_set.operations)
-        .expect("change operations should always be serializable");
+    // The approval binding includes provider and scope as well as operations.
+    // Otherwise a caller could reuse a valid operation hash with a modified
+    // provider/host envelope.
+    let encoded = serde_json::to_vec(&(
+        &change_set.provider_id,
+        &change_set.scope,
+        &change_set.operations,
+    ))
+    .expect("change operations should always be serializable");
     let mut hasher = Sha256::new();
     hasher.update(encoded);
     hex::encode(hasher.finalize())

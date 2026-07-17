@@ -1,7 +1,7 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
-    HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, RuntimeEvent,
-    SensitivityClass, SessionItem, SessionRecord,
+    HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, ProviderRecord,
+    RuntimeEvent, SensitivityClass, SessionItem, SessionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1035,6 +1035,27 @@ impl Catalog {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    pub fn list_providers(&self, host_id: Option<&str>) -> Result<Vec<ProviderRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT host_id, provider_id, display_name, version, adapter_version, capabilities_json
+             FROM providers
+             WHERE (?1 IS NULL OR host_id = ?1)
+             ORDER BY host_id, display_name, provider_id",
+        )?;
+        let rows = statement.query_map(params![host_id], |row| {
+            let capabilities_json: String = row.get(5)?;
+            Ok(ProviderRecord {
+                host_id: row.get(0)?,
+                provider_id: row.get(1)?,
+                display_name: row.get(2)?,
+                version: row.get(3)?,
+                adapter_version: row.get(4)?,
+                capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
@@ -1220,6 +1241,7 @@ mod tests {
         );
         assert_eq!(catalog.search("sandbox", 10).expect("search").len(), 1);
         assert_eq!(catalog.list_projects(None).expect("projects").len(), 1);
+        assert_eq!(catalog.list_providers(None).expect("providers").len(), 1);
         assert_eq!(
             catalog
                 .list_config_layers(None, None)

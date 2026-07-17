@@ -447,6 +447,10 @@ Possible decisions:
 
 The Agent must not trust a Controller-provided “approved” flag without validating the approval token, target hash, target path, and local policy.
 
+Approval envelopes are short-lived and one-time-use. The Agent persists consumed
+approval IDs/nonces in its protected state directory before invoking a provider
+mutation, so a retry or duplicated request cannot apply the same envelope twice.
+
 ### 8.6 Change application
 
 The local Agent applies changes using this sequence:
@@ -554,6 +558,11 @@ events in a transaction and acknowledges their stable IDs only after persistence
 the Agent removes acknowledged records, while failed acknowledgements leave them
 available for safe at-least-once replay. Future streaming transports can reuse the
 same event envelope and deduplication semantics.
+
+The Agent also owns a local `notify` watcher over the provider root. On macOS this
+uses the platform FSEvents backend, coalesces notification bursts, emits relative
+source paths, and never emits `auth.json` paths. The watcher only writes bounded
+events to the local outbox; it does not grant the Controller filesystem access.
 
 ## 10. Data flow sequences
 

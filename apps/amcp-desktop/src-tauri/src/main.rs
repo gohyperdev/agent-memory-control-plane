@@ -5,7 +5,7 @@ use amcp_codex::{hash_bytes, redact_text};
 use amcp_core::CatalogService;
 use amcp_domain::{
     ArtifactRecord, ChangeSet, CollectionBatch, ConfigLayerRecord, GuidanceRecord, HostIdentity,
-    HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, RuntimeEvent, SessionItem,
+    HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, ProviderRecord, RuntimeEvent, SessionItem,
     SessionRecord,
 };
 use amcp_storage::SearchHit;
@@ -28,6 +28,14 @@ fn list_hosts() -> Result<Vec<HostRecord>, String> {
     CatalogService::open(database_path())
         .map_err(|error| error.to_string())?
         .list_hosts()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_providers() -> Result<Vec<ProviderRecord>, String> {
+    CatalogService::open(database_path())
+        .map_err(|error| error.to_string())?
+        .list_providers(None)
         .map_err(|error| error.to_string())
 }
 
@@ -324,6 +332,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_hosts,
+            list_providers,
             list_changes,
             list_projects,
             list_sessions,

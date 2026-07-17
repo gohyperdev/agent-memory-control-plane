@@ -11,6 +11,15 @@ type Host = {
   last_seen?: string;
 };
 
+type Provider = {
+  host_id: string;
+  provider_id: string;
+  display_name: string;
+  version?: string;
+  adapter_version: string;
+  capabilities: string[];
+};
+
 type SearchHit = {
   artifact_id: string;
   title: string;
@@ -72,6 +81,7 @@ type Guidance = {
 
 function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
   const [changes, setChanges] = useState<ChangeSet[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -92,6 +102,7 @@ function App() {
   useEffect(() => {
     Promise.all([
       invoke<Host[]>("list_hosts"),
+      invoke<Provider[]>("list_providers"),
       invoke<ChangeSet[]>("list_changes"),
       invoke<Project[]>("list_projects"),
       invoke<Session[]>("list_sessions"),
@@ -99,8 +110,9 @@ function App() {
       invoke<ConfigLayer[]>("list_config_layers"),
       invoke<Guidance[]>("list_guidance"),
     ])
-      .then(([nextHosts, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance]) => {
+      .then(([nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance]) => {
         setHosts(nextHosts);
+        setProviders(nextProviders);
         setChanges(nextChanges);
         setProjects(nextProjects);
         setSessions(nextSessions);
@@ -129,8 +141,9 @@ function App() {
       setSyncing(true);
       setError(null);
       await invoke("collect_local");
-      const [nextHosts, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance] = await Promise.all([
+      const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance] = await Promise.all([
         invoke<Host[]>("list_hosts"),
+        invoke<Provider[]>("list_providers"),
         invoke<ChangeSet[]>("list_changes"),
         invoke<Project[]>("list_projects"),
         invoke<Session[]>("list_sessions"),
@@ -139,6 +152,7 @@ function App() {
         invoke<Guidance[]>("list_guidance"),
       ]);
       setHosts(nextHosts);
+      setProviders(nextProviders);
       setChanges(nextChanges);
       setProjects(nextProjects);
       setSessions(nextSessions);
@@ -188,6 +202,7 @@ function App() {
   const navigation = [
     ["System map", "⌘"],
     ["Hosts", String(hosts.length)],
+    ["Providers", String(providers.length)],
     ["Projects", String(projects.length)],
     ["Configuration", String(configLayers.length)],
     ["Guidance", String(guidance.length)],
@@ -221,6 +236,7 @@ function App() {
           <div className="status-row">
             <div className="status-card"><span className="status-icon violet">⌁</span><div><small>Connected hosts</small><strong>{connectedHosts.length || hosts.length || 0}<span> / {hosts.length || 1}</span></strong></div><span className="trend">↗ healthy</span></div>
             <div className="status-card"><span className="status-icon blue">⌂</span><div><small>Indexed artifacts</small><strong>{projects.length + sessions.length + memories.length + configLayers.length + guidance.length || "—"}</strong></div><span className="muted">normalized catalog</span></div>
+            <div className="status-card"><span className="status-icon blue">◉</span><div><small>Active providers</small><strong>{providers.length || "—"}</strong></div><span className="muted">capability registry</span></div>
             <div className="status-card"><span className="status-icon orange">◈</span><div><small>Pending approval</small><strong>{changes.filter((change) => change.status === "Proposed").length}</strong></div><span className="muted">review required</span></div>
           </div>
 
@@ -259,6 +275,7 @@ function App() {
           <section className="inventory-section">
             <div className="section-heading"><div><span className="eyebrow">Normalized catalog</span><h2>Projects, memories, sessions</h2></div><span className="scope-pill">Source-linked records</span></div>
             <div className="inventory-grid">
+              <div className="inventory-card"><div className="inventory-card-head"><strong>Providers</strong><span>{providers.length}</span></div>{providers.slice(0, 4).map((provider) => <div className="inventory-item" key={`${provider.host_id}-${provider.provider_id}`}><span className="inventory-symbol">◉</span><div><strong>{provider.display_name}</strong><small>{provider.host_id} · {provider.capabilities.slice(0, 3).join(", ") || "inventory-only"}</small></div></div>)}{!providers.length && <div className="change-empty">No provider capabilities reported yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Configuration</strong><span>{configLayers.length}</span></div>{configLayers.slice(0, 4).map((layer) => <div className="inventory-item" key={layer.config_layer_id}><span className="inventory-symbol">⚙</span><div><strong>{layer.profile ?? layer.scope}</strong><small>precedence {layer.precedence_rank} · {layer.source_reference}</small></div></div>)}{!configLayers.length && <div className="change-empty">No normalized config layers yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Guidance chain</strong><span>{guidance.length}</span></div>{guidance.slice(0, 4).map((item) => <div className="inventory-item" key={item.guidance_id}><span className="inventory-symbol">☷</span><div><strong>{item.kind}</strong><small>precedence {item.precedence_rank} · {item.source_reference}</small></div></div>)}{!guidance.length && <div className="change-empty">No AGENTS guidance discovered yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Projects</strong><span>{projects.length}</span></div>{projects.slice(0, 4).map((project) => <div className="inventory-item" key={project.project_id}><span className="inventory-symbol">◈</span><div><strong>{project.display_name}</strong><small>{project.trust_level ?? "trust unknown"} · {project.root_path}</small></div></div>)}{!projects.length && <div className="change-empty">No normalized projects yet.</div>}</div>

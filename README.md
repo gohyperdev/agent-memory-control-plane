@@ -37,10 +37,12 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 ## Current implementation surface
 
 - `amcp-agent` is a provider-registry based local process. Codex is the first adapter; the Agent can also expose an opt-in TLS TCP listener for a remote host.
-- `amcp-controller` supports local Unix IPC and `tcp://` Agent endpoints with a user-supplied CA, central host connection records, collection, FTS search, change proposal, approval, atomic apply, and rollback.
+- Provider adapters are capability-based; inventory-only adapters can omit reads and mutations, keeping future Claude Code, Kiro, and Antigravity integrations out of the Codex-specific UI and storage contract.
+- `amcp-controller` supports local Unix IPC and `tcp://` Agent endpoints with a user-supplied CA, central host connection records, collection, FTS search, change proposal, approval, atomic apply, and rollback. Approval envelopes carry a signed nonce and are consumed once by the Agent through a durable replay store.
 - The Agent keeps a bounded, redacted collection outbox. On reconnect, the Controller replays it idempotently before requesting a fresh snapshot; cursors advance only after central persistence.
 - Collection batches emit persisted runtime events with stable IDs; SQLite deduplicates replayed events, while the MCP diagnostics tool exposes the resulting event history.
 - Runtime events also have a separate bounded Agent outbox and authenticated replay/ack endpoint; the Controller acknowledges event IDs only after central persistence, and repeated delivery remains safe because central persistence deduplicates IDs.
+- The macOS Agent runs a `notify`/FSEvents-backed watcher over the Codex root and emits bounded, path-relative `source.changed` events; sensitive `auth.json` paths are excluded and bursts are coalesced.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/session-item/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.
 - `amcp-app-server` supervises the documented Codex app-server stdio protocol and supports initialization, thread/turn start, streamed notifications, and interruption.

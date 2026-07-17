@@ -4,7 +4,7 @@
 
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
-use amcp_domain::{HostIdentity, RuntimeEvent, new_id};
+use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, new_id};
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
 };
@@ -16,13 +16,15 @@ use amcp_provider_api::ProviderRegistry;
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use rustls::{ServerConfig, pki_types::PrivateKeyDer};
 use std::{
+    collections::HashSet,
     env,
     fs::File,
     io::BufReader as StdBufReader,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
@@ -71,6 +73,7 @@ struct AgentAuth {
     credential_expires_at: Option<chrono::DateTime<Utc>>,
     pairing_code: Option<String>,
     pairing_expires_at: chrono::DateTime<Utc>,
+    consumed_approval_ids: HashSet<String>,
 }
 
 impl AgentAuth {
@@ -90,6 +93,7 @@ impl AgentAuth {
             credential_expires_at: None,
             pairing_code: Some(pairing_code),
             pairing_expires_at: Utc::now() + Duration::seconds(timeout_seconds.max(1) as i64),
+            consumed_approval_ids: HashSet::new(),
         }
     }
 
@@ -157,10 +161,117 @@ async fn serve(args: Args) -> Result<()> {
         "AMCP Agent pairing code (expires in {}s): {pairing_code}",
         args.pairing_timeout_seconds
     );
+    let _local_watcher = start_local_watcher(
+        CodexAdapter::from_environment(args.codex_home.clone()).codex_home,
+        default_state_dir(),
+    );
     if let Some(bind) = args.tcp_bind.clone() {
         return serve_tls(args, bind, auth).await;
     }
     serve_unix(args, auth).await
+}
+
+fn start_local_watcher(
+    codex_home: PathBuf,
+    state_dir: PathBuf,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !codex_home.exists() {
+        eprintln!(
+            "AMCP local watcher skipped because Codex home does not exist: {}",
+            codex_home.display()
+        );
+        return None;
+    }
+    let watch_root = std::fs::canonicalize(&codex_home).unwrap_or(codex_home);
+    let _ = std::fs::create_dir_all(&state_dir);
+    let state_root = std::fs::canonicalize(&state_dir).unwrap_or(state_dir.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut watcher = match RecommendedWatcher::new(
+        move |result| {
+            let _ = sender.send(result);
+        },
+        Config::default(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            eprintln!("AMCP local watcher unavailable: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = watcher.watch(&watch_root, RecursiveMode::Recursive) {
+        eprintln!(
+            "AMCP local watcher could not watch {}: {error}",
+            watch_root.display()
+        );
+        return None;
+    }
+    Some(
+        std::thread::Builder::new()
+            .name("amcp-codex-watcher".into())
+            .spawn(move || {
+                let _watcher = watcher;
+                let mut sequence = 0i64;
+                let mut last_fingerprint = String::new();
+                while let Ok(first) = receiver.recv() {
+                    let mut notifications = vec![first];
+                    while let Ok(next) = receiver.recv_timeout(std::time::Duration::from_millis(50))
+                    {
+                        notifications.push(next);
+                    }
+                    let mut kinds = Vec::new();
+                    let mut relative_paths = Vec::new();
+                    for result in notifications {
+                        let Ok(event) = result else {
+                            continue;
+                        };
+                        kinds.push(format!("{:?}", event.kind));
+                        relative_paths.extend(event.paths.into_iter().filter_map(|path| {
+                            if path.starts_with(&state_root) {
+                                return None;
+                            }
+                            let relative = path.strip_prefix(&watch_root).unwrap_or(&path);
+                            let relative = relative.to_string_lossy().into_owned();
+                            if relative.ends_with("auth.json") || relative.is_empty() {
+                                None
+                            } else {
+                                Some(relative)
+                            }
+                        }));
+                    }
+                    let kind = kinds.join(",");
+                    relative_paths.truncate(32);
+                    relative_paths.sort();
+                    relative_paths.dedup();
+                    if relative_paths.is_empty() {
+                        continue;
+                    }
+                    let fingerprint = format!("{kind}:{relative_paths:?}");
+                    if fingerprint == last_fingerprint {
+                        continue;
+                    }
+                    last_fingerprint = fingerprint;
+                    sequence += 1;
+                    let event = RuntimeEvent {
+                        event_id: new_id("event"),
+                        host_id: host_identity().host_id,
+                        provider_id: "codex".to_owned(),
+                        event_type: "source.changed".to_owned(),
+                        sequence,
+                        payload_json: serde_json::json!({
+                            "watcher": "notify",
+                            "kind": kind,
+                            "paths": relative_paths,
+                        })
+                        .to_string(),
+                        occurred_at: Utc::now(),
+                    };
+                    if let Err(error) = append_runtime_event_outbox(&state_dir, &[event]) {
+                        eprintln!("AMCP local watcher could not persist event: {error}");
+                    }
+                }
+            })
+            .expect("spawn AMCP local watcher thread"),
+    )
 }
 
 async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
@@ -497,9 +608,30 @@ fn process_request(
                         )),
                     };
                 }
-                if !approval.is_valid(request_token.as_deref().unwrap_or_default(), Utc::now())
+                let operations_hash = change_set_operations_hash(&change_set);
+                let approval_valid = match consume_approval(
+                    auth,
+                    state_dir,
+                    &approval,
+                    request_token.as_deref().unwrap_or_default(),
+                    &change_set.change_set_id,
+                    &operations_hash,
+                ) {
+                    Ok(valid) => valid,
+                    Err(error) => {
+                        return ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Err(ProtocolError::new(
+                                "approval_replay_store_failed",
+                                error.to_string(),
+                            )),
+                        };
+                    }
+                };
+                if !approval_valid
                     || approval.change_set_id != change_set.change_set_id
-                    || approval.operations_hash != change_set_operations_hash(&change_set)
+                    || approval.operations_hash != operations_hash
                 {
                     return ResponseEnvelope {
                         protocol_version: PROTOCOL_VERSION,
@@ -532,9 +664,30 @@ fn process_request(
                         )),
                     };
                 }
-                if !approval.is_valid(request_token.as_deref().unwrap_or_default(), Utc::now())
+                let operations_hash = change_set_operations_hash(&change_set);
+                let approval_valid = match consume_approval(
+                    auth,
+                    state_dir,
+                    &approval,
+                    request_token.as_deref().unwrap_or_default(),
+                    &change_set.change_set_id,
+                    &operations_hash,
+                ) {
+                    Ok(valid) => valid,
+                    Err(error) => {
+                        return ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Err(ProtocolError::new(
+                                "approval_replay_store_failed",
+                                error.to_string(),
+                            )),
+                        };
+                    }
+                };
+                if !approval_valid
                     || approval.change_set_id != change_set.change_set_id
-                    || approval.operations_hash != change_set_operations_hash(&change_set)
+                    || approval.operations_hash != operations_hash
                 {
                     return ResponseEnvelope {
                         protocol_version: PROTOCOL_VERSION,
@@ -779,6 +932,108 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_id, "event-keep");
     }
+
+    #[test]
+    fn approval_replay_store_allows_an_envelope_only_once() {
+        let directory = tempfile::tempdir().expect("approval replay directory");
+        let auth = Arc::new(Mutex::new(AgentAuth::new("bootstrap".into(), None, 300)));
+        let now = Utc::now();
+        let approval = ApprovalEnvelope::issue(
+            "shared-secret",
+            "change-test",
+            "human",
+            now,
+            now + Duration::minutes(5),
+            "idem-test",
+            "operations-hash",
+        );
+        assert!(
+            consume_approval(
+                &auth,
+                directory.path(),
+                &approval,
+                "shared-secret",
+                "change-test",
+                "operations-hash",
+            )
+            .expect("consume first approval")
+        );
+        assert!(
+            !consume_approval(
+                &auth,
+                directory.path(),
+                &approval,
+                "shared-secret",
+                "change-test",
+                "operations-hash",
+            )
+            .expect("reject replayed approval")
+        );
+        assert_eq!(
+            load_consumed_approvals(directory.path())
+                .expect("load approval replay store")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_request_rejects_a_replayed_approval_envelope() {
+        let directory = tempfile::tempdir().expect("approval replay directory");
+        let host = host_identity();
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "shared-secret".into(),
+            None,
+            300,
+        )));
+        let now = Utc::now();
+        let change_set = amcp_domain::ChangeSet {
+            change_set_id: "change-replay-test".into(),
+            actor: "human".into(),
+            scope: amcp_domain::Scope::host(host.host_id.clone()),
+            provider_id: "codex".into(),
+            reason: "replay test".into(),
+            evidence_ids: Vec::new(),
+            status: amcp_domain::ChangeStatus::Proposed,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+        };
+        let approval = ApprovalEnvelope::issue(
+            "shared-secret",
+            change_set.change_set_id.clone(),
+            "human",
+            now,
+            now + Duration::minutes(5),
+            "idem-replay-test",
+            amcp_domain::change_set_operations_hash(&change_set),
+        );
+        let request = || {
+            RequestEnvelope::new(
+                RequestMethod::ApplyChange {
+                    change_set: change_set.clone(),
+                    approval: approval.clone(),
+                },
+                Some("shared-secret".into()),
+            )
+        };
+        let first = process_request(
+            request(),
+            &auth,
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex")),
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        assert_eq!(first.result.unwrap_err().code, "apply_failed");
+        let second = process_request(
+            request(),
+            &auth,
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex")),
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        assert_eq!(second.result.unwrap_err().code, "approval_invalid");
+    }
 }
 
 fn default_backup_dir() -> PathBuf {
@@ -813,6 +1068,57 @@ fn collection_outbox_path(state_dir: &Path, provider_id: &str) -> PathBuf {
 
 fn runtime_event_outbox_path(state_dir: &Path) -> PathBuf {
     state_dir.join("runtime-events-outbox.json")
+}
+
+fn approval_replay_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("approval-replay.json")
+}
+
+fn consume_approval(
+    auth: &Arc<Mutex<AgentAuth>>,
+    state_dir: &Path,
+    approval: &ApprovalEnvelope,
+    secret: &str,
+    expected_change_set_id: &str,
+    operations_hash: &str,
+) -> Result<bool> {
+    if approval.change_set_id.trim().is_empty()
+        || approval.change_set_id != expected_change_set_id
+        || approval.operations_hash != operations_hash
+        || !approval.is_valid(secret, Utc::now())
+    {
+        return Ok(false);
+    }
+    let replay_key = format!("{}:{}", approval.approval_id, approval.nonce);
+    let mut guard = auth.lock().expect("Agent auth mutex");
+    if guard.consumed_approval_ids.contains(&replay_key) {
+        return Ok(false);
+    }
+    let mut consumed = load_consumed_approvals(state_dir)?;
+    if consumed.iter().any(|key| key == &replay_key) {
+        guard.consumed_approval_ids.insert(replay_key);
+        return Ok(false);
+    }
+    consumed.push(replay_key.clone());
+    if consumed.len() > 4_096 {
+        let keep_from = consumed.len() - 4_096;
+        consumed.drain(..keep_from);
+    }
+    std::fs::create_dir_all(state_dir)?;
+    let path = approval_replay_path(state_dir);
+    let temporary = path.with_extension(format!("{}.tmp", new_id("approvals")));
+    std::fs::write(&temporary, serde_json::to_vec(&consumed)?)?;
+    std::fs::rename(temporary, path)?;
+    guard.consumed_approval_ids = consumed.into_iter().collect();
+    Ok(true)
+}
+
+fn load_consumed_approvals(state_dir: &Path) -> Result<Vec<String>> {
+    match std::fs::read(approval_replay_path(state_dir)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn save_collection_cache(
@@ -875,6 +1181,9 @@ fn append_runtime_event_outbox(state_dir: &Path, events: &[RuntimeEvent]) -> Res
     if events.is_empty() {
         return Ok(());
     }
+    let _lock = runtime_event_outbox_lock()
+        .lock()
+        .expect("event outbox mutex");
     std::fs::create_dir_all(state_dir)?;
     let path = runtime_event_outbox_path(state_dir);
     let mut queued = load_runtime_event_outbox(state_dir)?;
@@ -908,6 +1217,9 @@ fn acknowledge_runtime_events(state_dir: &Path, event_ids: &[String]) -> Result<
     if event_ids.is_empty() {
         return Ok(0);
     }
+    let _lock = runtime_event_outbox_lock()
+        .lock()
+        .expect("event outbox mutex");
     let path = runtime_event_outbox_path(state_dir);
     let queued = load_runtime_event_outbox(state_dir)?;
     let before = queued.len();
@@ -922,6 +1234,11 @@ fn acknowledge_runtime_events(state_dir: &Path, event_ids: &[String]) -> Result<
     std::fs::write(&temporary, serde_json::to_vec(&acknowledged)?)?;
     std::fs::rename(temporary, path)?;
     Ok(before - acknowledged.len())
+}
+
+fn runtime_event_outbox_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn load_server_config(

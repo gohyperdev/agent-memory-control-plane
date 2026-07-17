@@ -2,7 +2,7 @@ use amcp_domain::{
     ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet, CollectionBatch,
     HostIdentity, ProviderDescriptor,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::Path;
 
 pub trait ProviderAdapter: Send + Sync {
@@ -12,10 +12,22 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
     fn discover(&self, host: HostIdentity) -> Result<CollectionBatch>;
-    fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord>;
-    fn propose_change(&self, request: &ChangeRequest) -> Result<ChangeSet>;
-    fn apply_change(&self, change_set: &ChangeSet, backup_dir: &Path) -> Result<ChangeReceipt>;
-    fn rollback_change(&self, change_set: &ChangeSet, backup_dir: &Path) -> Result<ChangeReceipt>;
+    fn read_artifact(&self, _target: &ArtifactRef, _host: &HostIdentity) -> Result<ArtifactRecord> {
+        bail!("provider does not expose artifact reads")
+    }
+    fn propose_change(&self, _request: &ChangeRequest) -> Result<ChangeSet> {
+        bail!("provider is inventory-only")
+    }
+    fn apply_change(&self, _change_set: &ChangeSet, _backup_dir: &Path) -> Result<ChangeReceipt> {
+        bail!("provider is inventory-only")
+    }
+    fn rollback_change(
+        &self,
+        _change_set: &ChangeSet,
+        _backup_dir: &Path,
+    ) -> Result<ChangeReceipt> {
+        bail!("provider is inventory-only")
+    }
 }
 
 pub struct ProviderRegistry {
@@ -105,6 +117,24 @@ mod tests {
         }
     }
 
+    struct InventoryOnlyProvider;
+
+    impl ProviderAdapter for InventoryOnlyProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            ProviderDescriptor {
+                id: "inventory-only".into(),
+                display_name: "Inventory only".into(),
+                version: None,
+                adapter_version: "test".into(),
+                capabilities: vec!["inventory".into()],
+            }
+        }
+
+        fn discover(&self, _host: HostIdentity) -> Result<CollectionBatch> {
+            anyhow::bail!("test provider does not collect")
+        }
+    }
+
     #[test]
     fn registry_resolves_provider_by_neutral_id() {
         let mut registry = ProviderRegistry::new();
@@ -114,5 +144,31 @@ mod tests {
             "fake"
         );
         assert!(registry.get("codex").is_err());
+    }
+
+    #[test]
+    fn inventory_only_provider_can_omit_mutation_methods() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Box::new(InventoryOnlyProvider));
+        let provider = registry.get("inventory-only").expect("provider");
+        assert!(
+            provider
+                .propose_change(&ChangeRequest {
+                    actor: "test".into(),
+                    scope: amcp_domain::Scope::host("host"),
+                    target: ArtifactRef {
+                        host_id: "host".into(),
+                        provider_id: "inventory-only".into(),
+                        native_id: "native".into(),
+                        source_reference: "fixture://native".into(),
+                    },
+                    expected_source_hash: None,
+                    operation: amcp_domain::ChangeOperationKind::ReplaceText,
+                    replacement_content: Some("content".into()),
+                    reason: "test".into(),
+                    evidence_ids: Vec::new(),
+                })
+                .is_err()
+        );
     }
 }

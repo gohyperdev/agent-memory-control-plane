@@ -160,6 +160,15 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_providers_list",
+                "description": "List provider adapters and negotiated capabilities by host. Inventory-only providers are valid and expose no mutation capability.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "host_id": { "type": "string" } }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_projects_list",
                 "description": "List normalized projects discovered from provider state, including trust and provenance.",
                 "inputSchema": {
@@ -333,6 +342,10 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             }))
         }
         "amcp_hosts_list" => Ok(json!({ "hosts": catalog.list_hosts()? })),
+        "amcp_providers_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            Ok(json!({ "providers": catalog.list_providers(host_id)? }))
+        }
         "amcp_projects_list" => {
             let host_id = arguments.get("host_id").and_then(Value::as_str);
             Ok(json!({ "projects": catalog.list_projects(host_id)? }))
