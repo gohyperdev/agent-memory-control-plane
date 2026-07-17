@@ -67,6 +67,8 @@ enum CommandKind {
         agent_bin: Option<PathBuf>,
         #[arg(long)]
         no_start_agent: bool,
+        #[arg(long, default_value = "codex", env = "AMCP_PROVIDER_ID")]
+        provider_id: String,
         #[arg(long)]
         query: Option<String>,
         #[arg(long)]
@@ -91,6 +93,8 @@ enum CommandKind {
         db: Option<PathBuf>,
         #[arg(long)]
         agent_bin: Option<PathBuf>,
+        #[arg(long, default_value = "codex", env = "AMCP_PROVIDER_ID")]
+        provider_id: String,
         #[arg(long, default_value_t = 30)]
         interval_seconds: u64,
         #[arg(long)]
@@ -348,6 +352,7 @@ async fn main() -> Result<()> {
             db,
             agent_bin,
             no_start_agent,
+            provider_id,
             query,
             json,
         } => {
@@ -361,6 +366,7 @@ async fn main() -> Result<()> {
                 db.unwrap_or_else(default_db_path),
                 agent_bin,
                 no_start_agent,
+                provider_id,
                 query,
                 json,
                 0,
@@ -378,6 +384,7 @@ async fn main() -> Result<()> {
             codex_home,
             db,
             agent_bin,
+            provider_id,
             interval_seconds,
             iterations,
         } => {
@@ -389,6 +396,7 @@ async fn main() -> Result<()> {
                 codex_home,
                 db.unwrap_or_else(default_db_path),
                 agent_bin,
+                provider_id,
                 interval_seconds,
                 iterations,
             )
@@ -604,6 +612,7 @@ async fn run_once(
     db: PathBuf,
     agent_bin: Option<PathBuf>,
     no_start_agent: bool,
+    provider_id: String,
     query: Option<String>,
     json: bool,
     event_wait_ms: u64,
@@ -686,7 +695,7 @@ async fn run_once(
     let replayed = match client
         .request(
             RequestMethod::ReplayCollection {
-                provider_id: "codex".into(),
+                provider_id: provider_id.clone(),
                 limit: 8,
             },
             &token,
@@ -699,7 +708,7 @@ async fn run_once(
                 catalog.ingest(&replay)?;
                 catalog.save_cursor(
                     &replay.host.host_id,
-                    "codex",
+                    &provider_id,
                     replay
                         .next_cursor
                         .as_deref()
@@ -716,14 +725,22 @@ async fn run_once(
             0
         }
     };
-    let cursor = catalog.latest_cursor(&registered_host.host_id, "codex")?;
+    let cursor = catalog.latest_cursor(&registered_host.host_id, &provider_id)?;
     let batch = match client
         .request(
             RequestMethod::Collect {
                 scope: if agent_url.is_some() {
-                    None
+                    Some(Scope {
+                        host_id: None,
+                        provider_id: Some(provider_id.clone()),
+                        project_id: None,
+                    })
                 } else {
-                    Some(Scope::host(host_id_from_env()))
+                    Some(Scope {
+                        host_id: Some(host_id_from_env()),
+                        provider_id: Some(provider_id.clone()),
+                        project_id: None,
+                    })
                 },
                 cursor,
             },
@@ -738,7 +755,7 @@ async fn run_once(
     let inserted = catalog.ingest(&batch)?;
     catalog.save_cursor(
         &batch.host.host_id,
-        "codex",
+        &provider_id,
         batch
             .next_cursor
             .as_deref()
@@ -755,6 +772,7 @@ async fn run_once(
             "{}",
             serde_json::json!({
                 "host_id": batch.host.host_id,
+                "provider_id": provider_id,
                 "collection_run_id": batch.collection_run_id,
                 "discovered": batch.artifacts.len(),
                 "inserted": inserted,
@@ -766,8 +784,9 @@ async fn run_once(
         );
     } else {
         println!(
-            "Collected {} Codex artifacts ({} new) into {}",
+            "Collected {} {} artifacts ({} new) into {}",
             batch.artifacts.len(),
+            provider_id,
             inserted,
             db.display()
         );
@@ -798,6 +817,7 @@ async fn watch(
     codex_home: Option<PathBuf>,
     db: PathBuf,
     agent_bin: Option<PathBuf>,
+    provider_id: String,
     interval_seconds: u64,
     iterations: Option<usize>,
 ) -> Result<()> {
@@ -822,6 +842,7 @@ async fn watch(
                 db.clone(),
                 agent_bin.clone(),
                 endpoint.is_some(),
+                provider_id.clone(),
                 None,
                 true,
                 interval_seconds.saturating_mul(1_000).min(30_000),

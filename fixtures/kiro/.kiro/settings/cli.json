@@ -1,0 +1,4 @@
+{
+  "includeMcpJson": true,
+  "token": "fixture-secret-must-not-be-indexed"
+}

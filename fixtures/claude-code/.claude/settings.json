@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "allow": ["Bash(cargo test:*)"],
+    "api_key": "fixture-secret-must-not-be-indexed"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "amcp-file-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+amcp-domain = { path = "../amcp-domain" }
+amcp-provider-api = { path = "../amcp-provider-api" }
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true

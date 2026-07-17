@@ -6,6 +6,7 @@ use amcp_app_server::AppServerClient;
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
 use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, new_id};
+use amcp_file_providers::{ClaudeCodeAdapter, KiroAdapter};
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
 };
@@ -1521,20 +1522,12 @@ fn provider_registry(codex_home: Option<PathBuf>) -> ProviderRegistry {
     registry.register(Box::new(CodexAdapter::from_environment(codex_home)));
     if env_flag("AMCP_ENABLE_FUTURE_PROVIDERS") {
         registry.register(Box::new(InventoryProviderAdapter::new(
-            "claude-code",
-            "Claude Code",
-            "inventory-fixture-0.1.0",
-        )));
-        registry.register(Box::new(InventoryProviderAdapter::new(
             "antigravity",
             "Antigravity",
             "inventory-fixture-0.1.0",
         )));
-        registry.register(Box::new(InventoryProviderAdapter::new(
-            "kiro",
-            "Kiro",
-            "inventory-fixture-0.1.0",
-        )));
+        registry.register(Box::new(ClaudeCodeAdapter::claude_code_from_environment()));
+        registry.register(Box::new(KiroAdapter::kiro_from_environment()));
     }
     registry
 }

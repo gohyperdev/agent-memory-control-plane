@@ -5,6 +5,7 @@ members = [
     "crates/amcp-core",
     "crates/amcp-platform",
     "crates/amcp-provider-api",
+    "crates/amcp-file-providers",
     "crates/amcp-app-server",
     "crates/amcp-rag",
     "crates/amcp-mcp",

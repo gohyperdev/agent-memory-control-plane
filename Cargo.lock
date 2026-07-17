@@ -30,6 +30,7 @@ dependencies = [
  "amcp-app-server",
  "amcp-codex",
  "amcp-domain",
+ "amcp-file-providers",
  "amcp-platform",
  "amcp-protocol",
  "amcp-provider-api",
@@ -112,6 +113,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "amcp-file-providers"
+version = "0.1.0"
+dependencies = [
+ "amcp-domain",
+ "amcp-provider-api",
+ "anyhow",
+ "chrono",
+ "hex",
+ "regex",
+ "serde_json",
+ "sha2",
+ "walkdir",
 ]
 
 [[package]]
