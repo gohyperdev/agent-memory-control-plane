@@ -140,9 +140,18 @@ function App() {
   const [codexReply, setCodexReply] = useState<string | null>(null);
   const [askingCodex, setAskingCodex] = useState(false);
   const [proposingRuntime, setProposingRuntime] = useState<string | null>(null);
+  const [remoteUrl, setRemoteUrl] = useState("tcp://");
+  const [remoteCaPath, setRemoteCaPath] = useState("");
+  const [remoteServerName, setRemoteServerName] = useState("");
+  const [remotePairingCode, setRemotePairingCode] = useState("");
+  const [remoteBootstrapToken, setRemoteBootstrapToken] = useState("");
+  const [remoteHostId, setRemoteHostId] = useState("");
+  const [remoteToken, setRemoteToken] = useState("");
+  const [remoteProviderId, setRemoteProviderId] = useState("codex");
+  const [remoteBusy, setRemoteBusy] = useState(false);
 
-  useEffect(() => {
-    Promise.all([
+  const refreshCatalog = async (hostId = selectedHostId, providerId = selectedProviderId) => {
+    const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents] = await Promise.all([
       invoke<Host[]>("list_hosts"),
       invoke<Provider[]>("list_providers"),
       invoke<ChangeSet[]>("list_changes"),
@@ -151,20 +160,24 @@ function App() {
       invoke<Memory[]>("list_memory"),
       invoke<ConfigLayer[]>("list_config_layers"),
       invoke<Guidance[]>("list_guidance"),
-      invoke<RuntimeEvent[]>("list_runtime_events", { hostId: null, providerId: null }),
-    ])
-      .then(([nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents]) => {
-        setHosts(nextHosts);
-        setProviders(nextProviders);
-        setChanges(nextChanges);
-        setProjects(nextProjects);
-        setSessions(nextSessions);
-        setMemories(nextMemories);
-        setConfigLayers(nextConfigLayers);
-        setGuidance(nextGuidance);
-        setRuntimeEvents(nextRuntimeEvents);
-      })
-      .catch((reason) => setError(String(reason)));
+      invoke<RuntimeEvent[]>("list_runtime_events", {
+        hostId: hostId || null,
+        providerId: providerId || null,
+      }),
+    ]);
+    setHosts(nextHosts);
+    setProviders(nextProviders);
+    setChanges(nextChanges);
+    setProjects(nextProjects);
+    setSessions(nextSessions);
+    setMemories(nextMemories);
+    setConfigLayers(nextConfigLayers);
+    setGuidance(nextGuidance);
+    setRuntimeEvents(nextRuntimeEvents);
+  };
+
+  useEffect(() => {
+    refreshCatalog().catch((reason) => setError(String(reason)));
   }, []);
 
   const search = async (event?: React.FormEvent) => {
@@ -189,34 +202,59 @@ function App() {
       setSyncing(true);
       setError(null);
       await invoke("collect_local", { providerId: selectedProviderId || "codex" });
-      const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents] = await Promise.all([
-        invoke<Host[]>("list_hosts"),
-        invoke<Provider[]>("list_providers"),
-        invoke<ChangeSet[]>("list_changes"),
-        invoke<Project[]>("list_projects"),
-        invoke<Session[]>("list_sessions"),
-        invoke<Memory[]>("list_memory"),
-        invoke<ConfigLayer[]>("list_config_layers"),
-        invoke<Guidance[]>("list_guidance"),
-        invoke<RuntimeEvent[]>("list_runtime_events", {
-          hostId: selectedHostId || null,
-          providerId: selectedProviderId || null,
-        }),
-      ]);
-      setHosts(nextHosts);
-      setProviders(nextProviders);
-      setChanges(nextChanges);
-      setProjects(nextProjects);
-      setSessions(nextSessions);
-      setMemories(nextMemories);
-      setConfigLayers(nextConfigLayers);
-      setGuidance(nextGuidance);
-      setRuntimeEvents(nextRuntimeEvents);
+      await refreshCatalog();
       await search();
     } catch (reason) {
       setError(String(reason));
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const enrollAndSyncRemote = async () => {
+    try {
+      setRemoteBusy(true);
+      setError(null);
+      const result = await invoke<{ enrollment: { host_id: string } }>("enroll_remote", {
+        agentUrl: remoteUrl,
+        tlsCa: remoteCaPath,
+        tlsServerName: remoteServerName || null,
+        pairingCode: remotePairingCode,
+        bootstrapToken: remoteBootstrapToken,
+        providerId: remoteProviderId,
+      });
+      const hostId = result.enrollment.host_id;
+      setRemoteHostId(hostId);
+      setSelectedHostId(hostId);
+      await refreshCatalog(hostId, remoteProviderId);
+      setRemotePairingCode("");
+      setRemoteBootstrapToken("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteBusy(false);
+    }
+  };
+
+  const syncRemote = async () => {
+    try {
+      setRemoteBusy(true);
+      setError(null);
+      await invoke("sync_remote", {
+        agentUrl: remoteUrl,
+        tlsCa: remoteCaPath,
+        tlsServerName: remoteServerName || null,
+        hostId: remoteHostId,
+        token: remoteToken || null,
+        providerId: remoteProviderId,
+      });
+      setSelectedHostId(remoteHostId);
+      await refreshCatalog(remoteHostId, remoteProviderId);
+      setRemoteToken("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteBusy(false);
     }
   };
 
@@ -370,6 +408,21 @@ function App() {
             <div className="status-card"><span className="status-icon blue">◉</span><div><small>Active providers</small><strong>{providers.length || "—"}</strong></div><span className="muted">capability registry</span></div>
             <div className="status-card"><span className="status-icon orange">◈</span><div><small>Pending approval</small><strong>{changes.filter((change) => change.status === "Proposed").length}</strong></div><span className="muted">review required</span></div>
           </div>
+
+          <section className="remote-section">
+            <div className="section-heading"><div><span className="eyebrow">Multi-host</span><h2>Connect another AMCP Agent</h2></div><span className="scope-pill"><span className="dot green" /> TLS · no remote filesystem mount</span></div>
+            <div className="remote-grid">
+              <input value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} placeholder="tcp://host.example:45432" aria-label="Remote Agent URL" />
+              <input value={remoteCaPath} onChange={(event) => setRemoteCaPath(event.target.value)} placeholder="/path/to/agent-ca.crt" aria-label="TLS CA path" />
+              <input value={remoteServerName} onChange={(event) => setRemoteServerName(event.target.value)} placeholder="TLS server name (optional)" aria-label="TLS server name" />
+              <select value={remoteProviderId} onChange={(event) => setRemoteProviderId(event.target.value)} aria-label="Remote provider"><option value="codex">Codex</option><option value="claude-code">Claude Code</option><option value="kiro">Kiro</option><option value="antigravity">Antigravity</option></select>
+              <input value={remotePairingCode} onChange={(event) => setRemotePairingCode(event.target.value)} placeholder="Pairing code" aria-label="Pairing code" />
+              <input type="password" value={remoteBootstrapToken} onChange={(event) => setRemoteBootstrapToken(event.target.value)} placeholder="Bootstrap token" aria-label="Bootstrap token" />
+              <input value={remoteHostId} onChange={(event) => setRemoteHostId(event.target.value)} placeholder="Enrolled host id for resync" aria-label="Enrolled host id" />
+              <input type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder="Credential (optional; Keychain fallback)" aria-label="Remote credential" />
+            </div>
+            <div className="remote-actions"><button className="primary" onClick={() => void enrollAndSyncRemote()} disabled={remoteBusy}>{remoteBusy ? "Connecting…" : "Enroll & sync"}</button><button className="secondary" onClick={() => void syncRemote()} disabled={remoteBusy || !remoteHostId}>{remoteBusy ? "Syncing…" : "Sync enrolled host"}</button><small>Enrollment stores the rotated host credential in the macOS Keychain. Later sync can use the stored credential by leaving the credential field empty.</small></div>
+          </section>
 
           <form className="search-box" onSubmit={search}><span className="search-icon">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search configuration, memory, sessions…"/><kbd>⌘ K</kbd><button type="submit">Search</button></form>
           {error && <div className="error-banner">{error}</div>}

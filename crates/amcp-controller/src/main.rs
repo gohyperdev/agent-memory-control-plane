@@ -942,19 +942,11 @@ async fn run_once(
     let batch = match client
         .request(
             RequestMethod::Collect {
-                scope: if agent_url.is_some() {
-                    Some(Scope {
-                        host_id: None,
-                        provider_id: Some(provider_id.clone()),
-                        project_id: None,
-                    })
-                } else {
-                    Some(Scope {
-                        host_id: Some(host_id_from_env()),
-                        provider_id: Some(provider_id.clone()),
-                        project_id: None,
-                    })
-                },
+                scope: Some(Scope {
+                    host_id: Some(registered_host.host_id.clone()),
+                    provider_id: Some(provider_id.clone()),
+                    project_id: None,
+                }),
                 cursor,
             },
             &token,

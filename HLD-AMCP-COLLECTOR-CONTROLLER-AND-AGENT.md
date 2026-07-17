@@ -111,6 +111,13 @@ flowchart TB
     A3 --> P3
 ```
 
+The desktop Controller exposes the enrollment and resync flow for this topology.
+It requires an explicit `tcp://` endpoint, a trusted CA path, and the Agent
+pairing code for first enrollment. The Controller stores the rotated credential
+in the macOS Keychain and uses the Agent-reported `host_id` as the scope for the
+initial collection and all subsequent requests. A remote Agent is never
+represented as a mounted filesystem.
+
 ### 5.3 Future server mode
 
 The Controller database and protocol should later support a headless central deployment. The desktop UI becomes a client, while Agents remain responsible for local state. This mode is not required for the macOS MVP.

@@ -65,6 +65,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - `amcp-core` exposes the shared functional catalog API used by the desktop UI, MCP gateway, and Controller; all surfaces therefore share scope and storage behavior.
 - Collection cursors are persisted only after a successful catalog transaction, allowing the Controller to resume per-host/provider collection safely.
 - `apps/amcp-desktop` is the Tauri 2 + React desktop shell. It renders host/index/approval status, search evidence, provenance, safe local sync, and the human approval action for proposed changes.
+- The desktop shell also provides a multi-host panel for TLS Agent enrollment and resync. Enrollment uses the Agent pairing code, stores the rotated credential in the macOS Keychain, and performs the initial provider collection without mounting or browsing the remote filesystem.
 
 Remote Agent example (TLS is required for TCP mode):
 

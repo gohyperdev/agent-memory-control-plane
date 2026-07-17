@@ -205,6 +205,104 @@ fn collect_local(provider_id: Option<String>) -> Result<serde_json::Value, Strin
 }
 
 #[tauri::command]
+fn enroll_remote(
+    agent_url: String,
+    tls_ca: String,
+    tls_server_name: Option<String>,
+    pairing_code: String,
+    bootstrap_token: String,
+    provider_id: String,
+) -> Result<serde_json::Value, String> {
+    if !agent_url.starts_with("tcp://") {
+        return Err("Remote Agent URL must use tcp://".into());
+    }
+    if tls_ca.trim().is_empty() || pairing_code.trim().is_empty() {
+        return Err("TLS CA path and pairing code are required".into());
+    }
+    let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
+    let mut enroll = Command::new(&controller);
+    enroll
+        .args(["enroll", "--agent-url", &agent_url, "--tls-ca", &tls_ca])
+        .args(["--pairing-code", &pairing_code, "--bootstrap-token", &bootstrap_token])
+        .args(["--no-start-agent", "--json"]);
+    if let Some(server_name) = &tls_server_name {
+        enroll.args(["--tls-server-name", server_name]);
+    }
+    let enrollment_output = enroll
+        .output()
+        .map_err(|error| format!("start remote enrollment: {error}"))?;
+    if !enrollment_output.status.success() {
+        return Err(String::from_utf8_lossy(&enrollment_output.stderr).trim().to_owned());
+    }
+    let enrollment: serde_json::Value = serde_json::from_slice(&enrollment_output.stdout)
+        .map_err(|error| format!("decode enrollment result: {error}"))?;
+    let host_id = enrollment
+        .get("host_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "enrollment did not return host_id".to_owned())?;
+
+    let mut collect = Command::new(&controller);
+    collect
+        .args(["run-once", "--agent-url", &agent_url, "--tls-ca", &tls_ca])
+        .args(["--provider-id", &provider_id, "--token", "amcp-development-token"])
+        .args(["--no-start-agent", "--json"])
+        .env("AMCP_AGENT_KEYCHAIN_ACCOUNT", format!("agent:{host_id}"));
+    if let Some(server_name) = &tls_server_name {
+        collect.args(["--tls-server-name", server_name]);
+    }
+    let collection_output = collect
+        .output()
+        .map_err(|error| format!("start remote collection: {error}"))?;
+    if !collection_output.status.success() {
+        return Err(String::from_utf8_lossy(&collection_output.stderr).trim().to_owned());
+    }
+    let collection: serde_json::Value = serde_json::from_slice(&collection_output.stdout)
+        .map_err(|error| format!("decode remote collection result: {error}"))?;
+    Ok(serde_json::json!({ "enrollment": enrollment, "collection": collection }))
+}
+
+#[tauri::command]
+fn sync_remote(
+    agent_url: String,
+    tls_ca: String,
+    tls_server_name: Option<String>,
+    host_id: String,
+    token: Option<String>,
+    provider_id: String,
+) -> Result<serde_json::Value, String> {
+    if !agent_url.starts_with("tcp://") {
+        return Err("Remote Agent URL must use tcp://".into());
+    }
+    if tls_ca.trim().is_empty() || host_id.trim().is_empty() {
+        return Err("TLS CA path and host id are required".into());
+    }
+    let controller = env::var_os("AMCP_CONTROLLER_BIN").unwrap_or_else(|| "amcp-controller".into());
+    let supplied_token = token.filter(|value| !value.trim().is_empty());
+    let auth_token = supplied_token
+        .as_deref()
+        .unwrap_or("amcp-development-token");
+    let mut collect = Command::new(controller);
+    collect
+        .args(["run-once", "--agent-url", &agent_url, "--tls-ca", &tls_ca])
+        .args(["--provider-id", &provider_id, "--token", auth_token])
+        .args(["--no-start-agent", "--json"]);
+    if supplied_token.is_none() {
+        collect.env("AMCP_AGENT_KEYCHAIN_ACCOUNT", format!("agent:{host_id}"));
+    }
+    if let Some(server_name) = &tls_server_name {
+        collect.args(["--tls-server-name", server_name]);
+    }
+    let output = collect
+        .output()
+        .map_err(|error| format!("start remote collection: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode remote collection result: {error}"))
+}
+
+#[tauri::command]
 fn approve_change(
     change_set_id: String,
     approved_by: Option<String>,
@@ -510,6 +608,8 @@ fn main() {
             propose_artifact_change,
             list_runtime_events,
             collect_local,
+            enroll_remote,
+            sync_remote,
             approve_change,
             propose_runtime_change,
             ask_codex
