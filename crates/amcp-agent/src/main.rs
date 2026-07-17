@@ -334,7 +334,7 @@ fn process_request(
                     .collect(),
                 agent_version: env!("CARGO_PKG_VERSION").into(),
             }),
-            RequestMethod::Collect { scope, .. } => {
+            RequestMethod::Collect { scope, cursor } => {
                 if let Some(scope) = &scope {
                     if scope.host_id.as_deref() != Some(host_identity().host_id.as_str()) {
                         return ResponseEnvelope {
@@ -351,11 +351,34 @@ fn process_request(
                     .as_ref()
                     .and_then(|scope| scope.provider_id.as_deref())
                     .unwrap_or("codex");
-                match provider_registry(codex_home)
-                    .get(provider_id)
-                    .and_then(|provider| provider.discover(host_identity()))
-                {
-                    Ok(batch) => {
+                let registry = provider_registry(codex_home);
+                let provider = match registry.get(provider_id) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        return ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Err(ProtocolError::new(
+                                "provider_unavailable",
+                                error.to_string(),
+                            )),
+                        };
+                    }
+                };
+                let current_cursor = provider.collection_cursor();
+                if current_cursor.is_some() && current_cursor.as_deref() == cursor.as_deref() {
+                    if let Ok(Some(mut batch)) = load_collection_cache(state_dir, provider_id) {
+                        batch.next_cursor = current_cursor.clone();
+                        return ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Ok(ResponsePayload::Collection(batch)),
+                        };
+                    }
+                }
+                match provider.discover(host_identity()) {
+                    Ok(mut batch) => {
+                        batch.next_cursor = current_cursor;
                         let _ = save_collection_cache(state_dir, provider_id, &batch);
                         let _ = append_collection_outbox(state_dir, provider_id, &batch);
                         Ok(ResponsePayload::Collection(batch))

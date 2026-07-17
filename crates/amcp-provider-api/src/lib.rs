@@ -7,6 +7,10 @@ use std::path::Path;
 
 pub trait ProviderAdapter: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
+    /// Return a cheap source-state cursor when the provider supports incremental discovery.
+    fn collection_cursor(&self) -> Option<String> {
+        None
+    }
     fn discover(&self, host: HostIdentity) -> Result<CollectionBatch>;
     fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord>;
     fn propose_change(&self, request: &ChangeRequest) -> Result<ChangeSet>;

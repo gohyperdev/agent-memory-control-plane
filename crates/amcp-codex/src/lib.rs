@@ -944,6 +944,74 @@ impl CodexAdapter {
         unique
     }
 
+    pub fn discovery_cursor(&self) -> String {
+        let mut entries = Vec::new();
+        for root in self.discovery_roots() {
+            if !root.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root)
+                .max_depth(4)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| should_descend(entry.path(), &root))
+                .flatten()
+            {
+                if !entry.file_type().is_file() || !is_cursor_file(entry.path(), &root) {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_nanos().to_string())
+                    .unwrap_or_default();
+                entries.push(format!(
+                    "{}:{}:{}",
+                    entry.path().display(),
+                    metadata.len(),
+                    modified
+                ));
+            }
+            for directory in ["sessions", "archived_sessions", "memories"] {
+                let path = root.join(directory);
+                if !path.is_dir() {
+                    continue;
+                }
+                for entry in WalkDir::new(path)
+                    .max_depth(2)
+                    .follow_links(false)
+                    .into_iter()
+                    .flatten()
+                {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|value| value.as_nanos().to_string())
+                        .unwrap_or_default();
+                    entries.push(format!(
+                        "{}:{}:{}",
+                        entry.path().display(),
+                        metadata.len(),
+                        modified
+                    ));
+                }
+            }
+        }
+        entries.sort();
+        hash_bytes(entries.join("\n").as_bytes())
+    }
+
     fn config_layer(&self, path: &Path, host: &HostIdentity) -> io::Result<ConfigLayerRecord> {
         let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let codex_home =
@@ -1087,6 +1155,10 @@ impl ProviderAdapter for CodexAdapter {
         self.provider()
     }
 
+    fn collection_cursor(&self) -> Option<String> {
+        Some(self.discovery_cursor())
+    }
+
     fn discover(&self, host: HostIdentity) -> Result<CollectionBatch> {
         Self::discover(self, host).map_err(Into::into)
     }
@@ -1216,6 +1288,23 @@ fn should_descend(path: &Path, root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+fn is_cursor_file(path: &Path, root: &Path) -> bool {
+    if path == root {
+        return false;
+    }
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(
+            "config.toml"
+            | "projects.toml"
+            | "AGENTS.md"
+            | "AGENTS.override.md"
+            | "history.jsonl"
+            | "session_index.jsonl",
+        ) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,7 +1419,9 @@ mod tests {
         )
         .expect("project guidance");
 
-        let batch = CodexAdapter::from_environment(Some(directory.path().to_path_buf()))
+        let adapter = CodexAdapter::from_environment(Some(directory.path().to_path_buf()));
+        let before_cursor = adapter.discovery_cursor();
+        let batch = adapter
             .discover(HostIdentity {
                 host_id: "host_project_fixture".into(),
                 display_name: "Fixture".into(),
@@ -1357,6 +1448,12 @@ mod tests {
                 .iter()
                 .any(|item| { item.project_id.as_deref() == Some(project_id.as_str()) })
         );
+        fs::write(
+            project.join(".codex/config.toml"),
+            "approval_policy = \"never\"\n",
+        )
+        .expect("change project config");
+        assert_ne!(before_cursor, adapter.discovery_cursor());
     }
 
     #[test]
