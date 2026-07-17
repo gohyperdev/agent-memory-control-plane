@@ -75,6 +75,7 @@ dependencies = [
 name = "amcp-controller"
 version = "0.1.0"
 dependencies = [
+ "amcp-core",
  "amcp-domain",
  "amcp-platform",
  "amcp-protocol",

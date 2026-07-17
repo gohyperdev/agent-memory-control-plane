@@ -357,12 +357,22 @@ fn process_request(
                 {
                     Ok(batch) => {
                         let _ = save_collection_cache(state_dir, provider_id, &batch);
+                        let _ = append_collection_outbox(state_dir, provider_id, &batch);
                         Ok(ResponsePayload::Collection(batch))
                     }
                     Err(error) => match load_collection_cache(state_dir, provider_id) {
                         Ok(Some(batch)) => Ok(ResponsePayload::Collection(batch)),
                         _ => Err(ProtocolError::new("collection_failed", error.to_string())),
                     },
+                }
+            }
+            RequestMethod::ReplayCollection { provider_id, limit } => {
+                match load_collection_outbox(state_dir, &provider_id) {
+                    Ok(batches) => Ok(ResponsePayload::CollectionReplay {
+                        provider_id,
+                        batches: batches.into_iter().rev().take(limit.clamp(1, 32)).collect(),
+                    }),
+                    Err(error) => Err(ProtocolError::new("replay_failed", error.to_string())),
                 }
             }
             RequestMethod::ReadArtifact {
@@ -625,6 +635,25 @@ mod tests {
                 .contains("fixture-secret-must-not-be-indexed")
         }));
     }
+
+    #[test]
+    fn collection_outbox_is_bounded_and_deduplicates_runs() {
+        let directory = tempfile::tempdir().expect("outbox directory");
+        let host = host_identity();
+        let batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host)
+        .expect("fixture collection");
+        append_collection_outbox(directory.path(), "codex", &batch).expect("append batch");
+        append_collection_outbox(directory.path(), "codex", &batch).expect("deduplicate batch");
+        let mut second = batch.clone();
+        second.collection_run_id = "second-run".into();
+        append_collection_outbox(directory.path(), "codex", &second).expect("append second");
+        let queued = load_collection_outbox(directory.path(), "codex").expect("load outbox");
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[1].collection_run_id, "second-run");
+    }
 }
 
 fn default_backup_dir() -> PathBuf {
@@ -653,6 +682,10 @@ fn collection_cache_path(state_dir: &Path, provider_id: &str) -> PathBuf {
     state_dir.join(format!("collection-{provider_id}.json"))
 }
 
+fn collection_outbox_path(state_dir: &Path, provider_id: &str) -> PathBuf {
+    state_dir.join(format!("collection-outbox-{provider_id}.json"))
+}
+
 fn save_collection_cache(
     state_dir: &Path,
     provider_id: &str,
@@ -674,6 +707,37 @@ fn load_collection_cache(
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn append_collection_outbox(
+    state_dir: &Path,
+    provider_id: &str,
+    batch: &amcp_domain::CollectionBatch,
+) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = collection_outbox_path(state_dir, provider_id);
+    let mut batches = load_collection_outbox(state_dir, provider_id)?;
+    batches.retain(|queued| queued.collection_run_id != batch.collection_run_id);
+    batches.push(batch.clone());
+    if batches.len() > 8 {
+        let keep_from = batches.len() - 8;
+        batches.drain(..keep_from);
+    }
+    let temporary = path.with_extension(format!("{}.tmp", new_id("outbox")));
+    std::fs::write(&temporary, serde_json::to_vec(&batches)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn load_collection_outbox(
+    state_dir: &Path,
+    provider_id: &str,
+) -> Result<Vec<amcp_domain::CollectionBatch>> {
+    match std::fs::read(collection_outbox_path(state_dir, provider_id)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.into()),
     }
 }

@@ -36,6 +36,10 @@ pub enum RequestMethod {
         scope: Option<Scope>,
         cursor: Option<String>,
     },
+    ReplayCollection {
+        provider_id: String,
+        limit: usize,
+    },
     ReadArtifact {
         target: ArtifactRef,
         redacted: bool,
@@ -86,6 +90,10 @@ pub enum ResponsePayload {
         agent_version: String,
     },
     Collection(CollectionBatch),
+    CollectionReplay {
+        provider_id: String,
+        batches: Vec<CollectionBatch>,
+    },
     Artifact(ArtifactRecord),
     ChangeSet(ChangeSet),
     ChangeReceipt(ChangeReceipt),
@@ -162,5 +170,23 @@ mod tests {
                 .expect("decode");
         assert_eq!(decoded.pairing_code.as_deref(), Some("12345678"));
         assert!(matches!(decoded.method, RequestMethod::Enroll { .. }));
+    }
+
+    #[test]
+    fn replay_request_round_trip_preserves_limit() {
+        let request = RequestEnvelope::new(
+            RequestMethod::ReplayCollection {
+                provider_id: "codex".into(),
+                limit: 4,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode replay request"))
+                .expect("decode replay request");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::ReplayCollection { limit: 4, .. }
+        ));
     }
 }

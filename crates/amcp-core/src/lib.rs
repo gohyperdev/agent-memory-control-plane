@@ -102,6 +102,17 @@ impl CatalogService {
             .save_cursor(host_id, provider_id, cursor, collection_run_id)
     }
 
+    pub fn register_connection(
+        &mut self,
+        host: &amcp_domain::HostIdentity,
+        endpoint: Option<&str>,
+        agent_version: Option<&str>,
+        capabilities: &[String],
+    ) -> Result<()> {
+        self.catalog
+            .register_connection(host, endpoint, agent_version, capabilities)
+    }
+
     pub fn save_change_set(&mut self, change_set: &ChangeSet) -> Result<()> {
         self.catalog.save_change_set(change_set)
     }

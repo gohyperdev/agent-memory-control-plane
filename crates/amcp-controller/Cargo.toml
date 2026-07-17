@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+amcp-core = { path = "../amcp-core" }
 amcp-domain = { path = "../amcp-domain" }
 amcp-platform = { path = "../amcp-platform" }
 amcp-protocol = { path = "../amcp-protocol" }

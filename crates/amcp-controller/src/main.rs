@@ -1,10 +1,10 @@
+use amcp_core::CatalogService;
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
     change_set_operations_hash, new_id,
 };
 use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
 use amcp_protocol::{RequestEnvelope, RequestMethod, ResponseEnvelope, ResponsePayload};
-use amcp_storage::Catalog;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
@@ -480,7 +480,40 @@ async fn run_once(
     let mut client = AgentClient::new(stream);
     let (registered_host, agent_version, capabilities) =
         register_and_refresh(&mut client, &token).await?;
-    let mut catalog = Catalog::open(&db)?;
+    let mut catalog = CatalogService::open(&db)?;
+    let replayed = match client
+        .request(
+            RequestMethod::ReplayCollection {
+                provider_id: "codex".into(),
+                limit: 8,
+            },
+            &token,
+        )
+        .await
+    {
+        Ok(ResponsePayload::CollectionReplay { batches, .. }) => {
+            let mut count = 0usize;
+            for replay in batches {
+                catalog.ingest(&replay)?;
+                catalog.save_cursor(
+                    &replay.host.host_id,
+                    "codex",
+                    replay
+                        .next_cursor
+                        .as_deref()
+                        .or(Some(replay.collection_run_id.as_str())),
+                    &replay.collection_run_id,
+                )?;
+                count += 1;
+            }
+            count
+        }
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("AMCP replay unavailable; continuing with live collection: {error:#}");
+            0
+        }
+    };
     let cursor = catalog.latest_cursor(&registered_host.host_id, "codex")?;
     let batch = match client
         .request(
@@ -532,6 +565,7 @@ async fn run_once(
                 "collection_run_id": batch.collection_run_id,
                 "discovered": batch.artifacts.len(),
                 "inserted": inserted,
+                "replayed": replayed,
                 "search": search_results.as_ref().map(|hits| hits.iter().map(|hit| serde_json::json!({"title": hit.title, "source": hit.source_reference, "preview": hit.preview})).collect::<Vec<_>>())
             })
         );
@@ -692,7 +726,7 @@ async fn enroll(
         let endpoint = agent_url
             .clone()
             .unwrap_or_else(|| format!("unix://{}", socket.display()));
-        let mut catalog = Catalog::open(&db)?;
+        let mut catalog = CatalogService::open(&db)?;
         catalog.register_connection(&host, Some(&endpoint), Some(&agent_version), &capabilities)?;
         let _ = client.request(RequestMethod::Shutdown, &credential).await;
         Ok::<_, anyhow::Error>((host, expires_at))
@@ -721,7 +755,7 @@ async fn enroll(
 }
 
 fn search(db: PathBuf, query: String, limit: usize) -> Result<()> {
-    let catalog = Catalog::open(&db)?;
+    let catalog = CatalogService::open(&db)?;
     for hit in catalog.search(&query, limit)? {
         println!("{}\t{}\t{}", hit.title, hit.source_reference, hit.preview);
     }
@@ -790,7 +824,7 @@ async fn propose_change(
             ResponsePayload::ChangeSet(change_set) => change_set,
             other => bail!("Agent returned unexpected proposal response: {other:?}"),
         };
-        let mut catalog = Catalog::open(&db)?;
+        let mut catalog = CatalogService::open(&db)?;
         let endpoint = agent_url
             .clone()
             .unwrap_or_else(|| format!("unix://{}", socket.display()));
@@ -842,7 +876,7 @@ async fn approve_change(
     json: bool,
 ) -> Result<()> {
     let token = resolve_agent_token(&token);
-    let mut catalog = Catalog::open(&db)?;
+    let mut catalog = CatalogService::open(&db)?;
     let mut change_set = catalog
         .load_change_set(&change_set_id)?
         .with_context(|| format!("change set not found: {change_set_id}"))?;
@@ -952,7 +986,7 @@ async fn rollback_change(
     json: bool,
 ) -> Result<()> {
     let token = resolve_agent_token(&token);
-    let mut catalog = Catalog::open(&db)?;
+    let mut catalog = CatalogService::open(&db)?;
     let mut change_set = catalog
         .load_change_set(&change_set_id)?
         .with_context(|| format!("change set not found: {change_set_id}"))?;
@@ -1044,7 +1078,7 @@ async fn rollback_change(
 }
 
 fn list_hosts(db: PathBuf) -> Result<()> {
-    let catalog = Catalog::open(&db)?;
+    let catalog = CatalogService::open(&db)?;
     for host in catalog.list_hosts()? {
         println!(
             "{}\t{}\t{:?}\t{}",
