@@ -14,13 +14,14 @@ use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use std::{
+    collections::VecDeque,
     env,
     fs::File,
     io::BufReader as StdBufReader,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
@@ -122,6 +123,44 @@ enum CommandKind {
         no_start_agent: bool,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    StreamEvents {
+        #[arg(
+            long,
+            default_value_os_t = default_agent_socket_path(),
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long, default_value_t = 16)]
+        max_in_flight: usize,
+        #[arg(long, default_value_t = 1_000)]
+        heartbeat_ms: u64,
+        #[arg(long, default_value_t = 10)]
+        duration_seconds: u64,
+        #[arg(long)]
+        provider_id: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -369,6 +408,40 @@ async fn main() -> Result<()> {
                 agent_bin,
                 no_start_agent,
                 limit,
+                json,
+            )
+            .await
+        }
+        CommandKind::StreamEvents {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            no_start_agent,
+            max_in_flight,
+            heartbeat_ms,
+            duration_seconds,
+            provider_id,
+            json,
+        } => {
+            stream_events(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                no_start_agent,
+                max_in_flight,
+                heartbeat_ms,
+                duration_seconds,
+                provider_id,
                 json,
             )
             .await
@@ -754,6 +827,150 @@ async fn watch(
             _ = sleep(StdDuration::from_secs(interval_seconds.max(1))) => {}
         }
     }
+}
+
+async fn stream_events(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    max_in_flight: usize,
+    heartbeat_ms: u64,
+    duration_seconds: u64,
+    provider_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let token = resolve_agent_token(&token);
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).context("create Controller data directory")?;
+    }
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await
+        .context("connect to AMCP Agent event stream")?;
+        let mut client = AgentClient::new(stream);
+        let (host, agent_version, capabilities, provider_descriptors) =
+            register_and_refresh(&mut client, &token).await?;
+        let mut catalog = CatalogService::open(&db)?;
+        let endpoint = agent_url
+            .clone()
+            .unwrap_or_else(|| format!("unix://{}", socket.display()));
+        catalog.register_connection(&host, Some(&endpoint), Some(&agent_version), &capabilities)?;
+        catalog.register_provider_descriptors(&host, &provider_descriptors)?;
+        let stream_scope = Scope {
+            host_id: Some(host.host_id.clone()),
+            provider_id: provider_id.clone(),
+            project_id: None,
+        };
+        let opened = client
+            .request(
+                RequestMethod::OpenEventStream {
+                    after_event_id: None,
+                    scope: Some(stream_scope),
+                    max_in_flight: max_in_flight.clamp(1, 64),
+                    heartbeat_ms: heartbeat_ms.clamp(250, 30_000),
+                },
+                &token,
+            )
+            .await?;
+        let (stream_id, negotiated_max_in_flight, negotiated_heartbeat_ms) = match opened {
+            ResponsePayload::EventStreamOpened {
+                stream_id,
+                max_in_flight,
+                heartbeat_ms,
+            } => (stream_id, max_in_flight, heartbeat_ms),
+            other => bail!("Agent returned unexpected event stream response: {other:?}"),
+        };
+        let deadline = Instant::now() + StdDuration::from_secs(duration_seconds);
+        let mut pages = 0usize;
+        let mut heartbeats = 0usize;
+        let mut received = 0usize;
+        let mut persisted = 0usize;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let response = match tokio::time::timeout(remaining, client.next_response()).await {
+                Ok(response) => response?,
+                Err(_) => break,
+            };
+            let payload = response
+                .result
+                .map_err(|error| anyhow::anyhow!("Agent {}: {}", error.code, error.message))?;
+            match payload {
+                ResponsePayload::EventStreamPage {
+                    stream_id: page_stream_id,
+                    events,
+                    heartbeat,
+                    ..
+                } if page_stream_id == stream_id => {
+                    pages += 1;
+                    if heartbeat {
+                        heartbeats += 1;
+                        continue;
+                    }
+                    received += events.len();
+                    let event_ids = events
+                        .iter()
+                        .map(|event| event.event_id.clone())
+                        .collect::<Vec<_>>();
+                    persisted += catalog.ingest_runtime_events(&events)?;
+                    if !event_ids.is_empty() {
+                        match client
+                            .request(RequestMethod::AckEvents { event_ids }, &token)
+                            .await?
+                        {
+                            ResponsePayload::RuntimeEventsAcked(_) => {}
+                            other => {
+                                bail!("Agent returned unexpected event ACK response: {other:?}")
+                            }
+                        }
+                    }
+                }
+                ResponsePayload::EventStreamClosed { .. } => break,
+                other => bail!("Agent returned unexpected event stream frame: {other:?}"),
+            }
+        }
+        let _ = client
+            .request(RequestMethod::CloseEventStream { stream_id }, &token)
+            .await;
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "host_id": host.host_id,
+            "max_in_flight": negotiated_max_in_flight,
+            "heartbeat_ms": negotiated_heartbeat_ms,
+            "pages": pages,
+            "heartbeats": heartbeats,
+            "received": received,
+            "persisted": persisted,
+        }))
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let summary = result?;
+    if json {
+        println!("{}", serde_json::to_string(&summary)?);
+    } else {
+        println!(
+            "AMCP event stream received {} event(s), persisted {}",
+            summary["received"], summary["persisted"]
+        );
+    }
+    Ok(())
 }
 
 async fn runtime_list(
@@ -1394,6 +1611,7 @@ fn load_tls_connector(ca_path: &Path) -> Result<TlsConnector> {
 struct AgentClient<S: AsyncRead + AsyncWrite + Unpin> {
     reader: tokio::io::Lines<BufReader<ReadHalf<S>>>,
     writer: WriteHalf<S>,
+    pending: VecDeque<ResponseEnvelope>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
@@ -1402,6 +1620,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         Self {
             reader: BufReader::new(reader).lines(),
             writer,
+            pending: VecDeque::new(),
         }
     }
 
@@ -1421,23 +1640,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         } else {
             request
         };
+        let request_id = self.send_request(request).await?;
+        let mut unrelated = VecDeque::new();
+        loop {
+            let response = self.next_response().await?;
+            if response.request_id == request_id {
+                while let Some(response) = unrelated.pop_front() {
+                    self.pending.push_back(response);
+                }
+                return response
+                    .result
+                    .map_err(|error| anyhow::anyhow!("Agent {}: {}", error.code, error.message));
+            }
+            unrelated.push_back(response);
+        }
+    }
+
+    async fn send_request(&mut self, request: RequestEnvelope) -> Result<String> {
         let request_id = request.request_id.clone();
         let encoded = serde_json::to_string(&request)?;
         self.writer.write_all(encoded.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
+        Ok(request_id)
+    }
+
+    async fn next_response(&mut self) -> Result<ResponseEnvelope> {
+        if let Some(response) = self.pending.pop_front() {
+            return Ok(response);
+        }
         let line = self
             .reader
             .next_line()
             .await?
             .context("Agent closed connection")?;
         let response: ResponseEnvelope = serde_json::from_str(&line)?;
-        if response.request_id != request_id {
-            bail!("Agent response request ID mismatch")
-        }
-        response
-            .result
-            .map_err(|error| anyhow::anyhow!("Agent {}: {}", error.code, error.message))
+        Ok(response)
     }
 }
 

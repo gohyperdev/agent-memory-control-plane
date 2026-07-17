@@ -26,12 +26,12 @@ use std::{
     io::BufReader as StdBufReader,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, UnixListener},
-    time::sleep,
+    time::{interval, sleep},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -589,6 +589,15 @@ where
                 continue;
             }
         };
+        if matches!(&request.method, RequestMethod::OpenEventStream { .. }) {
+            let (response, stream_config) = open_event_stream(request, &auth);
+            write_response(&mut writer, response).await?;
+            if let Some(config) = stream_config {
+                serve_event_stream(&mut lines, &mut writer, &auth, &state_dir, config).await?;
+                break;
+            }
+            continue;
+        }
         let response = if matches!(&request.method, RequestMethod::SubscribeEvents { .. }) {
             process_subscribe_request(request, &auth, &state_dir).await
         } else if matches!(&request.method, RequestMethod::RuntimeListThreads { .. }) {
@@ -610,6 +619,309 @@ where
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct EventStreamConfig {
+    stream_id: String,
+    after_event_id: Option<String>,
+    scope: Option<amcp_domain::Scope>,
+    max_in_flight: usize,
+    heartbeat: StdDuration,
+}
+
+fn open_event_stream(
+    request: RequestEnvelope,
+    auth: &Arc<Mutex<AgentAuth>>,
+) -> (ResponseEnvelope, Option<EventStreamConfig>) {
+    let request_id = request.request_id.clone();
+    let (after_event_id, scope, max_in_flight, heartbeat_ms) = match request.method {
+        RequestMethod::OpenEventStream {
+            after_event_id,
+            scope,
+            max_in_flight,
+            heartbeat_ms,
+        } => (after_event_id, scope, max_in_flight, heartbeat_ms),
+        _ => {
+            return (
+                ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        "invalid_event_stream_request",
+                        "not an event stream open request",
+                    )),
+                },
+                None,
+            );
+        }
+    };
+    let authenticated = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .accepts(request.token.as_deref());
+    if request.protocol_version != PROTOCOL_VERSION {
+        return (
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "protocol_version_mismatch",
+                    "unsupported protocol version",
+                )),
+            },
+            None,
+        );
+    }
+    if !authenticated {
+        return (
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+            },
+            None,
+        );
+    }
+    if scope
+        .as_ref()
+        .and_then(|scope| scope.host_id.as_deref())
+        .is_some_and(|host_id| host_id != host_identity().host_id)
+    {
+        return (
+            ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "scope_denied",
+                    "requested host is not this Agent",
+                )),
+            },
+            None,
+        );
+    }
+    let stream_id = new_id("event-stream");
+    let max_in_flight = max_in_flight.clamp(1, 64);
+    let heartbeat_ms = heartbeat_ms.clamp(250, 30_000);
+    let config = EventStreamConfig {
+        stream_id: stream_id.clone(),
+        after_event_id,
+        scope,
+        max_in_flight,
+        heartbeat: StdDuration::from_millis(heartbeat_ms),
+    };
+    (
+        ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Ok(ResponsePayload::EventStreamOpened {
+                stream_id,
+                max_in_flight,
+                heartbeat_ms,
+            }),
+        },
+        Some(config),
+    )
+}
+
+async fn serve_event_stream<R, W>(
+    lines: &mut tokio::io::Lines<BufReader<R>>,
+    writer: &mut W,
+    auth: &Arc<Mutex<AgentAuth>>,
+    state_dir: &Path,
+    config: EventStreamConfig,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut cursor = config.after_event_id.clone();
+    let mut in_flight = HashSet::new();
+    let mut sent_ids = HashSet::new();
+    let mut ticks = interval(StdDuration::from_millis(100));
+    let mut last_heartbeat = Instant::now();
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { return Ok(()); };
+                let request: RequestEnvelope = match serde_json::from_str(&line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id: "unknown".into(),
+                            result: Err(ProtocolError::new("invalid_json", error.to_string())),
+                        }).await?;
+                        continue;
+                    }
+                };
+                let request_id = request.request_id.clone();
+                let authenticated = auth
+                    .lock()
+                    .expect("Agent auth mutex")
+                    .accepts(request.token.as_deref());
+                if request.protocol_version != PROTOCOL_VERSION {
+                    write_response(writer, ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new("protocol_version_mismatch", "unsupported protocol version")),
+                    }).await?;
+                    continue;
+                }
+                if !authenticated {
+                    write_response(writer, ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+                    }).await?;
+                    continue;
+                }
+                match request.method {
+                    RequestMethod::AckEvents { event_ids } => {
+                        let allowed = event_ids
+                            .into_iter()
+                            .filter(|event_id| in_flight.contains(event_id))
+                            .collect::<Vec<_>>();
+                        let removed = acknowledge_runtime_events(state_dir, &allowed)?;
+                        for event_id in allowed {
+                            in_flight.remove(&event_id);
+                        }
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Ok(ResponsePayload::RuntimeEventsAcked(removed)),
+                        }).await?;
+                    }
+                    RequestMethod::CloseEventStream { stream_id } if stream_id == config.stream_id => {
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Ok(ResponsePayload::EventStreamClosed {
+                                stream_id: config.stream_id.clone(),
+                                reason: "client_closed".into(),
+                            }),
+                        }).await?;
+                        return Ok(());
+                    }
+                    RequestMethod::Shutdown => {
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Ok(ResponsePayload::ShutdownAck),
+                        }).await?;
+                        return Ok(());
+                    }
+                    _ => {
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id,
+                            result: Err(ProtocolError::new(
+                                "event_stream_request_not_supported",
+                                "only AckEvents, CloseEventStream and Shutdown are accepted on an event stream",
+                            )),
+                        }).await?;
+                    }
+                }
+            }
+            _ = ticks.tick() => {
+                let available = config.max_in_flight.saturating_sub(in_flight.len());
+                let mut emitted = false;
+                if available > 0 {
+                    let events = runtime_event_stream_page(
+                        state_dir,
+                        cursor.as_deref(),
+                        config.scope.as_ref(),
+                        &sent_ids,
+                        available,
+                    )?;
+                    if !events.is_empty() {
+                        let next_event_id = events.last().map(|event| event.event_id.clone());
+                        for event in &events {
+                            in_flight.insert(event.event_id.clone());
+                            sent_ids.insert(event.event_id.clone());
+                        }
+                        cursor = next_event_id.clone();
+                        write_response(writer, ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            request_id: new_id("event-stream-page"),
+                            result: Ok(ResponsePayload::EventStreamPage {
+                                stream_id: config.stream_id.clone(),
+                                events,
+                                next_event_id,
+                                heartbeat: false,
+                            }),
+                        }).await?;
+                        last_heartbeat = Instant::now();
+                        emitted = true;
+                    }
+                }
+                if !emitted && last_heartbeat.elapsed() >= config.heartbeat {
+                    write_response(writer, ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id: new_id("event-stream-heartbeat"),
+                        result: Ok(ResponsePayload::EventStreamPage {
+                            stream_id: config.stream_id.clone(),
+                            events: Vec::new(),
+                            next_event_id: cursor.clone(),
+                            heartbeat: true,
+                        }),
+                    }).await?;
+                    last_heartbeat = Instant::now();
+                }
+            }
+        }
+    }
+}
+
+fn runtime_event_stream_page(
+    state_dir: &Path,
+    after_event_id: Option<&str>,
+    scope: Option<&amcp_domain::Scope>,
+    sent_ids: &HashSet<String>,
+    limit: usize,
+) -> Result<Vec<RuntimeEvent>> {
+    let events = load_runtime_event_outbox(state_dir)?;
+    let start = after_event_id
+        .and_then(|event_id| {
+            events
+                .iter()
+                .position(|event| event.event_id == event_id)
+                .map(|position| position + 1)
+        })
+        .unwrap_or(0);
+    Ok(events
+        .into_iter()
+        .skip(start)
+        .filter(|event| !sent_ids.contains(&event.event_id) && event_matches_scope(event, scope))
+        .take(limit.clamp(1, 64))
+        .collect())
+}
+
+fn event_matches_scope(event: &RuntimeEvent, scope: Option<&amcp_domain::Scope>) -> bool {
+    let Some(scope) = scope else { return true };
+    if scope
+        .host_id
+        .as_deref()
+        .is_some_and(|host_id| host_id != event.host_id)
+        || scope
+            .provider_id
+            .as_deref()
+            .is_some_and(|provider_id| provider_id != event.provider_id)
+    {
+        return false;
+    }
+    scope.project_id.as_deref().is_none_or(|project_id| {
+        serde_json::from_str::<serde_json::Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("project_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|event_project_id| event_project_id == project_id)
+    })
 }
 
 fn process_request(
@@ -793,7 +1105,9 @@ fn process_request(
                     error.to_string(),
                 )),
             },
-            RequestMethod::RuntimeListThreads { .. } => Err(ProtocolError::new(
+            RequestMethod::RuntimeListThreads { .. }
+            | RequestMethod::OpenEventStream { .. }
+            | RequestMethod::CloseEventStream { .. } => Err(ProtocolError::new(
                 "runtime_request_requires_async_handler",
                 "runtime thread requests must use the Agent async handler",
             )),
@@ -1553,6 +1867,174 @@ mod tests {
             }
             other => panic!("unexpected continued subscription page: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn event_stream_delivers_with_backpressure_and_ack() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().expect("stream directory");
+        let host = host_identity();
+        append_runtime_event_outbox(
+            directory.path(),
+            &[
+                RuntimeEvent {
+                    event_id: "stream-event-1".into(),
+                    host_id: host.host_id.clone(),
+                    provider_id: "codex".into(),
+                    event_type: "session.updated".into(),
+                    sequence: 1,
+                    payload_json: serde_json::json!({"thread_id": "thread-1"}).to_string(),
+                    occurred_at: Utc::now(),
+                },
+                RuntimeEvent {
+                    event_id: "stream-event-2".into(),
+                    host_id: host.host_id.clone(),
+                    provider_id: "codex".into(),
+                    event_type: "session.updated".into(),
+                    sequence: 2,
+                    payload_json: serde_json::json!({"thread_id": "thread-2"}).to_string(),
+                    occurred_at: Utc::now(),
+                },
+            ],
+        )
+        .expect("append stream events");
+        let auth = Arc::new(Mutex::new(AgentAuth::new("stream-token".into(), None, 300)));
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server_auth = auth.clone();
+        let server_directory = directory.path().to_path_buf();
+        let server_task = tokio::spawn(async move {
+            handle_connection(
+                server,
+                server_auth,
+                None,
+                PathBuf::from("codex"),
+                None,
+                PathBuf::from("/tmp/amcp-stream-backup"),
+                server_directory,
+            )
+            .await
+        });
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_lines = BufReader::new(client_read).lines();
+        let open = RequestEnvelope::new(
+            RequestMethod::OpenEventStream {
+                after_event_id: None,
+                scope: Some(amcp_domain::Scope {
+                    host_id: Some(host.host_id),
+                    provider_id: Some("codex".into()),
+                    project_id: None,
+                }),
+                max_in_flight: 1,
+                heartbeat_ms: 250,
+            },
+            Some("stream-token".into()),
+        );
+        let open_id = open.request_id.clone();
+        client_write
+            .write_all(format!("{}\n", serde_json::to_string(&open).unwrap()).as_bytes())
+            .await
+            .expect("write stream open");
+        client_write.flush().await.expect("flush stream open");
+        let opened: ResponseEnvelope = serde_json::from_str(
+            &client_lines
+                .next_line()
+                .await
+                .expect("read stream open")
+                .expect("stream open response"),
+        )
+        .expect("decode stream open");
+        assert_eq!(opened.request_id, open_id);
+        let stream_id = match opened.result.expect("stream open should succeed") {
+            ResponsePayload::EventStreamOpened {
+                stream_id,
+                max_in_flight: 1,
+                ..
+            } => stream_id,
+            other => panic!("unexpected stream open response: {other:?}"),
+        };
+        let first: ResponseEnvelope = serde_json::from_str(
+            &tokio::time::timeout(StdDuration::from_secs(2), client_lines.next_line())
+                .await
+                .expect("first event timeout")
+                .expect("read first event")
+                .expect("first event response"),
+        )
+        .expect("decode first event");
+        match first.result.expect("first event should succeed") {
+            ResponsePayload::EventStreamPage { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].event_id, "stream-event-1");
+            }
+            other => panic!("unexpected first stream frame: {other:?}"),
+        }
+        let ack = RequestEnvelope::new(
+            RequestMethod::AckEvents {
+                event_ids: vec!["stream-event-1".into()],
+            },
+            Some("stream-token".into()),
+        );
+        let ack_id = ack.request_id.clone();
+        client_write
+            .write_all(format!("{}\n", serde_json::to_string(&ack).unwrap()).as_bytes())
+            .await
+            .expect("write stream ack");
+        client_write.flush().await.expect("flush stream ack");
+        let ack_response: ResponseEnvelope = serde_json::from_str(
+            &client_lines
+                .next_line()
+                .await
+                .expect("read stream ack")
+                .expect("stream ack response"),
+        )
+        .expect("decode stream ack");
+        assert_eq!(ack_response.request_id, ack_id);
+        assert!(matches!(
+            ack_response.result.expect("ack should succeed"),
+            ResponsePayload::RuntimeEventsAcked(1)
+        ));
+        let second: ResponseEnvelope = serde_json::from_str(
+            &tokio::time::timeout(StdDuration::from_secs(2), client_lines.next_line())
+                .await
+                .expect("second event timeout")
+                .expect("read second event")
+                .expect("second event response"),
+        )
+        .expect("decode second event");
+        assert!(matches!(
+            second.result.expect("second event should succeed"),
+            ResponsePayload::EventStreamPage { events, .. }
+                if events.len() == 1 && events[0].event_id == "stream-event-2"
+        ));
+        let close = RequestEnvelope::new(
+            RequestMethod::CloseEventStream {
+                stream_id: stream_id.clone(),
+            },
+            Some("stream-token".into()),
+        );
+        let close_id = close.request_id.clone();
+        client_write
+            .write_all(format!("{}\n", serde_json::to_string(&close).unwrap()).as_bytes())
+            .await
+            .expect("write stream close");
+        client_write.flush().await.expect("flush stream close");
+        let closed: ResponseEnvelope = serde_json::from_str(
+            &client_lines
+                .next_line()
+                .await
+                .expect("read stream close")
+                .expect("stream close response"),
+        )
+        .expect("decode stream close");
+        assert_eq!(closed.request_id, close_id);
+        assert!(matches!(
+            closed.result.expect("close should succeed"),
+            ResponsePayload::EventStreamClosed { stream_id: id, .. } if id == stream_id
+        ));
+        server_task
+            .await
+            .expect("join stream server")
+            .expect("stream server");
     }
 
     #[tokio::test]

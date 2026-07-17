@@ -49,6 +49,15 @@ pub enum RequestMethod {
         limit: usize,
         wait_ms: u64,
     },
+    OpenEventStream {
+        after_event_id: Option<String>,
+        scope: Option<Scope>,
+        max_in_flight: usize,
+        heartbeat_ms: u64,
+    },
+    CloseEventStream {
+        stream_id: String,
+    },
     RuntimeListThreads {
         provider_id: String,
         scope: Option<Scope>,
@@ -119,6 +128,21 @@ pub enum ResponsePayload {
         events: Vec<RuntimeEvent>,
         next_event_id: Option<String>,
         timed_out: bool,
+    },
+    EventStreamOpened {
+        stream_id: String,
+        max_in_flight: usize,
+        heartbeat_ms: u64,
+    },
+    EventStreamPage {
+        stream_id: String,
+        events: Vec<RuntimeEvent>,
+        next_event_id: Option<String>,
+        heartbeat: bool,
+    },
+    EventStreamClosed {
+        stream_id: String,
+        reason: String,
     },
     RuntimeThreadPage {
         provider_id: String,
@@ -305,6 +329,35 @@ mod tests {
                 cursor: Some(cursor),
                 limit: 32
             } if provider_id == "codex" && host_id == "host-runtime" && cursor == "page-2"
+        ));
+    }
+
+    #[test]
+    fn event_stream_request_round_trip_preserves_flow_control() {
+        let request = RequestEnvelope::new(
+            RequestMethod::OpenEventStream {
+                after_event_id: Some("event-1".into()),
+                scope: Some(Scope {
+                    host_id: Some("host-runtime".into()),
+                    provider_id: Some("codex".into()),
+                    project_id: None,
+                }),
+                max_in_flight: 32,
+                heartbeat_ms: 1_000,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode stream request"))
+                .expect("decode stream request");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::OpenEventStream {
+                after_event_id: Some(_),
+                scope: Some(Scope { provider_id: Some(provider_id), .. }),
+                max_in_flight: 32,
+                heartbeat_ms: 1_000
+            } if provider_id == "codex"
         ));
     }
 }
