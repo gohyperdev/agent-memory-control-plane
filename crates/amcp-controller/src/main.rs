@@ -3,7 +3,9 @@ use amcp_domain::{
     ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
     change_set_operations_hash, new_id,
 };
-use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
+use amcp_platform::{
+    MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
+};
 use amcp_protocol::{RequestEnvelope, RequestMethod, ResponseEnvelope, ResponsePayload};
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
@@ -38,7 +40,7 @@ enum CommandKind {
     RunOnce {
         #[arg(
             long,
-            default_value_os_t = default_socket_path(),
+            default_value_os_t = default_agent_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -101,7 +103,7 @@ enum CommandKind {
     ProposeChange {
         #[arg(
             long,
-            default_value_os_t = default_socket_path(),
+            default_value_os_t = default_agent_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -139,7 +141,7 @@ enum CommandKind {
     ApproveChange {
         #[arg(
             long,
-            default_value_os_t = default_socket_path(),
+            default_value_os_t = default_agent_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -175,7 +177,7 @@ enum CommandKind {
     RollbackChange {
         #[arg(
             long,
-            default_value_os_t = default_socket_path(),
+            default_value_os_t = default_agent_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -221,7 +223,7 @@ enum CommandKind {
     Enroll {
         #[arg(
             long,
-            default_value_os_t = default_socket_path(),
+            default_value_os_t = default_agent_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -617,7 +619,7 @@ async fn watch(
             let result = run_once(
                 PathBuf::from(
                     env::var_os("AMCP_AGENT_SOCKET")
-                        .unwrap_or_else(|| default_socket_path().into_os_string()),
+                        .unwrap_or_else(|| default_agent_socket_path().into_os_string()),
                 ),
                 endpoint.clone(),
                 tls_ca.clone(),
@@ -1304,12 +1306,6 @@ fn default_db_path() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from(".amcp/controller.sqlite"))
-}
-
-fn default_socket_path() -> PathBuf {
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
-        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 fn default_agent_binary() -> PathBuf {

@@ -156,6 +156,10 @@ Both components use shared Rust crates for:
 
 The shared core must not depend on Tauri, launchd, SQLite connection details, or a particular network transport.
 
+Platform-owned endpoint paths are resolved through `amcp-platform`: macOS uses
+the per-user Application Support directory, Linux uses the user runtime/state
+directory, and Windows has a LocalAppData path reserved for the future port.
+
 ## 7. Collector/Controller design
 
 ### 7.1 Internal modules

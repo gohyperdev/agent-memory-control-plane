@@ -118,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "amcp-core",
  "amcp-domain",
+ "amcp-platform",
  "amcp-rag",
  "amcp-storage",
  "anyhow",

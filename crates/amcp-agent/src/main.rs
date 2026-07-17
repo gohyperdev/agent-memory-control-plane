@@ -1,7 +1,9 @@
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
 use amcp_domain::{HostIdentity, new_id};
-use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
+use amcp_platform::{
+    MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
+};
 use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
     ResponsePayload,
@@ -31,7 +33,7 @@ struct Args {
     command: Option<Command>,
     #[arg(
         long,
-        default_value_os_t = default_socket_path(),
+        default_value_os_t = default_agent_socket_path(),
         env = "AMCP_AGENT_SOCKET"
     )]
     socket: PathBuf,
@@ -697,12 +699,6 @@ fn default_backup_dir() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from(".amcp/agent-backups"))
-}
-
-fn default_socket_path() -> PathBuf {
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
-        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 fn default_state_dir() -> PathBuf {

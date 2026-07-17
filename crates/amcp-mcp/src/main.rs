@@ -1,5 +1,6 @@
 use amcp_core::CatalogService;
 use amcp_domain::Scope;
+use amcp_platform::default_agent_socket_path;
 use amcp_rag::{DisabledRagManager, RagManager};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -23,7 +24,7 @@ struct Args {
     #[arg(
         long,
         env = "AMCP_AGENT_SOCKET",
-        default_value_os_t = default_socket_path()
+        default_value_os_t = default_agent_socket_path()
     )]
     agent_socket: PathBuf,
     #[arg(long, env = "AMCP_AGENT_URL")]
@@ -40,12 +41,6 @@ struct Args {
     agent_token: String,
     #[arg(long, env = "CODEX_HOME")]
     codex_home: Option<PathBuf>,
-}
-
-fn default_socket_path() -> PathBuf {
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
-        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,7 +1,34 @@
 use anyhow::{Context, Result, bail};
-use std::process::Command;
+use std::{env, path::PathBuf, process::Command};
 
 pub const KEYCHAIN_SERVICE: &str = "com.gohyperdev.amcp.agent";
+
+pub fn default_agent_socket_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
+            .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return env::var_os("LOCALAPPDATA")
+            .map(|home| PathBuf::from(home).join("AMCP/agent.sock"))
+            .unwrap_or_else(|| PathBuf::from("AMCP/agent.sock"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return env::var_os("XDG_RUNTIME_DIR")
+            .map(|directory| PathBuf::from(directory).join("amcp-agent.sock"))
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/state/AMCP/agent.sock"))
+            })
+            .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"));
+    }
+    #[allow(unreachable_code)]
+    PathBuf::from(".amcp/agent.sock")
+}
 
 pub trait SecretStore {
     fn get(&self) -> Result<Option<String>>;
@@ -119,5 +146,12 @@ mod tests {
             keychain_account_for_host("host-a"),
             keychain_account_for_host("host-b")
         );
+    }
+
+    #[test]
+    fn default_agent_socket_is_user_scoped() {
+        let path = default_agent_socket_path();
+        assert!(path.is_absolute() || path.starts_with(".amcp"));
+        assert!(!path.to_string_lossy().is_empty());
     }
 }
