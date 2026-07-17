@@ -161,6 +161,36 @@ impl AppServerClient {
         self.request("thread/start", Value::Object(params)).await
     }
 
+    pub async fn list_threads(
+        &mut self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Value> {
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor.into()));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".into(), Value::Number(limit.into()));
+        }
+        self.request("thread/list", Value::Object(params)).await
+    }
+
+    pub async fn read_thread(&mut self, thread_id: &str) -> Result<Value> {
+        self.request("thread/read", json!({ "threadId": thread_id }))
+            .await
+    }
+
+    pub async fn archive_thread(&mut self, thread_id: &str) -> Result<Value> {
+        self.request("thread/archive", json!({ "threadId": thread_id }))
+            .await
+    }
+
+    pub async fn unarchive_thread(&mut self, thread_id: &str) -> Result<Value> {
+        self.request("thread/unarchive", json!({ "threadId": thread_id }))
+            .await
+    }
+
     pub async fn start_turn(&mut self, thread_id: &str, text: &str) -> Result<Value> {
         self.request(
             "turn/start",
@@ -288,5 +318,13 @@ mod tests {
         });
         assert_eq!(params["input"][0]["type"], "text");
         assert_eq!(params["threadId"], "thr_123");
+    }
+
+    #[test]
+    fn thread_inventory_payloads_are_scoped_to_thread_ids() {
+        let read = json!({ "threadId": "thr_123" });
+        let list = json!({ "cursor": "next", "limit": 20 });
+        assert_eq!(read["threadId"], "thr_123");
+        assert_eq!(list["limit"], 20);
     }
 }

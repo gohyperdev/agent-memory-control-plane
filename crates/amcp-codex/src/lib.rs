@@ -10,6 +10,7 @@ use chrono::Utc;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::{
+    cmp::Reverse,
     env,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -76,8 +77,7 @@ impl CodexAdapter {
         let mut memory_records = Vec::new();
         let mut config_layers = Vec::new();
         let mut guidance_records = Vec::new();
-        let mut roots = vec![self.codex_home.clone()];
-        roots.extend(self.scan_roots.iter().cloned());
+        let roots = self.discovery_roots();
 
         for root in roots {
             if !root.exists() {
@@ -609,7 +609,9 @@ impl CodexAdapter {
             }
         }
 
-        if root != self.codex_home && !self.scan_roots.is_empty() {
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        if root != codex_home {
             let project_id = canonical_project_path(root);
             if !projects
                 .iter()
@@ -850,11 +852,41 @@ impl CodexAdapter {
     }
 
     fn project_id_for(&self, path: &Path) -> Option<String> {
-        self.scan_roots
-            .iter()
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        self.discovery_roots()
+            .into_iter()
+            .filter(|root| root != &codex_home)
             .filter_map(|root| fs::canonicalize(root).ok())
             .find(|root| path.starts_with(root))
             .map(|root| root.to_string_lossy().into_owned())
+    }
+
+    fn discovery_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.codex_home.clone()];
+        roots.extend(self.scan_roots.iter().cloned());
+        let projects_file = self.codex_home.join("projects.toml");
+        if let Ok(content) = fs::read_to_string(projects_file) {
+            if let Ok(document) = content.parse::<toml::Value>() {
+                if let Some(entries) = document.get("projects").and_then(toml::Value::as_table) {
+                    roots.extend(
+                        entries
+                            .keys()
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_dir()),
+                    );
+                }
+            }
+        }
+        let mut unique = Vec::new();
+        for root in roots {
+            let canonical = fs::canonicalize(&root).unwrap_or(root);
+            if !unique.iter().any(|existing| existing == &canonical) {
+                unique.push(canonical);
+            }
+        }
+        unique.sort_by_key(|root| Reverse(root.components().count()));
+        unique
     }
 
     fn config_layer(&self, path: &Path, host: &HostIdentity) -> io::Result<ConfigLayerRecord> {
@@ -1210,6 +1242,64 @@ mod tests {
             artifact.kind == ArtifactKind::Session
                 && artifact.content.starts_with("metadata-only file")
         }));
+    }
+
+    #[test]
+    fn configured_existing_project_is_scanned_for_project_layers() {
+        let directory = tempfile::tempdir().expect("Codex home");
+        let project = directory.path().join("workspace");
+        fs::create_dir_all(project.join(".codex")).expect("project config directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "model = \"gpt-test\"\n",
+        )
+        .expect("user config");
+        fs::write(
+            directory.path().join("projects.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )
+        .expect("projects registry");
+        fs::write(
+            project.join(".codex/config.toml"),
+            "approval_policy = \"on-request\"\n",
+        )
+        .expect("project config");
+        fs::write(
+            project.join("AGENTS.md"),
+            "Use the project test workflow.\n",
+        )
+        .expect("project guidance");
+
+        let batch = CodexAdapter::from_environment(Some(directory.path().to_path_buf()))
+            .discover(HostIdentity {
+                host_id: "host_project_fixture".into(),
+                display_name: "Fixture".into(),
+                platform: "macos".into(),
+                hostname: "fixture.local".into(),
+            })
+            .expect("project fixture should be readable");
+        let project_id = fs::canonicalize(&project)
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            batch
+                .projects
+                .iter()
+                .any(|item| item.project_id == project_id)
+        );
+        assert!(batch.config_layers.iter().any(|item| {
+            item.scope == "project" && item.project_id.as_deref() == Some(project_id.as_str())
+        }));
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|item| { item.project_id.as_deref() == Some(project_id.as_str()) })
+        );
     }
 
     #[test]

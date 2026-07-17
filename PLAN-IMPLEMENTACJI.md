@@ -8,7 +8,7 @@ Stan implementacji na 2026-07-17:
 
 - zrealizowane: Rust workspace, osobny macOS Agent, wspólny `amcp-core` catalog service dla UI/MCP/Controller, Codex discovery/redaction, central SQLite/FTS5, provider registry, normalized projects/sessions/memory/configuration/guidance, persisted collection cursors, bounded redacted collection outbox/replay, approval envelope, proposal/apply/rollback z backupem i hash-conflict, MCP read/proposal/RAG-fallback gateway, Codex app-server client z UI bridge, TLS remote Agent transport, pairing/enrollment z rotowanym credentialem w Keychain, redacted Agent collection cache, watch/reconnect polling, register-capabilities-heartbeat handshake oraz Tauri/React shell z approval queue;
 - w toku: pełny event manager z at-least-once event IDs/backpressure oraz session persistence/app-server bridge;
-- następne: incremental local index/watchers, pełna Codex app-server conversation bridge, optional RAG, provider contract fixtures/adapters, packaging/launchd i cross-platform ports.
+- następne: full runtime event IDs/backpressure, persistence of app-server thread events into `sessions`/`session_items`, incremental local index/watchers, optional RAG, provider contract fixtures/adapters, packaging/launchd i cross-platform ports.
 
 Dokumenty referencyjne:
 

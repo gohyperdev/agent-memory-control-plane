@@ -9,6 +9,7 @@ The current implementation slice is macOS-first and Codex-first:
 - The Agent and Controller communicate over an authenticated JSONL protocol on a Unix socket.
 - Native provider state remains authoritative; AMCP stores normalized, redacted observations and evidence.
 - Codex configuration layers and `AGENTS.md`/`AGENTS.override.md` guidance are normalized with explicit precedence and source hashes.
+- Existing trusted paths from Codex `projects.toml` are discovered as additional project roots, so project `.codex/config.toml` and guidance are inventoried without manual root configuration.
 
 ## Run the first vertical slice
 
@@ -39,6 +40,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - The Agent keeps a bounded, redacted collection outbox. On reconnect, the Controller replays it idempotently before requesting a fresh snapshot; cursors advance only after central persistence.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.
 - `amcp-app-server` supervises the documented Codex app-server stdio protocol and supports initialization, thread/turn start, streamed notifications, and interruption.
+- The app-server client also exposes thread list/read/archive/unarchive primitives for the next session explorer increment.
 - `amcp-rag` defines the consent, citation, invalidation, and retrieval contract; its default implementation is disabled and lexical search remains the fallback.
 - `amcp-core` exposes the shared functional catalog API used by the desktop UI, MCP gateway, and Controller; all surfaces therefore share scope and storage behavior.
 - Collection cursors are persisted only after a successful catalog transaction, allowing the Controller to resume per-host/provider collection safely.
