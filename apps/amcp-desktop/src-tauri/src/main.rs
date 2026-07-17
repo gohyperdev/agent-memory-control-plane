@@ -99,10 +99,25 @@ fn list_guidance() -> Result<Vec<GuidanceRecord>, String> {
 }
 
 #[tauri::command]
-fn search_catalog(query: String) -> Result<Vec<SearchHit>, String> {
+fn search_catalog(
+    query: String,
+    host_id: Option<String>,
+    provider_id: Option<String>,
+) -> Result<Vec<SearchHit>, String> {
     CatalogService::open(database_path())
         .map_err(|error| error.to_string())?
-        .search(&query, 50)
+        .search_scoped(&query, 50, host_id.as_deref(), provider_id.as_deref(), None)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_runtime_events(
+    host_id: Option<String>,
+    provider_id: Option<String>,
+) -> Result<Vec<RuntimeEvent>, String> {
+    CatalogService::open(database_path())
+        .map_err(|error| error.to_string())?
+        .list_runtime_events(host_id.as_deref(), provider_id.as_deref(), 40)
         .map_err(|error| error.to_string())
 }
 
@@ -398,6 +413,7 @@ fn main() {
             list_config_layers,
             list_guidance,
             search_catalog,
+            list_runtime_events,
             collect_local,
             approve_change,
             ask_codex

@@ -89,6 +89,16 @@ type Guidance = {
   precedence_rank: number;
 };
 
+type RuntimeEvent = {
+  event_id: string;
+  host_id: string;
+  provider_id: string;
+  event_type: string;
+  sequence: number;
+  payload_json: string;
+  occurred_at: string;
+};
+
 function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -100,6 +110,9 @@ function App() {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [configLayers, setConfigLayers] = useState<ConfigLayer[]>([]);
   const [guidance, setGuidance] = useState<Guidance[]>([]);
+  const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEvent[]>([]);
+  const [selectedHostId, setSelectedHostId] = useState("");
+  const [selectedProviderId, setSelectedProviderId] = useState("");
   const [query, setQuery] = useState("sandbox");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [selected, setSelected] = useState<SearchHit | null>(null);
@@ -121,8 +134,9 @@ function App() {
       invoke<Memory[]>("list_memory"),
       invoke<ConfigLayer[]>("list_config_layers"),
       invoke<Guidance[]>("list_guidance"),
+      invoke<RuntimeEvent[]>("list_runtime_events", { hostId: null, providerId: null }),
     ])
-      .then(([nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance]) => {
+      .then(([nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents]) => {
         setHosts(nextHosts);
         setProviders(nextProviders);
         setChanges(nextChanges);
@@ -131,6 +145,7 @@ function App() {
         setMemories(nextMemories);
         setConfigLayers(nextConfigLayers);
         setGuidance(nextGuidance);
+        setRuntimeEvents(nextRuntimeEvents);
       })
       .catch((reason) => setError(String(reason)));
   }, []);
@@ -140,7 +155,11 @@ function App() {
     if (!query.trim()) return;
     try {
       setError(null);
-      const nextHits = await invoke<SearchHit[]>("search_catalog", { query });
+      const nextHits = await invoke<SearchHit[]>("search_catalog", {
+        query,
+        hostId: selectedHostId || null,
+        providerId: selectedProviderId || null,
+      });
       setHits(nextHits);
       setSelected(nextHits[0] ?? null);
     } catch (reason) {
@@ -153,7 +172,7 @@ function App() {
       setSyncing(true);
       setError(null);
       await invoke("collect_local");
-      const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance] = await Promise.all([
+      const [nextHosts, nextProviders, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance, nextRuntimeEvents] = await Promise.all([
         invoke<Host[]>("list_hosts"),
         invoke<Provider[]>("list_providers"),
         invoke<ChangeSet[]>("list_changes"),
@@ -162,6 +181,10 @@ function App() {
         invoke<Memory[]>("list_memory"),
         invoke<ConfigLayer[]>("list_config_layers"),
         invoke<Guidance[]>("list_guidance"),
+        invoke<RuntimeEvent[]>("list_runtime_events", {
+          hostId: selectedHostId || null,
+          providerId: selectedProviderId || null,
+        }),
       ]);
       setHosts(nextHosts);
       setProviders(nextProviders);
@@ -171,11 +194,23 @@ function App() {
       setMemories(nextMemories);
       setConfigLayers(nextConfigLayers);
       setGuidance(nextGuidance);
+      setRuntimeEvents(nextRuntimeEvents);
       await search();
     } catch (reason) {
       setError(String(reason));
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const refreshRuntimeEvents = async () => {
+    try {
+      setRuntimeEvents(await invoke<RuntimeEvent[]>("list_runtime_events", {
+        hostId: selectedHostId || null,
+        providerId: selectedProviderId || null,
+      }));
+    } catch (reason) {
+      setError(String(reason));
     }
   };
 
@@ -251,7 +286,7 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div><div className="eyebrow">{activeNav} / overview</div><h1>Agent state, made legible.</h1></div>
-          <div className="top-actions"><span className="connection"><span className="dot green" /> Controller online</span><button className="secondary sync-button" onClick={() => void syncLocal()} disabled={syncing}>{syncing ? "Syncing…" : "Sync now"}</button><button className="icon-button">?</button><button className="avatar">M</button></div>
+          <div className="top-actions"><span className="connection"><span className="dot green" /> Controller online</span><select className="scope-select" value={selectedHostId} onChange={(event) => setSelectedHostId(event.target.value)}><option value="">All hosts</option>{hosts.map((host) => <option key={host.identity.host_id} value={host.identity.host_id}>{host.identity.display_name}</option>)}</select><select className="scope-select" value={selectedProviderId} onChange={(event) => setSelectedProviderId(event.target.value)}><option value="">All providers</option>{providers.filter((provider) => !selectedHostId || provider.host_id === selectedHostId).map((provider) => <option key={`${provider.host_id}-${provider.provider_id}`} value={provider.provider_id}>{provider.display_name}</option>)}</select><button className="secondary sync-button" onClick={() => void syncLocal()} disabled={syncing}>{syncing ? "Syncing…" : "Sync now"}</button><button className="icon-button">?</button><button className="avatar">M</button></div>
         </header>
 
         <section className="content">
@@ -271,7 +306,7 @@ function App() {
             {codexReply && <div className="codex-reply"><div className="evidence-heading"><span>Codex response</span><span className="verified">✓ app-server</span></div><pre>{codexReply}</pre></div>}
           </section>
 
-          <div className="section-heading"><div><span className="eyebrow">Unified index</span><h2>Search evidence</h2></div><span className="scope-pill"><span className="dot green" /> All connected hosts</span></div>
+          <div className="section-heading"><div><span className="eyebrow">Unified index</span><h2>Search evidence</h2></div><span className="scope-pill"><span className="dot green" /> {selectedHostId || "All connected hosts"}{selectedProviderId ? ` · ${selectedProviderId}` : ""}</span></div>
           <div className="explorer">
             <div className="results-panel">
               <div className="panel-toolbar"><span>{hits.length ? `${hits.length} results` : "Run a search to inspect indexed evidence"}</span><button>Filters ˅</button></div>
@@ -282,6 +317,11 @@ function App() {
               {selected ? <><div className="inspector-header"><span className="type-chip">{selected.provider_id}</span><button>•••</button></div><h3>{selected.title}</h3><p className="path">{selected.source_reference}</p><div className="meta-grid"><div><small>Host</small><strong>{selected.host_id}</strong></div><div><small>Sensitivity</small><strong>{selected.sensitivity}</strong></div><div><small>Artifact</small><strong>{selected.artifact_id.slice(0, 16)}</strong></div><div><small>Observed</small><strong>{new Date(selected.observed_at).toLocaleString()}</strong></div></div><div className="evidence"><div className="evidence-heading"><span>Evidence preview</span><span className="verified">✓ redacted</span></div><pre>{selected.preview}</pre></div><button className="secondary">Open in explorer</button></> : <div className="inspector-empty"><span>◌</span><p>Select an evidence record to inspect provenance, scope, and safe content.</p></div>}
             </aside>
           </div>
+
+          <section className="runtime-section">
+            <div className="section-heading"><div><span className="eyebrow">Runtime telemetry</span><h2>Recent agent activity</h2></div><button className="secondary refresh-button" onClick={() => void refreshRuntimeEvents()}>Refresh events</button></div>
+            <div className="runtime-list">{runtimeEvents.slice(0, 8).map((event) => <article className="runtime-row" key={event.event_id}><span className="runtime-marker">●</span><div><strong>{event.event_type}</strong><small>{event.host_id} · {event.provider_id} · seq {event.sequence}</small></div><time>{new Date(event.occurred_at).toLocaleString()}</time><code>{event.payload_json}</code></article>)}{!runtimeEvents.length && <div className="change-empty">No runtime events in the selected scope.</div>}</div>
+          </section>
 
           <section className="changes-section">
             <div className="section-heading"><div><span className="eyebrow">Policy gate</span><h2>Change queue</h2></div><span className="scope-pill">Human approval required</span></div>
