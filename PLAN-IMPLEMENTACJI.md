@@ -6,8 +6,8 @@ Status: aktywny plan implementacji; pierwszy działający increment został już
 
 Stan implementacji na 2026-07-17:
 
-- zrealizowane: Rust workspace, osobny macOS Agent, Codex discovery/redaction, central SQLite/FTS5, provider registry, approval envelope, proposal/apply/rollback z backupem i hash-conflict, MCP read/proposal gateway, Codex app-server client, TLS remote Agent transport, register-capabilities-heartbeat handshake oraz Tauri/React shell z approval queue;
-- w toku: pełne modele projektów/sesji/pamięci, host enrollment z Keychain, trwały heartbeat/reconnect manager i Controller service API;
+- zrealizowane: Rust workspace, osobny macOS Agent, wspólny `amcp-core` catalog service, Codex discovery/redaction, central SQLite/FTS5, provider registry, normalized projects/sessions/memory, approval envelope, proposal/apply/rollback z backupem i hash-conflict, MCP read/proposal/RAG-fallback gateway, Codex app-server client z UI bridge, TLS remote Agent transport, register-capabilities-heartbeat handshake oraz Tauri/React shell z approval queue;
+- w toku: host enrollment z Keychain, trwały heartbeat/reconnect manager, Controller service API, pełna konfiguracja precedence/guidance graph oraz session/app-server bridge;
 - następne: incremental local index/watchers, pełna Codex app-server conversation bridge, optional RAG, provider contract fixtures/adapters, packaging/launchd i cross-platform ports.
 
 Dokumenty referencyjne:

@@ -11,8 +11,12 @@ edition = "2021"
 tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
+anyhow = "1"
 amcp-domain = { path = "../../../crates/amcp-domain" }
+amcp-app-server = { path = "../../../crates/amcp-app-server" }
+amcp-core = { path = "../../../crates/amcp-core" }
 amcp-storage = { path = "../../../crates/amcp-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.5", features = [] }
+tokio = { version = "1.48", features = ["time"] }

@@ -21,7 +21,32 @@ impl AppServerClient {
         codex_home: Option<&Path>,
         working_directory: Option<&Path>,
     ) -> Result<Self> {
-        let mut command = Command::new(executable.as_ref());
+        Self::spawn_internal(executable.as_ref(), codex_home, working_directory, None).await
+    }
+
+    pub async fn spawn_with_mcp(
+        executable: impl AsRef<Path>,
+        codex_home: Option<&Path>,
+        working_directory: Option<&Path>,
+        mcp_command: &Path,
+        mcp_database: &Path,
+    ) -> Result<Self> {
+        Self::spawn_internal(
+            executable.as_ref(),
+            codex_home,
+            working_directory,
+            Some((mcp_command, mcp_database)),
+        )
+        .await
+    }
+
+    async fn spawn_internal(
+        executable: &Path,
+        codex_home: Option<&Path>,
+        working_directory: Option<&Path>,
+        mcp: Option<(&Path, &Path)>,
+    ) -> Result<Self> {
+        let mut command = Command::new(executable);
         command
             .arg("app-server")
             .arg("--listen")
@@ -34,6 +59,23 @@ impl AppServerClient {
         }
         if let Some(working_directory) = working_directory {
             command.current_dir(working_directory);
+        }
+        if let Some((mcp_command, mcp_database)) = mcp {
+            command
+                .arg("--config")
+                .arg(format!(
+                    "mcp_servers.amcp.command={}",
+                    toml_string(mcp_command.to_string_lossy().as_ref())
+                ))
+                .arg("--config")
+                .arg(format!(
+                    "mcp_servers.amcp.args=[\"--db\",{}]",
+                    toml_string(mcp_database.to_string_lossy().as_ref())
+                ))
+                .arg("--config")
+                .arg("mcp_servers.amcp.enabled=true")
+                .arg("--config")
+                .arg("mcp_servers.amcp.required=false");
         }
         let mut child = command.spawn().context("start Codex app-server")?;
         let stdin = child
@@ -130,6 +172,46 @@ impl AppServerClient {
         .await
     }
 
+    pub async fn run_turn(&mut self, thread_id: &str, text: &str) -> Result<Value> {
+        let started = self.start_turn(thread_id, text).await?;
+        let turn_id = started
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut answer = String::new();
+        loop {
+            let message = self.next_message().await?;
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if method == "item/agentMessage/delta" {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                    answer.push_str(delta);
+                }
+            } else if method == "turn/completed" {
+                let event_turn_id = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str);
+                if turn_id.as_deref().is_none()
+                    || event_turn_id.is_none()
+                    || event_turn_id == turn_id.as_deref()
+                {
+                    if answer.is_empty() {
+                        answer = extract_agent_text(&params);
+                    }
+                    return Ok(json!({
+                        "turn": params.get("turn").cloned().unwrap_or(params),
+                        "text": answer,
+                    }));
+                }
+            }
+        }
+    }
+
     pub async fn interrupt_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
         self.request(
             "turn/interrupt",
@@ -156,6 +238,42 @@ impl AppServerClient {
         self.stdin.flush().await?;
         Ok(())
     }
+
+    async fn next_message(&mut self) -> Result<Value> {
+        if let Some(message) = self.notifications.pop_front() {
+            return Ok(message);
+        }
+        let line = self
+            .stdout
+            .next_line()
+            .await?
+            .context("Codex app-server closed stdout")?;
+        serde_json::from_str(&line)
+            .with_context(|| format!("decode Codex app-server message: {line}"))
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("JSON string is valid TOML basic string")
+}
+
+fn extract_agent_text(value: &Value) -> String {
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return text.to_owned();
+    }
+    if let Some(item) = value.get("item") {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            return text.to_owned();
+        }
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            return content
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
-use amcp_storage::Catalog;
+use amcp_core::CatalogService;
+use amcp_domain::Scope;
+use amcp_rag::{DisabledRagManager, RagManager};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -157,6 +159,60 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_projects_list",
+                "description": "List normalized projects discovered from provider state, including trust and provenance.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "host_id": { "type": "string" } }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
+                "name": "amcp_sessions_list",
+                "description": "List normalized session metadata without exposing transcript bodies by default.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "project_id": { "type": "string" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
+                "name": "amcp_memory_list",
+                "description": "List normalized, redacted memory records with lifecycle and source provenance.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "project_id": { "type": "string" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
+                "name": "amcp_retrieve_context",
+                "description": "Retrieve optional RAG context. It is disabled by default and returns an explicit fallback warning with no uncited context.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "host_id": { "type": "string" },
+                                "provider_id": { "type": "string" },
+                                "project_id": { "type": "string" }
+                            }
+                        },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+                    },
+                    "required": ["query"]
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_change_review",
                 "description": "Review an existing human-visible AMCP change set. This never applies a change.",
                 "inputSchema": {
@@ -186,7 +242,7 @@ fn tool_list() -> Value {
 }
 
 fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
-    let catalog = Catalog::open(&args.db)?;
+    let catalog = CatalogService::open(&args.db)?;
     match name {
         "amcp_search" => {
             let query = arguments
@@ -226,6 +282,36 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             }))
         }
         "amcp_hosts_list" => Ok(json!({ "hosts": catalog.list_hosts()? })),
+        "amcp_projects_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            Ok(json!({ "projects": catalog.list_projects(host_id)? }))
+        }
+        "amcp_sessions_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            let project_id = arguments.get("project_id").and_then(Value::as_str);
+            Ok(json!({ "sessions": catalog.list_sessions(host_id, project_id)? }))
+        }
+        "amcp_memory_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            let project_id = arguments.get("project_id").and_then(Value::as_str);
+            Ok(json!({ "memory": catalog.list_memory_records(host_id, project_id)? }))
+        }
+        "amcp_retrieve_context" => {
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .context("amcp_retrieve_context requires query")?;
+            let scope = parse_scope(arguments.get("scope"));
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 20) as usize;
+            let manager = DisabledRagManager::default();
+            Ok(serde_json::to_value(
+                manager.retrieve(query, &scope, limit)?,
+            )?)
+        }
         "amcp_change_review" => {
             let change_set_id = arguments
                 .get("change_set_id")
@@ -336,5 +422,22 @@ fn error_response(id: Value, code: i32, message: String) -> JsonRpcResponse {
         id,
         result: None,
         error: Some(JsonRpcError { code, message }),
+    }
+}
+
+fn parse_scope(value: Option<&Value>) -> Scope {
+    Scope {
+        host_id: value
+            .and_then(|value| value.get("host_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        provider_id: value
+            .and_then(|value| value.get("provider_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        project_id: value
+            .and_then(|value| value.get("project_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }
 }

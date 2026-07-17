@@ -1,7 +1,8 @@
 use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, EvidenceSnapshot, HostIdentity, LifecycleState,
-    ObservationState, ProviderDescriptor, SensitivityClass, SourceObservation, new_id,
+    MemoryRecord, ObservationState, ProjectRecord, ProviderDescriptor, SensitivityClass,
+    SessionRecord, SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -60,6 +61,9 @@ impl CodexAdapter {
                 "inventory".to_owned(),
                 "read".to_owned(),
                 "search".to_owned(),
+                "projects".to_owned(),
+                "sessions".to_owned(),
+                "memory".to_owned(),
             ],
         }
     }
@@ -67,6 +71,9 @@ impl CodexAdapter {
     pub fn discover(&self, host: HostIdentity) -> io::Result<CollectionBatch> {
         let collection_run_id = new_id("run");
         let mut artifacts = Vec::new();
+        let mut projects = Vec::new();
+        let mut sessions = Vec::new();
+        let mut memory_records = Vec::new();
         let mut roots = vec![self.codex_home.clone()];
         roots.extend(self.scan_roots.iter().cloned());
 
@@ -74,15 +81,36 @@ impl CodexAdapter {
             if !root.exists() {
                 continue;
             }
-            self.discover_root(&root, &host, &collection_run_id, &mut artifacts)?;
+            self.discover_root(
+                &root,
+                &host,
+                &collection_run_id,
+                &mut artifacts,
+                &mut projects,
+                &mut sessions,
+                &mut memory_records,
+            )?;
         }
 
         artifacts.sort_by(|left, right| left.source_reference.cmp(&right.source_reference));
+        projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        projects.dedup_by(|left, right| left.project_id == right.project_id);
+        sessions.sort_by(|left, right| {
+            left.session_id.cmp(&right.session_id).then_with(|| {
+                session_source_priority(&left.source_reference)
+                    .cmp(&session_source_priority(&right.source_reference))
+            })
+        });
+        sessions.dedup_by(|left, right| left.session_id == right.session_id);
 
         Ok(CollectionBatch {
             collection_run_id,
             host,
             providers: vec![self.provider()],
+            projects,
+            sessions,
+            session_items: Vec::new(),
+            memory_records,
             artifacts,
             next_cursor: None,
         })
@@ -377,8 +405,12 @@ impl CodexAdapter {
         host: &HostIdentity,
         collection_run_id: &str,
         artifacts: &mut Vec<ArtifactRecord>,
+        projects: &mut Vec<ProjectRecord>,
+        sessions: &mut Vec<SessionRecord>,
+        memory_records: &mut Vec<MemoryRecord>,
     ) -> io::Result<()> {
         let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        self.discover_projects(&root, host, projects)?;
         let explicit_files = [
             ("config.toml", ArtifactKind::Configuration),
             ("projects.toml", ArtifactKind::Configuration),
@@ -394,18 +426,34 @@ impl CodexAdapter {
                 let allow_content = !matches!(kind, ArtifactKind::Session);
                 artifacts.push(self.file_artifact(
                     &path,
-                    kind,
+                    kind.clone(),
                     host,
                     collection_run_id,
                     allow_content,
                 )?);
+                if kind == ArtifactKind::Session && relative != "history.jsonl" {
+                    self.discover_session_file(&path, host, sessions)?;
+                }
             }
+        }
+
+        let history = root.join("history.jsonl");
+        let session_index = root.join("session_index.jsonl");
+        if !session_index.is_file() && history.is_file() {
+            self.discover_session_file(&history, host, sessions)?;
         }
 
         for directory in ["sessions", "archived_sessions", "memories"] {
             let path = root.join(directory);
             if path.is_dir() {
-                self.discover_directory_metadata(&path, host, collection_run_id, artifacts)?;
+                self.discover_directory_metadata(
+                    &path,
+                    host,
+                    collection_run_id,
+                    artifacts,
+                    sessions,
+                    memory_records,
+                )?;
             }
         }
 
@@ -457,25 +505,237 @@ impl CodexAdapter {
         host: &HostIdentity,
         collection_run_id: &str,
         artifacts: &mut Vec<ArtifactRecord>,
+        sessions: &mut Vec<SessionRecord>,
+        memory_records: &mut Vec<MemoryRecord>,
     ) -> io::Result<()> {
         for entry in WalkDir::new(directory).max_depth(2).follow_links(false) {
             let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
             if !entry.file_type().is_file() {
                 continue;
             }
+            let is_memory =
+                directory.file_name().and_then(|name| name.to_str()) == Some("memories");
             artifacts.push(self.file_artifact(
                 entry.path(),
-                if directory.file_name().and_then(|name| name.to_str()) == Some("memories") {
+                if is_memory {
                     ArtifactKind::Memory
                 } else {
                     ArtifactKind::Session
                 },
                 host,
                 collection_run_id,
-                false,
+                is_memory,
             )?);
+            if is_memory {
+                if let Ok(record) = self.memory_record(entry.path(), host) {
+                    memory_records.push(record);
+                }
+            } else {
+                self.discover_session_file(entry.path(), host, sessions)?;
+            }
         }
         Ok(())
+    }
+
+    fn discover_projects(
+        &self,
+        root: &Path,
+        host: &HostIdentity,
+        projects: &mut Vec<ProjectRecord>,
+    ) -> io::Result<()> {
+        let projects_file = root.join("projects.toml");
+        if projects_file.is_file() {
+            let content = fs::read_to_string(&projects_file)?;
+            if let Ok(document) = content.parse::<toml::Value>() {
+                if let Some(entries) = document.get("projects").and_then(toml::Value::as_table) {
+                    for (path, metadata) in entries {
+                        let root_path = PathBuf::from(path);
+                        let project_id = canonical_project_path(&root_path);
+                        let trust_level = metadata
+                            .get("trust_level")
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_owned);
+                        projects.push(ProjectRecord {
+                            project_id,
+                            host_id: host.host_id.clone(),
+                            provider_id: CODEX_PROVIDER_ID.to_owned(),
+                            root_path: path.clone(),
+                            display_name: root_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(path)
+                                .to_owned(),
+                            trust_level,
+                            discovered_from: projects_file.to_string_lossy().into_owned(),
+                            observed_at: Utc::now(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if root != self.codex_home && !self.scan_roots.is_empty() {
+            let project_id = canonical_project_path(root);
+            if !projects
+                .iter()
+                .any(|project| project.project_id == project_id)
+            {
+                projects.push(ProjectRecord {
+                    project_id,
+                    host_id: host.host_id.clone(),
+                    provider_id: CODEX_PROVIDER_ID.to_owned(),
+                    root_path: root.to_string_lossy().into_owned(),
+                    display_name: root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project")
+                        .to_owned(),
+                    trust_level: None,
+                    discovered_from: "amcp-scan-root".to_owned(),
+                    observed_at: Utc::now(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn discover_session_file(
+        &self,
+        path: &Path,
+        host: &HostIdentity,
+        sessions: &mut Vec<SessionRecord>,
+    ) -> io::Result<()> {
+        let bytes = fs::read(path)?;
+        let source_hash = hash_bytes(&bytes);
+        let source_reference = path.to_string_lossy().into_owned();
+        if path.file_name().and_then(|name| name.to_str()) == Some("session_index.jsonl") {
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(session_id) = entry
+                    .get("id")
+                    .or_else(|| entry.get("session_id"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let session_source = entry
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(|value| self.codex_home.join(value))
+                    .unwrap_or_else(|| path.to_path_buf());
+                let session_bytes = fs::read(&session_source).unwrap_or_default();
+                sessions.push(SessionRecord {
+                    session_id: session_id.to_owned(),
+                    host_id: host.host_id.clone(),
+                    provider_id: CODEX_PROVIDER_ID.to_owned(),
+                    project_id: None,
+                    title: None,
+                    cwd: None,
+                    model: None,
+                    branch: None,
+                    started_at: None,
+                    ended_at: None,
+                    archived: session_source
+                        .to_string_lossy()
+                        .contains("archived_sessions"),
+                    source_reference: session_source.to_string_lossy().into_owned(),
+                    source_hash: if session_bytes.is_empty() {
+                        source_hash.clone()
+                    } else {
+                        hash_bytes(&session_bytes)
+                    },
+                    metadata_json: serde_json::to_string(&entry)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                    observed_at: Utc::now(),
+                });
+            }
+            return Ok(());
+        }
+
+        let mut metadata = serde_json::Value::Object(serde_json::Map::new());
+        for line in String::from_utf8_lossy(&bytes).lines().take(8) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                if value.get("session_id").is_some() || value.get("thread_id").is_some() {
+                    metadata = value;
+                    break;
+                }
+            }
+        }
+        let session_id = metadata
+            .get("session_id")
+            .or_else(|| metadata.get("thread_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| new_id("session"));
+        let cwd = metadata
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        sessions.push(SessionRecord {
+            session_id,
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            project_id: cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .and_then(|path| self.project_id_for(&path)),
+            title: metadata
+                .get("title")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            cwd,
+            model: metadata
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            branch: metadata
+                .get("branch")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            started_at: metadata.get("started_at").and_then(parse_datetime),
+            ended_at: metadata.get("ended_at").and_then(parse_datetime),
+            archived: source_reference.contains("archived_sessions"),
+            source_reference,
+            source_hash,
+            metadata_json: serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_owned()),
+            observed_at: Utc::now(),
+        });
+        Ok(())
+    }
+
+    fn memory_record(&self, path: &Path, host: &HostIdentity) -> io::Result<MemoryRecord> {
+        let bytes = fs::read(path)?;
+        let content = redact_text(
+            &String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(12_000)
+                .collect::<String>(),
+        );
+        let source_reference = path.to_string_lossy().into_owned();
+        Ok(MemoryRecord {
+            memory_record_id: format!("memory_{}", hash_bytes(source_reference.as_bytes())),
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            project_id: self.project_id_for(path),
+            title: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("memory")
+                .to_owned(),
+            content,
+            source_reference,
+            source_hash: hash_bytes(&bytes),
+            lifecycle: LifecycleState::Active,
+            confidence: None,
+            observed_at: Utc::now(),
+        })
     }
 
     fn file_artifact(
@@ -596,6 +856,30 @@ fn extension(path: &Path) -> String {
         .to_owned()
 }
 
+fn canonical_project_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn parse_datetime(value: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
+    value
+        .as_str()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn session_source_priority(source: &str) -> u8 {
+    if source.contains("/sessions/") || source.contains("/archived_sessions/") {
+        0
+    } else if source.ends_with("session_index.jsonl") {
+        1
+    } else {
+        2
+    }
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -705,6 +989,25 @@ mod tests {
             .expect("fixture should be readable");
 
         assert_eq!(batch.artifacts.len(), 9);
+        assert!(
+            batch
+                .projects
+                .iter()
+                .any(|project| project.root_path == "/Users/example/alpha")
+        );
+        assert!(batch.sessions.iter().any(|session| {
+            session.session_id == "fixture-session-1"
+                && session
+                    .source_reference
+                    .ends_with("sessions/fixture-session-1.jsonl")
+        }));
+        assert!(
+            batch
+                .memory_records
+                .iter()
+                .any(|memory| memory.title == "fixture-memory.md"
+                    && memory.content.contains("Memory fixture"))
+        );
         assert!(batch.artifacts.iter().any(|artifact| {
             artifact
                 .source_reference

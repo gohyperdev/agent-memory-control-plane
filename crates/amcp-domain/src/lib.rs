@@ -326,6 +326,65 @@ pub struct ArtifactRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRecord {
+    pub project_id: ProjectId,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub root_path: String,
+    pub display_name: String,
+    pub trust_level: Option<String>,
+    pub discovered_from: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub project_id: Option<ProjectId>,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub branch: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub archived: bool,
+    pub source_reference: String,
+    pub source_hash: String,
+    pub metadata_json: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionItem {
+    pub session_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub sequence: i64,
+    pub role: Option<String>,
+    pub item_kind: String,
+    pub content: Option<String>,
+    pub source_reference: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRecord {
+    pub memory_record_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub project_id: Option<ProjectId>,
+    pub title: String,
+    pub content: String,
+    pub source_reference: String,
+    pub source_hash: String,
+    pub lifecycle: LifecycleState,
+    pub confidence: Option<f32>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
@@ -347,6 +406,14 @@ pub struct CollectionBatch {
     pub collection_run_id: String,
     pub host: HostIdentity,
     pub providers: Vec<ProviderDescriptor>,
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
+    #[serde(default)]
+    pub sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    pub session_items: Vec<SessionItem>,
+    #[serde(default)]
+    pub memory_records: Vec<MemoryRecord>,
     pub artifacts: Vec<ArtifactRecord>,
     pub next_cursor: Option<String>,
 }

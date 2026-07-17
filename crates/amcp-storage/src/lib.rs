@@ -1,6 +1,6 @@
 use amcp_domain::{
     AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, HostIdentity, HostRecord, HostStatus,
-    SensitivityClass,
+    MemoryRecord, ProjectRecord, SensitivityClass, SessionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -64,6 +64,63 @@ impl Catalog {
                 capabilities_json TEXT NOT NULL,
                 PRIMARY KEY (provider_id, host_id),
                 FOREIGN KEY (host_id) REFERENCES hosts(host_id)
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                trust_level TEXT,
+                discovered_from TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, host_id, provider_id),
+                FOREIGN KEY (host_id) REFERENCES hosts(host_id)
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                project_id TEXT,
+                title TEXT,
+                cwd TEXT,
+                model TEXT,
+                branch TEXT,
+                started_at TEXT,
+                ended_at TEXT,
+                archived INTEGER NOT NULL,
+                source_reference TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, host_id, provider_id),
+                FOREIGN KEY (host_id) REFERENCES hosts(host_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_items (
+                session_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                role TEXT,
+                item_kind TEXT NOT NULL,
+                content TEXT,
+                source_reference TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, host_id, provider_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS memory_records (
+                memory_record_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                project_id TEXT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_reference TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                lifecycle TEXT NOT NULL,
+                confidence REAL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (memory_record_id, host_id, provider_id)
             );
             CREATE TABLE IF NOT EXISTS artifacts (
                 artifact_id TEXT PRIMARY KEY,
@@ -193,6 +250,89 @@ impl Catalog {
                 "INSERT INTO providers(provider_id, host_id, display_name, version, adapter_version, capabilities_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(provider_id, host_id) DO UPDATE SET display_name=excluded.display_name, version=excluded.version, adapter_version=excluded.adapter_version, capabilities_json=excluded.capabilities_json",
                 params![provider.id, host.host_id, provider.display_name, provider.version, provider.adapter_version, serde_json::to_string(&provider.capabilities)?],
+            )?;
+        }
+
+        for project in &batch.projects {
+            transaction.execute(
+                "INSERT INTO projects(project_id, host_id, provider_id, root_path, display_name, trust_level, discovered_from, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(project_id, host_id, provider_id) DO UPDATE SET root_path=excluded.root_path, display_name=excluded.display_name, trust_level=excluded.trust_level, discovered_from=excluded.discovered_from, observed_at=excluded.observed_at",
+                params![
+                    project.project_id,
+                    project.host_id,
+                    project.provider_id,
+                    project.root_path,
+                    project.display_name,
+                    project.trust_level,
+                    project.discovered_from,
+                    project.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        for session in &batch.sessions {
+            transaction.execute(
+                "INSERT INTO sessions(session_id, host_id, provider_id, project_id, title, cwd, model, branch, started_at, ended_at, archived, source_reference, source_hash, metadata_json, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(session_id, host_id, provider_id) DO UPDATE SET project_id=excluded.project_id, title=excluded.title, cwd=excluded.cwd, model=excluded.model, branch=excluded.branch, started_at=excluded.started_at, ended_at=excluded.ended_at, archived=excluded.archived, source_reference=excluded.source_reference, source_hash=excluded.source_hash, metadata_json=excluded.metadata_json, observed_at=excluded.observed_at",
+                params![
+                    session.session_id,
+                    session.host_id,
+                    session.provider_id,
+                    session.project_id,
+                    session.title,
+                    session.cwd,
+                    session.model,
+                    session.branch,
+                    session.started_at.map(|value| value.to_rfc3339()),
+                    session.ended_at.map(|value| value.to_rfc3339()),
+                    i64::from(session.archived),
+                    session.source_reference,
+                    session.source_hash,
+                    session.metadata_json,
+                    session.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        for item in &batch.session_items {
+            transaction.execute(
+                "INSERT INTO session_items(session_id, host_id, provider_id, sequence, role, item_kind, content, source_reference, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(session_id, host_id, provider_id, sequence) DO UPDATE SET role=excluded.role, item_kind=excluded.item_kind, content=excluded.content, source_reference=excluded.source_reference, observed_at=excluded.observed_at",
+                params![
+                    item.session_id,
+                    item.host_id,
+                    item.provider_id,
+                    item.sequence,
+                    item.role,
+                    item.item_kind,
+                    item.content,
+                    item.source_reference,
+                    item.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        for memory in &batch.memory_records {
+            transaction.execute(
+                "INSERT INTO memory_records(memory_record_id, host_id, provider_id, project_id, title, content, source_reference, source_hash, lifecycle, confidence, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(memory_record_id, host_id, provider_id) DO UPDATE SET project_id=excluded.project_id, title=excluded.title, content=excluded.content, source_reference=excluded.source_reference, source_hash=excluded.source_hash, lifecycle=excluded.lifecycle, confidence=excluded.confidence, observed_at=excluded.observed_at",
+                params![
+                    memory.memory_record_id,
+                    memory.host_id,
+                    memory.provider_id,
+                    memory.project_id,
+                    memory.title,
+                    memory.content,
+                    memory.source_reference,
+                    memory.source_hash,
+                    serde_json::to_string(&memory.lifecycle)?,
+                    memory.confidence,
+                    memory.observed_at.to_rfc3339(),
+                ],
             )?;
         }
 
@@ -343,6 +483,93 @@ impl Catalog {
         Ok(self
             .connection
             .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))?)
+    }
+
+    pub fn list_projects(&self, host_id: Option<&str>) -> Result<Vec<ProjectRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT project_id, host_id, provider_id, root_path, display_name, trust_level, discovered_from, observed_at
+             FROM projects WHERE (?1 IS NULL OR host_id = ?1) ORDER BY display_name, root_path",
+        )?;
+        let rows = statement.query_map(params![host_id], |row| {
+            let observed_at: String = row.get(7)?;
+            Ok(ProjectRecord {
+                project_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                root_path: row.get(3)?,
+                display_name: row.get(4)?,
+                trust_level: row.get(5)?,
+                discovered_from: row.get(6)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_sessions(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, host_id, provider_id, project_id, title, cwd, model, branch, started_at, ended_at, archived, source_reference, source_hash, metadata_json, observed_at
+             FROM sessions WHERE (?1 IS NULL OR host_id = ?1) AND (?2 IS NULL OR project_id = ?2)
+             ORDER BY COALESCE(started_at, observed_at) DESC",
+        )?;
+        let rows = statement.query_map(params![host_id, project_id], |row| {
+            let started_at: Option<String> = row.get(8)?;
+            let ended_at: Option<String> = row.get(9)?;
+            let observed_at: String = row.get(14)?;
+            Ok(SessionRecord {
+                session_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                project_id: row.get(3)?,
+                title: row.get(4)?,
+                cwd: row.get(5)?,
+                model: row.get(6)?,
+                branch: row.get(7)?,
+                started_at: started_at.as_deref().and_then(parse_utc),
+                ended_at: ended_at.as_deref().and_then(parse_utc),
+                archived: row.get::<_, i64>(10)? != 0,
+                source_reference: row.get(11)?,
+                source_hash: row.get(12)?,
+                metadata_json: row.get(13)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_memory_records(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT memory_record_id, host_id, provider_id, project_id, title, content, source_reference, source_hash, lifecycle, confidence, observed_at
+             FROM memory_records WHERE (?1 IS NULL OR host_id = ?1) AND (?2 IS NULL OR project_id = ?2)
+             ORDER BY observed_at DESC",
+        )?;
+        let rows = statement.query_map(params![host_id, project_id], |row| {
+            let lifecycle: String = row.get(8)?;
+            let observed_at: String = row.get(10)?;
+            Ok(MemoryRecord {
+                memory_record_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                project_id: row.get(3)?,
+                title: row.get(4)?,
+                content: row.get(5)?,
+                source_reference: row.get(6)?,
+                source_hash: row.get(7)?,
+                lifecycle: serde_json::from_str(&lifecycle)
+                    .unwrap_or(amcp_domain::LifecycleState::Stale),
+                confidence: row.get(9)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn latest_cursor(&self, host_id: &str, provider_id: &str) -> Result<Option<String>> {
@@ -531,12 +758,19 @@ impl Catalog {
     }
 }
 
+fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use amcp_domain::{
-        ArtifactKind, ArtifactRecord, EvidenceSnapshot, HostIdentity, LifecycleState,
-        ObservationState, ProviderDescriptor, SourceObservation, new_id,
+        ArtifactKind, ArtifactRecord, EvidenceSnapshot, HostIdentity, LifecycleState, MemoryRecord,
+        ObservationState, ProjectRecord, ProviderDescriptor, SessionRecord, SourceObservation,
+        new_id,
     };
 
     fn batch() -> CollectionBatch {
@@ -573,6 +807,47 @@ mod tests {
                 adapter_version: "test".into(),
                 capabilities: vec!["read".into()],
             }],
+            projects: vec![ProjectRecord {
+                project_id: "/tmp/project".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                root_path: "/tmp/project".into(),
+                display_name: "project".into(),
+                trust_level: Some("trusted".into()),
+                discovered_from: "fixture".into(),
+                observed_at: now,
+            }],
+            sessions: vec![SessionRecord {
+                session_id: "session-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                project_id: Some("/tmp/project".into()),
+                title: Some("Test session".into()),
+                cwd: Some("/tmp/project".into()),
+                model: Some("gpt-test".into()),
+                branch: Some("main".into()),
+                started_at: Some(now),
+                ended_at: None,
+                archived: false,
+                source_reference: "/tmp/session.jsonl".into(),
+                source_hash: "session-hash".into(),
+                metadata_json: "{}".into(),
+                observed_at: now,
+            }],
+            session_items: Vec::new(),
+            memory_records: vec![MemoryRecord {
+                memory_record_id: "memory-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                project_id: Some("/tmp/project".into()),
+                title: "Memory".into(),
+                content: "remember sandbox".into(),
+                source_reference: "/tmp/memory.md".into(),
+                source_hash: "memory-hash".into(),
+                lifecycle: LifecycleState::Active,
+                confidence: Some(0.9),
+                observed_at: now,
+            }],
             artifacts: vec![ArtifactRecord {
                 artifact_id: new_id("artifact"),
                 host_id: "host_test".into(),
@@ -607,6 +882,18 @@ mod tests {
         assert_eq!(inserted, 1);
         assert_eq!(catalog.artifact_count().expect("count"), 1);
         assert_eq!(catalog.search("sandbox", 10).expect("search").len(), 1);
+        assert_eq!(catalog.list_projects(None).expect("projects").len(), 1);
+        assert_eq!(
+            catalog.list_sessions(None, None).expect("sessions").len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .list_memory_records(None, None)
+                .expect("memory")
+                .len(),
+            1
+        );
     }
 
     #[test]

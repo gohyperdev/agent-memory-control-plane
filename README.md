@@ -29,7 +29,7 @@ cargo run -p amcp-controller -- run-once \
   --json
 ```
 
-Discovery remains read-only and does not read credentials. Session and memory files are currently collected as metadata-only evidence; configuration and instruction files are redacted before persistence. A separate, explicit change workflow supports proposal, human approval, atomic apply, backup, conflict detection, and rollback for safe Codex text documents.
+Discovery remains read-only and does not read credentials. Session bodies are collected as metadata-only evidence; documented memory files are stored as bounded, redacted excerpts with source hashes. Configuration and instruction files are redacted before persistence. A separate, explicit change workflow supports proposal, human approval, atomic apply, backup, conflict detection, and rollback for safe Codex text documents.
 
 ## Current implementation surface
 
@@ -37,6 +37,8 @@ Discovery remains read-only and does not read credentials. Session and memory fi
 - `amcp-controller` supports local Unix IPC and `tcp://` Agent endpoints with a user-supplied CA, central host connection records, collection, FTS search, change proposal, approval, atomic apply, and rollback.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host listing, change review, and verified change-proposal tools. It never applies a change.
 - `amcp-app-server` supervises the documented Codex app-server stdio protocol and supports initialization, thread/turn start, streamed notifications, and interruption.
+- `amcp-rag` defines the consent, citation, invalidation, and retrieval contract; its default implementation is disabled and lexical search remains the fallback.
+- `amcp-core` exposes the shared functional catalog API used by the desktop UI and MCP gateway; both surfaces therefore share scope and storage behavior.
 - `apps/amcp-desktop` is the Tauri 2 + React desktop shell. It renders host/index/approval status, search evidence, provenance, safe local sync, and the human approval action for proposed changes.
 
 Remote Agent example (TLS is required for TCP mode):
