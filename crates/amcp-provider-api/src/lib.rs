@@ -1,6 +1,6 @@
 use amcp_domain::{
     ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet, CollectionBatch,
-    HostIdentity, ProviderDescriptor,
+    HostIdentity, ProviderDescriptor, RuntimeEvent,
 };
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -12,6 +12,17 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
     fn discover(&self, host: HostIdentity) -> Result<CollectionBatch>;
+    /// Convert provider-native live thread/session metadata into a bounded,
+    /// provider-neutral runtime event. Providers without a runtime connector
+    /// remain inventory-only for this capability.
+    fn map_runtime_thread(
+        &self,
+        _host: &HostIdentity,
+        _thread: &serde_json::Value,
+        _sequence: &mut i64,
+    ) -> Result<Option<RuntimeEvent>> {
+        Ok(None)
+    }
     fn read_artifact(&self, _target: &ArtifactRef, _host: &HostIdentity) -> Result<ArtifactRecord> {
         bail!("provider does not expose artifact reads")
     }

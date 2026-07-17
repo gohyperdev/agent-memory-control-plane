@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+amcp-app-server = { path = "../amcp-app-server" }
 amcp-codex = { path = "../amcp-codex" }
 amcp-domain = { path = "../amcp-domain" }
 amcp-platform = { path = "../amcp-platform" }

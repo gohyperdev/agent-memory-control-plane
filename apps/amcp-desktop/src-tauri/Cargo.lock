@@ -118,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "amcp-domain",
  "anyhow",
+ "serde_json",
 ]
 
 [[package]]

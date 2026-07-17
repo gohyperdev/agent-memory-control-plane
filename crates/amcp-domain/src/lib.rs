@@ -508,6 +508,24 @@ pub fn change_set_operations_hash(change_set: &ChangeSet) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Build an idempotent identifier for an observation emitted by a provider
+/// runtime connector. The payload is intentionally part of the identity so a
+/// changed thread snapshot becomes a new event while repeated polling of the
+/// same snapshot remains deduplicated in the Agent outbox and Controller
+/// catalog.
+pub fn stable_runtime_event_id(
+    host_id: &str,
+    provider_id: &str,
+    event_type: &str,
+    native_id: &str,
+    payload_json: &str,
+) -> String {
+    let encoded = format!("{host_id}\n{provider_id}\n{event_type}\n{native_id}\n{payload_json}");
+    let mut hasher = Sha256::new();
+    hasher.update(encoded.as_bytes());
+    format!("event_{}", hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +560,32 @@ mod tests {
         assert!(approval.is_valid("shared-secret", now));
         assert!(!approval.is_valid("wrong-secret", now));
         assert!(!approval.is_valid("shared-secret", now + chrono::Duration::minutes(6)));
+    }
+
+    #[test]
+    fn stable_runtime_event_ids_deduplicate_identical_snapshots() {
+        let first = stable_runtime_event_id(
+            "host",
+            "codex",
+            "session.updated",
+            "thread-1",
+            "{\"status\":\"idle\"}",
+        );
+        let same = stable_runtime_event_id(
+            "host",
+            "codex",
+            "session.updated",
+            "thread-1",
+            "{\"status\":\"idle\"}",
+        );
+        let changed = stable_runtime_event_id(
+            "host",
+            "codex",
+            "session.updated",
+            "thread-1",
+            "{\"status\":\"running\"}",
+        );
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
     }
 }

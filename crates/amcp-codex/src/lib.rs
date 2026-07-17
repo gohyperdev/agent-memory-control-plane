@@ -5,7 +5,7 @@ use amcp_domain::{
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
     GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
     ProviderDescriptor, RuntimeEvent, SensitivityClass, SessionItem, SessionRecord,
-    SourceObservation, new_id,
+    SourceObservation, new_id, stable_runtime_event_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -68,6 +68,7 @@ impl CodexAdapter {
                 "projects".to_owned(),
                 "sessions".to_owned(),
                 "memory".to_owned(),
+                "runtime".to_owned(),
             ],
         }
     }
@@ -1165,6 +1166,15 @@ impl ProviderAdapter for CodexAdapter {
         Self::discover(self, host).map_err(Into::into)
     }
 
+    fn map_runtime_thread(
+        &self,
+        host: &HostIdentity,
+        thread: &serde_json::Value,
+        sequence: &mut i64,
+    ) -> Result<Option<RuntimeEvent>> {
+        codex_runtime_event_from_thread(host, thread, sequence)
+    }
+
     fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord> {
         Self::read_artifact(self, target, host)
     }
@@ -1180,6 +1190,78 @@ impl ProviderAdapter for CodexAdapter {
     fn rollback_change(&self, change_set: &ChangeSet, backup_dir: &Path) -> Result<ChangeReceipt> {
         Self::rollback_change(self, change_set, backup_dir)
     }
+}
+
+fn codex_runtime_event_from_thread(
+    host: &HostIdentity,
+    thread: &serde_json::Value,
+    sequence: &mut i64,
+) -> Result<Option<RuntimeEvent>> {
+    let Some(native_id) = first_string(thread, &["id", "threadId", "thread_id"]) else {
+        return Ok(None);
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("source".into(), serde_json::json!("codex.app-server"));
+    payload.insert("metadata_only".into(), serde_json::json!(true));
+    payload.insert("thread_id".into(), serde_json::json!(native_id));
+    for (output_key, input_keys) in [
+        ("title", &["title", "name"][..]),
+        ("cwd", &["cwd", "workingDirectory", "working_directory"][..]),
+        ("model", &["model", "modelProvider"][..]),
+        ("status", &["status", "state"][..]),
+        ("updated_at", &["updatedAt", "updated_at"][..]),
+    ] {
+        if let Some(value) = first_scalar(thread, input_keys) {
+            payload.insert(output_key.into(), value);
+        }
+    }
+    for key in ["archived", "isArchived"] {
+        if let Some(value) = thread.get(key).filter(|value| value.is_boolean()) {
+            payload.insert("archived".into(), value.clone());
+            break;
+        }
+    }
+    let payload_json = serde_json::to_string(&payload)?;
+    let event_type = "session.updated";
+    *sequence += 1;
+    Ok(Some(RuntimeEvent {
+        event_id: stable_runtime_event_id(
+            &host.host_id,
+            CODEX_PROVIDER_ID,
+            event_type,
+            &native_id,
+            &payload_json,
+        ),
+        host_id: host.host_id.clone(),
+        provider_id: CODEX_PROVIDER_ID.into(),
+        event_type: event_type.into(),
+        sequence: *sequence,
+        payload_json,
+        occurred_at: Utc::now(),
+    }))
+}
+
+fn first_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
+fn first_scalar(value: &serde_json::Value, keys: &[&str]) -> Option<serde_json::Value> {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).filter(|candidate| {
+                candidate.is_string() || candidate.is_number() || candidate.is_boolean()
+            })
+        })
+        .map(|candidate| match candidate {
+            serde_json::Value::String(value) => {
+                let redacted = redact_text(value);
+                let bounded = redacted.chars().take(512).collect::<String>();
+                serde_json::Value::String(bounded)
+            }
+            other => other.clone(),
+        })
 }
 
 fn extension(path: &Path) -> String {
@@ -1323,6 +1405,41 @@ mod tests {
     fn provider_descriptor_is_codex() {
         let adapter = CodexAdapter::from_environment(Some(PathBuf::from("/tmp/codex")));
         assert_eq!(adapter.provider().id, CODEX_PROVIDER_ID);
+        assert!(adapter.provider().capabilities.contains(&"runtime".into()));
+    }
+
+    #[test]
+    fn runtime_mapping_is_provider_neutral_and_redacted() {
+        let adapter = CodexAdapter::from_environment(Some(PathBuf::from("/tmp/codex")));
+        let host = HostIdentity {
+            host_id: "host-runtime".into(),
+            display_name: "Runtime host".into(),
+            platform: "macos".into(),
+            hostname: "runtime.local".into(),
+        };
+        let mut sequence = 0;
+        let event = adapter
+            .map_runtime_thread(
+                &host,
+                &serde_json::json!({
+                    "id": "thread-1",
+                    "title": "Safe title api_key=secret-value",
+                    "cwd": "/work/project",
+                    "model": "gpt-test",
+                    "status": "idle",
+                    "archived": false,
+                    "delta": "must not be persisted"
+                }),
+                &mut sequence,
+            )
+            .expect("runtime event conversion")
+            .expect("thread id");
+        assert_eq!(event.provider_id, CODEX_PROVIDER_ID);
+        assert_eq!(event.event_type, "session.updated");
+        assert_eq!(event.sequence, 1);
+        assert!(event.payload_json.contains("metadata_only"));
+        assert!(!event.payload_json.contains("secret-value"));
+        assert!(!event.payload_json.contains("must not be persisted"));
     }
 
     #[test]

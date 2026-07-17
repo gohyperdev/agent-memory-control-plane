@@ -574,11 +574,86 @@ impl Catalog {
                     event.occurred_at.to_rfc3339(),
                 ],
             )?;
+            if event.event_type == "session.updated" {
+                Self::project_runtime_session(&transaction, event)?;
+            }
         }
         transaction
             .commit()
             .context("commit runtime event transaction")?;
         Ok(inserted)
+    }
+
+    fn project_runtime_session(
+        transaction: &rusqlite::Transaction<'_>,
+        event: &RuntimeEvent,
+    ) -> Result<()> {
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload_json).context("decode runtime session metadata")?;
+        let Some(thread_id) = payload.get("thread_id").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let cwd = payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let model = payload
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let project_id = payload
+            .get("project_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let archived = payload
+            .get("archived")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let started_at = payload
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_utc)
+            .map(|value| value.to_rfc3339());
+        let source_reference = format!(
+            "{}://thread/{}",
+            event.provider_id,
+            thread_id.replace('/', "%2F")
+        );
+        transaction.execute(
+        "INSERT INTO sessions(session_id, host_id, provider_id, project_id, title, cwd, model, branch, started_at, ended_at, archived, source_reference, source_hash, metadata_json, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(session_id, host_id, provider_id) DO UPDATE SET
+           project_id=COALESCE(excluded.project_id, sessions.project_id),
+           title=COALESCE(excluded.title, sessions.title),
+           cwd=COALESCE(excluded.cwd, sessions.cwd),
+           model=COALESCE(excluded.model, sessions.model),
+           started_at=COALESCE(excluded.started_at, sessions.started_at),
+           archived=excluded.archived,
+           source_reference=excluded.source_reference,
+           source_hash=excluded.source_hash,
+           metadata_json=excluded.metadata_json,
+           observed_at=excluded.observed_at",
+        params![
+            thread_id,
+            event.host_id,
+            event.provider_id,
+            project_id,
+            title,
+            cwd,
+            model,
+            started_at,
+            i64::from(archived),
+            source_reference,
+            event.event_id,
+            event.payload_json,
+            event.occurred_at.to_rfc3339(),
+        ],
+    )?;
+        Ok(())
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
@@ -1298,6 +1373,57 @@ mod tests {
             catalog.latest_cursor("host_test", "codex").expect("cursor"),
             Some("run-cursor".into())
         );
+    }
+
+    #[test]
+    fn runtime_session_events_are_projected_and_deduplicated() {
+        let mut catalog = Catalog::open_in_memory().expect("catalog");
+        catalog
+            .register_host(&HostIdentity {
+                host_id: "host-runtime".into(),
+                display_name: "Runtime host".into(),
+                platform: "macos".into(),
+                hostname: "runtime.local".into(),
+            })
+            .expect("runtime host");
+        let event = RuntimeEvent {
+            event_id: "event-session-1".into(),
+            host_id: "host-runtime".into(),
+            provider_id: "codex".into(),
+            event_type: "session.updated".into(),
+            sequence: 1,
+            payload_json: serde_json::json!({
+                "source": "codex.app-server",
+                "metadata_only": true,
+                "thread_id": "thread-1",
+                "title": "Runtime session",
+                "cwd": "/work/project",
+                "model": "gpt-test",
+                "archived": false
+            })
+            .to_string(),
+            occurred_at: Utc::now(),
+        };
+        assert_eq!(
+            catalog
+                .ingest_runtime_events(std::slice::from_ref(&event))
+                .expect("event"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .ingest_runtime_events(std::slice::from_ref(&event))
+                .expect("replay"),
+            0
+        );
+        let sessions = catalog
+            .list_sessions(Some("host-runtime"), None)
+            .expect("projected sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "thread-1");
+        assert_eq!(sessions[0].title.as_deref(), Some("Runtime session"));
+        assert_eq!(sessions[0].source_reference, "codex://thread/thread-1");
+        assert!(sessions[0].metadata_json.contains("metadata_only"));
     }
 
     #[test]

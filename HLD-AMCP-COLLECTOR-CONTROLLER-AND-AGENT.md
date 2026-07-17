@@ -402,6 +402,17 @@ transcript payloads are not copied into event items. This is an AMCP observation
 only; the Codex thread and native rollout remain authoritative and can be
 re-read through the app-server or Agent.
 
+The Agent-side runtime connector is an independent, opt-in supervisor. When
+`AMCP_AGENT_APP_SERVER_ENABLED=true`, it launches the local Codex executable
+(`AMCP_CODEX_BIN`, default `codex`), initializes the documented app-server
+stdio protocol, polls bounded thread metadata, and emits `session.updated`
+events into the Agent outbox. Event IDs are deterministic for an identical
+thread snapshot, so repeated polling and reconnects are idempotent. The
+connector applies exponential reconnect backoff, never persists transcript
+deltas in its event payload, and is disabled by default unless the host policy
+explicitly enables it. The Controller projects these metadata events into the
+central session catalog only after event persistence.
+
 RAG chunk retention is applied independently from native provider retention. A
 configured retention window purges derived chunks before retrieval; disabling or
 deleting RAG must not remove or mutate native provider state.

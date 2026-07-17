@@ -2,6 +2,7 @@
 #![allow(clippy::items_after_test_module)]
 #![allow(clippy::ptr_arg)]
 
+use amcp_app_server::AppServerClient;
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
 use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, new_id};
@@ -12,7 +13,7 @@ use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
     ResponsePayload,
 };
-use amcp_provider_api::ProviderRegistry;
+use amcp_provider_api::{ProviderAdapter, ProviderRegistry};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
@@ -67,6 +68,14 @@ struct Args {
         env = "AMCP_AGENT_PAIRING_TIMEOUT_SECONDS"
     )]
     pairing_timeout_seconds: u64,
+    #[arg(long, default_value_t = false, env = "AMCP_AGENT_APP_SERVER_ENABLED")]
+    app_server_enabled: bool,
+    #[arg(long, default_value = "codex", env = "AMCP_CODEX_BIN")]
+    codex_bin: PathBuf,
+    #[arg(long, default_value_t = 5_000, env = "AMCP_AGENT_RUNTIME_POLL_MS")]
+    runtime_poll_ms: u64,
+    #[arg(long, env = "AMCP_AGENT_RUNTIME_CWD")]
+    runtime_cwd: Option<PathBuf>,
 }
 
 struct AgentAuth {
@@ -167,6 +176,23 @@ async fn serve(args: Args) -> Result<()> {
         CodexAdapter::from_environment(args.codex_home.clone()).codex_home,
         default_state_dir(),
     );
+    let _runtime_connector = if args.app_server_enabled {
+        Some(start_runtime_connector(
+            args.codex_bin.clone(),
+            args.codex_home.clone(),
+            args.runtime_cwd.clone(),
+            default_state_dir(),
+            args.runtime_poll_ms,
+        ))
+    } else {
+        None
+    };
+    if args.app_server_enabled {
+        eprintln!(
+            "AMCP Codex app-server runtime connector enabled (poll={}ms)",
+            args.runtime_poll_ms.max(250)
+        );
+    }
     if let Some(bind) = args.tcp_bind.clone() {
         return serve_tls(args, bind, auth).await;
     }
@@ -274,6 +300,163 @@ fn start_local_watcher(
             })
             .expect("spawn AMCP local watcher thread"),
     )
+}
+
+fn start_runtime_connector(
+    codex_bin: PathBuf,
+    codex_home: Option<PathBuf>,
+    working_directory: Option<PathBuf>,
+    state_dir: PathBuf,
+    poll_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        runtime_connector_loop(codex_bin, codex_home, working_directory, state_dir, poll_ms).await;
+    })
+}
+
+async fn runtime_connector_loop(
+    codex_bin: PathBuf,
+    codex_home: Option<PathBuf>,
+    working_directory: Option<PathBuf>,
+    state_dir: PathBuf,
+    poll_ms: u64,
+) {
+    let poll_duration = std::time::Duration::from_millis(poll_ms.max(250));
+    let mut reconnect_delay = std::time::Duration::from_secs(1);
+    let registry = provider_registry(codex_home.clone());
+    let provider = match registry.get("codex") {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("AMCP runtime connector disabled: Codex provider unavailable: {error:#}");
+            return;
+        }
+    };
+    loop {
+        match AppServerClient::spawn(
+            &codex_bin,
+            codex_home.as_deref(),
+            working_directory.as_deref(),
+        )
+        .await
+        {
+            Ok(mut client) => {
+                match client
+                    .initialize("amcp-agent-runtime", env!("CARGO_PKG_VERSION"))
+                    .await
+                {
+                    Ok(_) => {
+                        eprintln!("AMCP Agent connected to Codex app-server runtime");
+                        reconnect_delay = std::time::Duration::from_secs(1);
+                        let host = host_identity();
+                        let mut sequence = 0i64;
+                        loop {
+                            match poll_runtime_threads(&mut client, provider, &host, &mut sequence)
+                                .await
+                            {
+                                Ok(events) => {
+                                    if let Err(error) =
+                                        append_runtime_event_outbox(&state_dir, &events)
+                                    {
+                                        eprintln!(
+                                            "AMCP runtime connector could not persist events: {error}"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "AMCP Codex app-server runtime poll failed; reconnecting: {error:#}"
+                                    );
+                                    break;
+                                }
+                            }
+                            sleep(poll_duration).await;
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "AMCP Codex app-server initialization failed; retrying: {error:#}"
+                    ),
+                }
+                let _ = client.shutdown().await;
+            }
+            Err(error) => eprintln!(
+                "AMCP Codex app-server runtime unavailable; retrying in {}s: {error:#}",
+                reconnect_delay.as_secs()
+            ),
+        }
+        sleep(reconnect_delay).await;
+        reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+async fn poll_runtime_threads(
+    client: &mut AppServerClient,
+    provider: &dyn ProviderAdapter,
+    host: &HostIdentity,
+    sequence: &mut i64,
+) -> Result<Vec<RuntimeEvent>> {
+    let mut events = Vec::new();
+    let mut cursor = None;
+    for _ in 0..8 {
+        let response = client.list_threads(cursor.as_deref(), Some(64)).await?;
+        for thread in extract_thread_values(&response) {
+            if let Some(event) = provider.map_runtime_thread(host, &thread, sequence)? {
+                events.push(event);
+            }
+        }
+        let next_cursor = extract_next_thread_cursor(&response);
+        if next_cursor.is_none() || next_cursor == cursor {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    Ok(events)
+}
+
+fn extract_thread_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter(|value| value.is_object())
+            .cloned()
+            .collect();
+    }
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    for key in ["threads", "data", "items", "results"] {
+        if let Some(nested) = object.get(key) {
+            let values = extract_thread_values(nested);
+            if !values.is_empty() {
+                return values;
+            }
+        }
+    }
+    if object
+        .get("id")
+        .or_else(|| object.get("threadId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return vec![value.clone()];
+    }
+    Vec::new()
+}
+
+fn extract_next_thread_cursor(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    for key in ["nextCursor", "next_cursor"] {
+        if let Some(cursor) = object.get(key).and_then(serde_json::Value::as_str) {
+            return Some(cursor.to_owned());
+        }
+    }
+    for key in ["data", "result"] {
+        if let Some(nested) = object.get(key)
+            && let Some(cursor) = extract_next_thread_cursor(nested)
+        {
+            return Some(cursor);
+        }
+    }
+    None
 }
 
 async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
@@ -1161,6 +1344,60 @@ mod tests {
             }
             other => panic!("unexpected continued subscription page: {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_connector_emits_redacted_metadata_only_session_events() {
+        let host = HostIdentity {
+            host_id: "host-runtime".into(),
+            display_name: "Runtime host".into(),
+            platform: "macos".into(),
+            hostname: "runtime.local".into(),
+        };
+        let mut sequence = 0;
+        let provider = CodexAdapter::from_environment(Some(PathBuf::from("/tmp/codex")));
+        let event = provider
+            .map_runtime_thread(
+                &host,
+                &serde_json::json!({
+                    "id": "thread-1",
+                    "title": "Safe title api_key=secret-value",
+                    "cwd": "/work/project",
+                    "model": "gpt-test",
+                    "status": "idle",
+                    "archived": false,
+                    "delta": "must not be persisted"
+                }),
+                &mut sequence,
+            )
+            .expect("runtime event conversion")
+            .expect("thread id");
+        assert_eq!(event.event_type, "session.updated");
+        assert_eq!(event.sequence, 1);
+        assert!(event.payload_json.contains("metadata_only"));
+        assert!(event.payload_json.contains("Safe title"));
+        assert!(!event.payload_json.contains("secret-value"));
+        assert!(!event.payload_json.contains("must not be persisted"));
+    }
+
+    #[test]
+    fn runtime_connector_extracts_common_thread_list_shapes() {
+        let response = serde_json::json!({
+            "data": {
+                "threads": [
+                    { "id": "thread-1" },
+                    { "id": "thread-2" }
+                ],
+                "nextCursor": "page-2"
+            }
+        });
+        let threads = extract_thread_values(&response);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[1]["id"], "thread-2");
+        assert_eq!(
+            extract_next_thread_cursor(&response).as_deref(),
+            Some("page-2")
+        );
     }
 
     #[test]

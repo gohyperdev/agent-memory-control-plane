@@ -27,6 +27,7 @@ dependencies = [
 name = "amcp-agent"
 version = "0.1.0"
 dependencies = [
+ "amcp-app-server",
  "amcp-codex",
  "amcp-domain",
  "amcp-platform",
@@ -153,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "amcp-domain",
  "anyhow",
+ "serde_json",
 ]
 
 [[package]]
