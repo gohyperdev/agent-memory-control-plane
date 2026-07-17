@@ -451,6 +451,17 @@ pub struct RuntimeThreadRecord {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Bounded metadata returned by a provider runtime read. The native thread
+/// response and transcript content stay on the Agent and are never serialized
+/// into the Controller protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeThreadSnapshot {
+    pub thread: RuntimeThreadRecord,
+    pub item_count: usize,
+    pub item_kinds: Vec<String>,
+    pub item_roles: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,

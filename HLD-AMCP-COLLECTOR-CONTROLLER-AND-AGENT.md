@@ -436,6 +436,17 @@ with pagination. It creates a short-lived app-server read connection and never
 exposes raw provider response objects or transcript content through this
 surface.
 
+The same boundary exposes `RuntimeReadThread` for one selected thread. The
+response is a bounded `RuntimeThreadSnapshot` containing the normalized thread
+record plus an item count and deduplicated item kind/role labels. It is not a
+transcript-read API: item text, deltas, tool arguments, provider-native fields,
+and raw app-server response objects are discarded on the Agent. The Controller
+CLI exposes this as `runtime-read`, and the embedded MCP gateway exposes it as
+`amcp_runtime_thread_read`, both with the same host/provider scope checks. A
+future `RuntimeSetThreadArchived` operation must use the existing human
+approval/replay mechanism before calling the provider's archive or unarchive
+runtime method.
+
 RAG chunk retention is applied independently from native provider retention. A
 configured retention window purges derived chunks before retrieval; disabling or
 deleting RAG must not remove or mutate native provider state.

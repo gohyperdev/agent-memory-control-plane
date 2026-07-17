@@ -48,6 +48,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - `amcp-controller watch` uses the long-poll wait budget before reconciling each host/provider cursor, while preserving the bounded reconnect behavior.
 - The Agent can optionally supervise a local Codex app-server runtime with `AMCP_AGENT_APP_SERVER_ENABLED=true`; it polls bounded thread metadata, emits deterministic `session.updated` events, persists no transcript deltas, and reconnects with exponential backoff.
 - The authenticated Agent protocol also exposes bounded `RuntimeListThreads` read pages with host-scope enforcement and provider-neutral metadata; raw app-server response objects and transcript content are not returned.
+- The authenticated Agent protocol also exposes `RuntimeReadThread`; it returns only one normalized thread snapshot with bounded item count/kind/role metadata. The Controller `runtime-read` command and MCP `amcp_runtime_thread_read` share the same host/provider scope checks and never return transcript content.
 - The macOS Agent runs a `notify`/FSEvents-backed watcher over the Codex root and emits bounded, path-relative `source.changed` events; sensitive `auth.json` paths are excluded and bursts are coalesced.
 - Central FTS5 search is maintained incrementally during collection, records projection runs, and supports bounded chunk rebuilds through `amcp-controller rebuild-index`.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.

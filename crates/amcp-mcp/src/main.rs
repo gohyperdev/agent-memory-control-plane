@@ -254,13 +254,28 @@ fn tool_list() -> Value {
             },
             {
                 "name": "amcp_runtime_threads_list",
-                "description": "Read bounded live Codex thread metadata from the selected Agent. Transcript content and provider response internals are excluded.",
+                "description": "Read bounded live runtime thread metadata from the selected Agent. Transcript content and provider response internals are excluded.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "host_id": { "type": "string" },
+                        "provider_id": { "type": "string", "default": "codex" },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
                     }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
+                "name": "amcp_runtime_thread_read",
+                "description": "Read one bounded live Codex thread snapshot. Only normalized thread metadata and item kind/role counts are returned; transcript content is excluded.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "thread_id": { "type": "string" },
+                        "provider_id": { "type": "string", "default": "codex" }
+                    },
+                    "required": ["thread_id"]
                 },
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
@@ -402,6 +417,7 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             Ok(json!({ "events": catalog.list_runtime_events(host_id, provider_id, limit)? }))
         }
         "amcp_runtime_threads_list" => runtime_threads_list(args, arguments),
+        "amcp_runtime_thread_read" => runtime_thread_read(args, arguments),
         "amcp_retrieve_context" => {
             let query = arguments
                 .get("query")
@@ -491,6 +507,10 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
 
 fn runtime_threads_list(args: &Args, arguments: Value) -> Result<Value> {
     let requested_host = arguments.get("host_id").and_then(Value::as_str);
+    let provider_id = arguments
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
     let limit = arguments
         .get("limit")
         .and_then(Value::as_u64)
@@ -503,6 +523,8 @@ fn runtime_threads_list(args: &Args, arguments: Value) -> Result<Value> {
         .args([
             "--limit",
             &limit.to_string(),
+            "--provider-id",
+            provider_id,
             "--token",
             &args.agent_token,
             "--json",
@@ -529,6 +551,54 @@ fn runtime_threads_list(args: &Args, arguments: Value) -> Result<Value> {
     }
     let result: Value =
         serde_json::from_slice(&output.stdout).context("decode Controller runtime read")?;
+    if requested_host
+        .is_some_and(|host_id| result.get("host_id").and_then(Value::as_str) != Some(host_id))
+    {
+        anyhow::bail!("runtime response host does not match requested host scope");
+    }
+    Ok(result)
+}
+
+fn runtime_thread_read(args: &Args, arguments: Value) -> Result<Value> {
+    let requested_host = arguments.get("host_id").and_then(Value::as_str);
+    let thread_id = arguments
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .context("amcp_runtime_thread_read requires thread_id")?;
+    let provider_id = arguments
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex");
+    let mut command = Command::new(&args.controller_bin);
+    command
+        .args(["runtime-read", "--socket"])
+        .arg(&args.agent_socket)
+        .args(["--provider-id", provider_id, "--token", &args.agent_token])
+        .arg(thread_id)
+        .args(["--json", "--no-start-agent"]);
+    if let Some(agent_url) = &args.agent_url {
+        command.args(["--agent-url", agent_url]);
+    }
+    if let Some(tls_ca) = &args.tls_ca {
+        command.args(["--tls-ca"]).arg(tls_ca);
+    }
+    if let Some(server_name) = &args.tls_server_name {
+        command.args(["--tls-server-name", server_name]);
+    }
+    if let Some(codex_home) = &args.codex_home {
+        command.args(["--codex-home"]).arg(codex_home);
+    }
+    let output = command
+        .output()
+        .context("start Controller runtime thread read")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Controller runtime thread read failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let result: Value =
+        serde_json::from_slice(&output.stdout).context("decode Controller runtime thread read")?;
     if requested_host
         .is_some_and(|host_id| result.get("host_id").and_then(Value::as_str) != Some(host_id))
     {

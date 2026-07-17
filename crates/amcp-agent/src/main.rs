@@ -5,7 +5,7 @@
 use amcp_app_server::AppServerClient;
 use amcp_codex::CodexAdapter;
 use amcp_domain::change_set_operations_hash;
-use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, new_id};
+use amcp_domain::{ApprovalEnvelope, HostIdentity, RuntimeEvent, RuntimeThreadSnapshot, new_id};
 use amcp_file_providers::{AntigravityAdapter, ClaudeCodeAdapter, KiroAdapter};
 use amcp_platform::{
     MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
@@ -443,6 +443,78 @@ fn extract_thread_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
+fn extract_runtime_thread_value(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if value.is_object()
+        && value
+            .get("id")
+            .or_else(|| value.get("threadId"))
+            .or_else(|| value.get("thread_id"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    {
+        return Some(value.clone());
+    }
+    let object = value.as_object()?;
+    for key in ["thread", "data", "result"] {
+        if let Some(nested) = object.get(key)
+            && let Some(thread) = extract_runtime_thread_value(nested)
+        {
+            return Some(thread);
+        }
+    }
+    None
+}
+
+fn summarize_runtime_items(value: &serde_json::Value) -> (usize, Vec<String>, Vec<String>) {
+    let Some(items) = extract_runtime_items(value) else {
+        return (0, Vec::new(), Vec::new());
+    };
+    let item_count = items.len().min(4_096);
+    let mut kinds = Vec::new();
+    let mut roles = Vec::new();
+    for item in items.iter().take(item_count) {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if let Some(value) = ["type", "kind", "itemType"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            && !value.is_empty()
+            && !kinds.iter().any(|existing| existing == &value)
+            && kinds.len() < 32
+        {
+            kinds.push(value);
+        }
+        if let Some(value) = object
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            && !value.is_empty()
+            && !roles.iter().any(|existing| existing == &value)
+            && roles.len() < 32
+        {
+            roles.push(value);
+        }
+    }
+    (item_count, kinds, roles)
+}
+
+fn extract_runtime_items(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    let object = value.as_object()?;
+    if let Some(items) = object.get("items").and_then(serde_json::Value::as_array) {
+        return Some(items.as_slice());
+    }
+    for key in ["thread", "data", "result"] {
+        if let Some(nested) = object.get(key)
+            && let Some(items) = extract_runtime_items(nested)
+        {
+            return Some(items);
+        }
+    }
+    None
+}
+
 fn extract_next_thread_cursor(value: &serde_json::Value) -> Option<String> {
     let object = value.as_object()?;
     for key in ["nextCursor", "next_cursor"] {
@@ -603,6 +675,15 @@ where
             process_subscribe_request(request, &auth, &state_dir).await
         } else if matches!(&request.method, RequestMethod::RuntimeListThreads { .. }) {
             process_runtime_list_request(
+                request,
+                &auth,
+                codex_home.clone(),
+                &codex_bin,
+                runtime_cwd.as_deref(),
+            )
+            .await
+        } else if matches!(&request.method, RequestMethod::RuntimeReadThread { .. }) {
+            process_runtime_read_request(
                 request,
                 &auth,
                 codex_home.clone(),
@@ -1107,6 +1188,7 @@ fn process_request(
                 )),
             },
             RequestMethod::RuntimeListThreads { .. }
+            | RequestMethod::RuntimeReadThread { .. }
             | RequestMethod::OpenEventStream { .. }
             | RequestMethod::CloseEventStream { .. } => Err(ProtocolError::new(
                 "runtime_request_requires_async_handler",
@@ -1485,6 +1567,164 @@ async fn process_runtime_list_request(
                 threads,
                 next_cursor,
             }),
+        },
+        Err(error) => ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("runtime_read_failed", error.to_string())),
+        },
+    }
+}
+
+async fn process_runtime_read_request(
+    request: RequestEnvelope,
+    auth: &Arc<Mutex<AgentAuth>>,
+    codex_home: Option<PathBuf>,
+    codex_bin: &Path,
+    runtime_cwd: Option<&Path>,
+) -> ResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let (provider_id, scope, thread_id) = match request.method {
+        RequestMethod::RuntimeReadThread {
+            provider_id,
+            scope,
+            thread_id,
+        } => (provider_id, scope, thread_id),
+        _ => {
+            return ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "invalid_runtime_request",
+                    "not a runtime thread read request",
+                )),
+            };
+        }
+    };
+    let authenticated = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .accepts(request.token.as_deref());
+    if request.protocol_version != PROTOCOL_VERSION {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "protocol_version_mismatch",
+                "unsupported protocol version",
+            )),
+        };
+    }
+    if !authenticated {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+        };
+    }
+    if thread_id.trim().is_empty() || thread_id.len() > 512 {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "invalid_runtime_request",
+                "thread id must be non-empty and bounded",
+            )),
+        };
+    }
+    if scope
+        .as_ref()
+        .and_then(|scope| scope.host_id.as_deref())
+        .is_some_and(|host_id| host_id != host_identity().host_id)
+    {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "scope_denied",
+                "requested host is not this Agent",
+            )),
+        };
+    }
+    if scope
+        .as_ref()
+        .and_then(|scope| scope.provider_id.as_deref())
+        .is_some_and(|scope_provider_id| scope_provider_id != provider_id)
+    {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "scope_denied",
+                "requested provider does not match the runtime provider",
+            )),
+        };
+    }
+    if provider_id != "codex" {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "provider_unavailable",
+                "runtime thread reads are not implemented for this provider",
+            )),
+        };
+    }
+    let registry = provider_registry(codex_home.clone());
+    let provider = match registry.get(&provider_id) {
+        Ok(provider)
+            if provider
+                .descriptor()
+                .capabilities
+                .iter()
+                .any(|capability| capability == "runtime") =>
+        {
+            provider
+        }
+        _ => {
+            return ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "runtime_unavailable",
+                    "provider does not expose runtime capability",
+                )),
+            };
+        }
+    };
+    let result = async {
+        let mut client = AppServerClient::spawn(codex_bin, codex_home.as_deref(), runtime_cwd)
+            .await
+            .context("start Codex app-server for runtime thread read")?;
+        client
+            .initialize("amcp-agent-runtime-thread-read", env!("CARGO_PKG_VERSION"))
+            .await
+            .context("initialize Codex app-server for runtime thread read")?;
+        let response = client
+            .read_thread(&thread_id)
+            .await
+            .context("read Codex runtime thread")?;
+        let thread = extract_runtime_thread_value(&response)
+            .context("Codex runtime read returned no thread metadata")?;
+        let host = host_identity();
+        let thread = provider
+            .map_runtime_thread_record(&host, &thread)?
+            .context("Codex runtime read returned an unmappable thread")?;
+        let (item_count, item_kinds, item_roles) = summarize_runtime_items(&response);
+        let _ = client.shutdown().await;
+        Ok::<_, anyhow::Error>(RuntimeThreadSnapshot {
+            thread,
+            item_count,
+            item_kinds,
+            item_roles,
+        })
+    }
+    .await;
+    match result {
+        Ok(snapshot) => ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Ok(ResponsePayload::RuntimeThreadSnapshot(snapshot)),
         },
         Err(error) => ResponseEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -2027,7 +2267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_thread_read_rejects_a_different_host_scope() {
+    async fn runtime_thread_list_rejects_a_different_host_scope() {
         let auth = Arc::new(Mutex::new(AgentAuth::new(
             "runtime-token".into(),
             None,
@@ -2080,6 +2320,56 @@ mod tests {
         )
         .await;
         assert_eq!(response.result.unwrap_err().code, "scope_denied");
+    }
+
+    #[tokio::test]
+    async fn runtime_thread_snapshot_read_rejects_a_different_host_scope() {
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "runtime-token".into(),
+            None,
+            300,
+        )));
+        let response = process_runtime_read_request(
+            RequestEnvelope::new(
+                RequestMethod::RuntimeReadThread {
+                    provider_id: "codex".into(),
+                    scope: Some(amcp_domain::Scope::host("other-host")),
+                    thread_id: "thread-1".into(),
+                },
+                Some("runtime-token".into()),
+            ),
+            &auth,
+            None,
+            Path::new("/does/not/exist"),
+            None,
+        )
+        .await;
+        assert_eq!(response.result.unwrap_err().code, "scope_denied");
+    }
+
+    #[test]
+    fn runtime_thread_read_summarizes_item_metadata_without_content() {
+        let response = serde_json::json!({
+            "thread": { "id": "thread-1" },
+            "items": [
+                { "type": "userMessage", "role": "user", "text": "secret transcript" },
+                { "type": "agentMessage", "role": "assistant", "delta": "secret delta" },
+                { "type": "agentMessage", "role": "assistant", "text": "secret answer" }
+            ]
+        });
+        let (count, kinds, roles) = summarize_runtime_items(&response);
+        assert_eq!(count, 3);
+        assert_eq!(kinds, vec!["userMessage", "agentMessage"]);
+        assert_eq!(roles, vec!["user", "assistant"]);
+        let summary = serde_json::json!({
+            "item_count": count,
+            "item_kinds": kinds,
+            "item_roles": roles,
+        });
+        let encoded = serde_json::to_string(&summary).expect("encode metadata summary");
+        assert!(!encoded.contains("secret transcript"));
+        assert!(!encoded.contains("secret delta"));
+        assert!(!encoded.contains("secret answer"));
     }
 
     #[test]

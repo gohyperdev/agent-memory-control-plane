@@ -1,6 +1,7 @@
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
-    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord, Scope,
+    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord,
+    RuntimeThreadSnapshot, Scope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -63,6 +64,11 @@ pub enum RequestMethod {
         scope: Option<Scope>,
         cursor: Option<String>,
         limit: usize,
+    },
+    RuntimeReadThread {
+        provider_id: String,
+        scope: Option<Scope>,
+        thread_id: String,
     },
     AckEvents {
         event_ids: Vec<String>,
@@ -149,6 +155,7 @@ pub enum ResponsePayload {
         threads: Vec<RuntimeThreadRecord>,
         next_cursor: Option<String>,
     },
+    RuntimeThreadSnapshot(RuntimeThreadSnapshot),
     RuntimeEventsAcked(usize),
     Artifact(ArtifactRecord),
     ChangeSet(ChangeSet),
@@ -329,6 +336,29 @@ mod tests {
                 cursor: Some(cursor),
                 limit: 32
             } if provider_id == "codex" && host_id == "host-runtime" && cursor == "page-2"
+        ));
+    }
+
+    #[test]
+    fn runtime_thread_read_round_trip_preserves_target_scope() {
+        let request = RequestEnvelope::new(
+            RequestMethod::RuntimeReadThread {
+                provider_id: "codex".into(),
+                scope: Some(Scope::host("host-runtime")),
+                thread_id: "thread-42".into(),
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode runtime read"))
+                .expect("decode runtime read");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::RuntimeReadThread {
+                provider_id,
+                scope: Some(Scope { host_id: Some(host_id), .. }),
+                thread_id
+            } if provider_id == "codex" && host_id == "host-runtime" && thread_id == "thread-42"
         ));
     }
 
