@@ -353,7 +353,7 @@ Agent runtime
   ├── Provider registry
   │    ├── Codex adapter
   │    ├── Claude Code adapter (file-backed read-only)
-  │    ├── Antigravity adapter (future)
+  │    ├── Antigravity adapter (file-backed read-only)
   │    └── Kiro adapter (file-backed read-only)
   ├── Discovery coordinator
   ├── Native state readers
@@ -386,11 +386,13 @@ Provider discovery must be isolated. A malformed Claude Code file must not preve
 
 The macOS MVP keeps future provider registration behind the explicit
 `AMCP_ENABLE_FUTURE_PROVIDERS=true` host setting. When enabled, the Agent
-registers file-backed read-only adapters for Claude Code and Kiro, while
-Antigravity remains an inventory-only descriptor. Claude Code discovery covers
+registers file-backed read-only adapters for Claude Code, Kiro and Antigravity.
+Claude Code discovery covers
 user/project `CLAUDE.md`, `.claude/settings*.json`, `.mcp.json` and bounded
 project command/agent markdown; Kiro discovery covers user/project steering,
-settings, prompts and agents under `.kiro`. These capabilities are persisted
+settings, prompts and agents under `.kiro`. Antigravity discovery covers the
+documented local knowledge, CLI settings and global/workspace plugin roots.
+These capabilities are persisted
 centrally and do not imply runtime access or mutation support. Full adapters can
 replace or extend these readers later without changing the Agent–Controller protocol,
 central schema, or UI contract.

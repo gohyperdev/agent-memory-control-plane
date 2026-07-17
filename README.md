@@ -37,8 +37,8 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 ## Current implementation surface
 
 - `amcp-agent` is a provider-registry based local process. Codex is the first adapter; the Agent can also expose an opt-in TLS TCP listener for a remote host.
-- Provider adapters are capability-based; inventory-only adapters can omit reads and mutations, keeping future Claude Code, Kiro, and Antigravity integrations out of the Codex-specific UI and storage contract.
-- Set `AMCP_ENABLE_FUTURE_PROVIDERS=true` on an Agent to enable modular file adapters for Claude Code and Kiro (read-only memory, guidance, configuration and project discovery); Antigravity remains inventory-only until its local state contract is finalized.
+- Provider adapters are capability-based; adapters can omit runtime reads and mutations, keeping Claude Code, Kiro and Antigravity out of the Codex-specific UI and storage contract.
+- Set `AMCP_ENABLE_FUTURE_PROVIDERS=true` on an Agent to enable modular file adapters for Claude Code, Kiro and Antigravity (read-only memory, guidance, configuration and project discovery); runtime/session parsing and mutation remain provider-specific follow-up work.
 - `amcp-controller` supports local Unix IPC and `tcp://` Agent endpoints with a user-supplied CA, central host connection records, collection, FTS search, change proposal, approval, atomic apply, and rollback. Approval envelopes carry a signed nonce and are consumed once by the Agent through a durable replay store.
 - The Agent keeps a bounded, redacted collection outbox. On reconnect, the Controller replays it idempotently before requesting a fresh snapshot; cursors advance only after central persistence.
 - Collection batches emit persisted runtime events with stable IDs; SQLite deduplicates replayed events, while the MCP diagnostics tool exposes the resulting event history.

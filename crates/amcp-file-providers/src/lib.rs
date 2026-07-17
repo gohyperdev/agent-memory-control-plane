@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 
 pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
 pub const KIRO_PROVIDER_ID: &str = "kiro";
+pub const ANTIGRAVITY_PROVIDER_ID: &str = "antigravity";
 pub const ADAPTER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,10 +52,12 @@ pub struct FileProviderAdapter {
 enum ProviderFamily {
     ClaudeCode,
     Kiro,
+    Antigravity,
 }
 
 pub type ClaudeCodeAdapter = FileProviderAdapter;
 pub type KiroAdapter = FileProviderAdapter;
+pub type AntigravityAdapter = FileProviderAdapter;
 
 impl FileProviderAdapter {
     pub fn claude_code_from_environment() -> ClaudeCodeAdapter {
@@ -86,6 +89,22 @@ impl FileProviderAdapter {
             user_root,
             project_roots("AMCP_KIRO_PROJECT_ROOTS"),
             ProviderFamily::Kiro,
+        )
+    }
+
+    pub fn antigravity_from_environment() -> AntigravityAdapter {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let user_root = env::var_os("AMCP_ANTIGRAVITY_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".gemini/antigravity"));
+        Self::new(
+            ANTIGRAVITY_PROVIDER_ID,
+            "Google Antigravity",
+            user_root,
+            project_roots("AMCP_ANTIGRAVITY_PROJECT_ROOTS"),
+            ProviderFamily::Antigravity,
         )
     }
 
@@ -122,6 +141,7 @@ impl FileProviderAdapter {
         match self.family {
             ProviderFamily::ClaudeCode => self.claude_candidates(&mut candidates),
             ProviderFamily::Kiro => self.kiro_candidates(&mut candidates),
+            ProviderFamily::Antigravity => self.antigravity_candidates(&mut candidates),
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         candidates.dedup_by(|left, right| left.path == right.path);
@@ -309,6 +329,74 @@ impl FileProviderAdapter {
                 41,
                 true,
                 Some("project-prompt"),
+            );
+        }
+    }
+
+    fn antigravity_candidates(&self, candidates: &mut Vec<Candidate>) {
+        self.add_directory(
+            candidates,
+            &self.user_root.join("knowledge"),
+            None,
+            CandidateKind::Instruction,
+            20,
+            true,
+            Some("knowledge"),
+        );
+        self.add_directory(
+            candidates,
+            &self.user_root.join("plugins"),
+            None,
+            CandidateKind::Tooling,
+            20,
+            true,
+            Some("global-plugin"),
+        );
+        self.add_file(
+            candidates,
+            self.user_root
+                .parent()
+                .unwrap_or(&self.user_root)
+                .join("antigravity-cli/settings.json"),
+            CandidateKind::Configuration,
+            None,
+            "user",
+            20,
+            false,
+            None,
+        );
+        self.add_directory(
+            candidates,
+            &self
+                .user_root
+                .parent()
+                .unwrap_or(&self.user_root)
+                .join("config/plugins"),
+            None,
+            CandidateKind::Tooling,
+            20,
+            true,
+            Some("global-plugin"),
+        );
+        for root in &self.project_roots {
+            let project_id = project_id(root);
+            self.add_directory(
+                candidates,
+                &root.join(".agents/plugins"),
+                project_id.clone(),
+                CandidateKind::Tooling,
+                40,
+                true,
+                Some("workspace-plugin"),
+            );
+            self.add_directory(
+                candidates,
+                &root.join("_agents/plugins"),
+                project_id,
+                CandidateKind::Tooling,
+                40,
+                true,
+                Some("workspace-plugin"),
             );
         }
     }
@@ -708,6 +796,43 @@ mod tests {
                 .projects
                 .iter()
                 .any(|project| project.display_name == "project")
+        );
+    }
+
+    #[test]
+    fn antigravity_fixture_discovers_knowledge_cli_settings_and_plugins() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/antigravity");
+        let adapter = FileProviderAdapter::new(
+            ANTIGRAVITY_PROVIDER_ID,
+            "Google Antigravity",
+            root.join(".gemini/antigravity"),
+            vec![root.join("project")],
+            ProviderFamily::Antigravity,
+        );
+        let batch = adapter.discover(host()).expect("Antigravity fixture");
+        assert!(
+            batch
+                .memory_records
+                .iter()
+                .any(|record| record.title == "team.md")
+        );
+        assert!(
+            batch
+                .config_layers
+                .iter()
+                .any(|layer| layer.source_reference.ends_with("settings.json"))
+        );
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|record| record.kind == "workspace-plugin")
+        );
+        assert!(
+            batch
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.content.contains("fixture-secret"))
         );
     }
 }

@@ -7,8 +7,8 @@ Status: aktywny plan implementacji; pierwszy działający increment został już
 Stan implementacji na 2026-07-17:
 
 - zrealizowane: Rust workspace, osobny macOS Agent, platformowy resolver endpointów z chronionym domyślnym Unix socket, macOS LaunchAgent installer/uninstaller, wspólny `amcp-core` catalog service dla UI/MCP/Controller, Codex discovery/redaction z incremental metadata cursor, central SQLite/FTS5, provider registry, normalized projects/sessions/session-items/memory/configuration/guidance, persisted collection cursors, bounded redacted collection outbox/replay, persisted deduplicated runtime events, local `notify`/FSEvents watcher with burst coalescing and safe relative paths, redacted embedded Codex session persistence, opt-in cited lexical RAG over redacted previews, signed nonce-based one-time approval replay store, proposal/apply/rollback z backupem i hash-conflict, MCP read/proposal/RAG-fallback gateway, Codex app-server client z UI bridge, TLS remote Agent transport, pairing/enrollment z rotowanym credentialem w Keychain, redacted Agent collection cache, watch/reconnect polling, register-capabilities-heartbeat handshake oraz Tauri/React shell z approval queue;
-- w toku: richer provider runtime operations, optional RAG retention/embedding providers, Antigravity parser, packaging/launchd hardening i cross-platform ports; authenticated event replay, bounded `SubscribeEvents` long-poll pages, bidirectional `OpenEventStream` with negotiated backpressure/heartbeats, post-persistence acknowledgements, central event-ID deduplication, local watcher events, modular file-backed Claude Code/Kiro adapters with fixtures, Controller-side metadata-only app-server session persistence, Agent-side opt-in Codex app-server thread connector with reconnect/backoff, bounded authenticated `RuntimeListThreads`, scoped human search/runtime activity UI, incremental FTS5 projections with bounded rebuilds, and lexical RAG retention purge are now in place;
-- następne: richer provider runtime operations, optional embedding providers, Antigravity parser fixtures and adapter, packaging/launchd hardening i cross-platform ports.
+- w toku: richer provider runtime operations, optional RAG retention/embedding providers, packaging/launchd hardening i cross-platform ports; authenticated event replay, bounded `SubscribeEvents` long-poll pages, bidirectional `OpenEventStream` with negotiated backpressure/heartbeats, post-persistence acknowledgements, central event-ID deduplication, local watcher events, modular file-backed Claude Code/Kiro/Antigravity adapters with fixtures, Controller-side metadata-only app-server session persistence, Agent-side opt-in Codex app-server thread connector with reconnect/backoff, bounded authenticated `RuntimeListThreads`, scoped human search/runtime activity UI, incremental FTS5 projections with bounded rebuilds, and lexical RAG retention purge are now in place;
+- następne: richer provider runtime operations, optional embedding providers, packaging/launchd hardening i cross-platform ports.
 
 Dokumenty referencyjne:
 
@@ -100,7 +100,7 @@ crates/
   amcp-protocol/        kontrakt Agent ↔ Controller
   amcp-provider-api/    provider trait, capability model, normalized artifacts
   amcp-codex/           Codex adapter i formaty Codex
-  amcp-file-providers/  file-backed Claude Code/Kiro adapters
+  amcp-file-providers/  file-backed Claude Code/Kiro/Antigravity adapters
   amcp-app-server/      klient Codex app-server, generated protocol types
   amcp-storage/         storage trait, migracje, transakcje
   amcp-index/           FTS5, projections, local index, search primitives
