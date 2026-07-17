@@ -5,8 +5,8 @@ use amcp_codex::{hash_bytes, redact_text};
 use amcp_core::CatalogService;
 use amcp_domain::{
     ArtifactRecord, ChangeSet, CollectionBatch, ConfigLayerRecord, GuidanceRecord, HostIdentity,
-    HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, ProviderRecord, RuntimeEvent, SessionItem,
-    SessionRecord,
+    HostRecord, MemoryRecord, ProjectRecord, ProviderDescriptor, ProviderRecord, RuntimeEvent,
+    SessionItem, SessionRecord,
 };
 use amcp_storage::SearchHit;
 use chrono::Utc;
@@ -60,6 +60,17 @@ fn list_sessions() -> Result<Vec<SessionRecord>, String> {
     CatalogService::open(database_path())
         .map_err(|error| error.to_string())?
         .list_sessions(None, None)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_session_items(
+    session_id: String,
+    host_id: Option<String>,
+) -> Result<Vec<SessionItem>, String> {
+    CatalogService::open(database_path())
+        .map_err(|error| error.to_string())?
+        .list_session_items(&session_id, host_id.as_deref())
         .map_err(|error| error.to_string())
 }
 
@@ -209,6 +220,14 @@ fn persist_embedded_session(
         .map_or(0, |sequence| sequence + 1);
     let prompt = bounded_redacted(prompt);
     let reply = bounded_redacted(reply_text);
+    let events = response
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(512)
+        .collect::<Vec<_>>();
     let session = SessionRecord {
         session_id: thread_id.to_owned(),
         host_id: host.host_id.clone(),
@@ -223,11 +242,15 @@ fn persist_embedded_session(
         archived: false,
         source_reference: format!("codex-app-server://thread/{thread_id}"),
         source_hash: hash_bytes(response.to_string().as_bytes()),
-        metadata_json: serde_json::json!({ "surface": "amcp-desktop", "thread_id": thread_id })
-            .to_string(),
+        metadata_json: serde_json::json!({
+            "surface": "amcp-desktop",
+            "thread_id": thread_id,
+            "app_server_event_count": events.len()
+        })
+        .to_string(),
         observed_at: now,
     };
-    let items = vec![
+    let mut items = vec![
         SessionItem {
             session_id: thread_id.to_owned(),
             host_id: host.host_id.clone(),
@@ -251,13 +274,43 @@ fn persist_embedded_session(
             observed_at: now,
         },
     ];
+    for (offset, event) in events.iter().enumerate() {
+        let method = event
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .take(96)
+            .collect::<String>();
+        items.push(SessionItem {
+            session_id: thread_id.to_owned(),
+            host_id: host.host_id.clone(),
+            provider_id: provider.id.clone(),
+            sequence: next_sequence + 2 + offset as i64,
+            role: Some("system".to_owned()),
+            item_kind: format!("app-server:{method}"),
+            content: None,
+            source_reference: session.source_reference.clone(),
+            observed_at: now,
+        });
+    }
+    let event_methods = events
+        .iter()
+        .filter_map(|event| event.get("method").and_then(serde_json::Value::as_str))
+        .take(64)
+        .collect::<Vec<_>>();
     let event = RuntimeEvent {
         event_id: amcp_domain::new_id("event"),
         host_id: host.host_id.clone(),
         provider_id: provider.id.clone(),
         event_type: "session.event".to_owned(),
         sequence: next_sequence,
-        payload_json: serde_json::json!({ "thread_id": thread_id, "items": 2 }).to_string(),
+        payload_json: serde_json::json!({
+            "thread_id": thread_id,
+            "items": items.len(),
+            "app_server_events": event_methods
+        })
+        .to_string(),
         occurred_at: now,
     };
     let batch = CollectionBatch {
@@ -300,7 +353,10 @@ mod tests {
             &database,
             "thread-test",
             "api_key=secret-prompt",
-            &serde_json::json!({ "text": "token=secret-reply" }),
+            &serde_json::json!({
+                "text": "token=secret-reply",
+                "events": [{ "method": "turn/completed", "status": "completed" }]
+            }),
             Some(Path::new("/tmp/project")),
         )
         .expect("persist embedded session");
@@ -312,12 +368,13 @@ mod tests {
         let items = catalog
             .list_session_items("thread-test", Some("controller-local"))
             .expect("items");
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| {
-            item.content
-                .as_deref()
-                .is_some_and(|content| !content.contains("secret"))
-        }));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].item_kind, "app-server:turn/completed");
+        assert!(items[2].content.is_none());
+        assert!(items
+            .iter()
+            .filter_map(|item| item.content.as_deref())
+            .all(|content| !content.contains("secret")));
         assert_eq!(
             catalog
                 .list_runtime_events(None, None, 10)
@@ -336,6 +393,7 @@ fn main() {
             list_changes,
             list_projects,
             list_sessions,
+            list_session_items,
             list_memory,
             list_config_layers,
             list_guidance,

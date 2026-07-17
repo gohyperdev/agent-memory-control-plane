@@ -45,11 +45,11 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - The macOS Agent runs a `notify`/FSEvents-backed watcher over the Codex root and emits bounded, path-relative `source.changed` events; sensitive `auth.json` paths are excluded and bursts are coalesced.
 - Codex discovery exposes a metadata cursor; unchanged collections are served from the Agent cache, while source changes trigger a fresh scan.
 - `amcp-mcp` is a stdio MCP gateway for embedded Codex with scoped redacted search, host/project/session/session-item/memory inventory, configuration-layer and guidance-chain tools, change review, and verified change-proposal tools. It never applies a change.
-- `amcp-app-server` supervises the documented Codex app-server stdio protocol and supports initialization, thread/turn start, streamed notifications, and interruption.
-- The app-server client also exposes thread list/read/archive/unarchive primitives for the next session explorer increment.
-- Embedded desktop Codex turns are persisted as bounded, redacted session items and `session.event` runtime events, while the native Codex state remains authoritative.
+- `amcp-app-server` supervises the documented Codex app-server stdio protocol, captures bounded notification summaries, and supports initialization, thread/turn start, streamed notifications, and interruption.
+- The app-server client also exposes thread list/read/archive/unarchive primitives; the desktop session explorer displays bounded session items and metadata-only event summaries.
+- Embedded desktop Codex turns are persisted as bounded, redacted session items and `session.event` runtime events, while delta/transcript payloads are excluded from event items and native Codex state remains authoritative.
 - `amcp-rag` defines the consent, citation, invalidation, and retrieval contract; its default implementation is disabled and lexical search remains the fallback.
-- Setting `AMCP_RAG_ENABLED=true` enables the bounded, cited lexical RAG manager over redacted FTS previews; embeddings remain a separate future provider and RAG stays disabled by default.
+- Setting `AMCP_RAG_ENABLED=true` enables the bounded, cited lexical RAG manager over redacted FTS previews; `AMCP_RAG_RETENTION_DAYS` purges expired chunks before retrieval, embeddings remain a separate future provider, and RAG stays disabled by default.
 - `amcp-core` exposes the shared functional catalog API used by the desktop UI, MCP gateway, and Controller; all surfaces therefore share scope and storage behavior.
 - Collection cursors are persisted only after a successful catalog transaction, allowing the Controller to resume per-host/provider collection safely.
 - `apps/amcp-desktop` is the Tauri 2 + React desktop shell. It renders host/index/approval status, search evidence, provenance, safe local sync, and the human approval action for proposed changes.

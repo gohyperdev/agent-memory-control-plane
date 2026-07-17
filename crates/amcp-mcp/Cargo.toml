@@ -12,6 +12,7 @@ amcp-domain = { path = "../amcp-domain" }
 amcp-storage = { path = "../amcp-storage" }
 amcp-rag = { path = "../amcp-rag" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

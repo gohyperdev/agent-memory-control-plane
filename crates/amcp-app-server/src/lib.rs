@@ -210,6 +210,7 @@ impl AppServerClient {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut answer = String::new();
+        let mut events = Vec::new();
         loop {
             let message = self.next_message().await?;
             let method = message
@@ -217,6 +218,9 @@ impl AppServerClient {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if events.len() < 512 {
+                events.push(summarize_notification(&message));
+            }
             if method == "item/agentMessage/delta" {
                 if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                     answer.push_str(delta);
@@ -236,6 +240,7 @@ impl AppServerClient {
                     return Ok(json!({
                         "turn": params.get("turn").cloned().unwrap_or(params),
                         "text": answer,
+                        "events": events,
                     }));
                 }
             }
@@ -283,6 +288,35 @@ impl AppServerClient {
     }
 }
 
+fn summarize_notification(message: &Value) -> Value {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let mut summary = serde_json::Map::new();
+    summary.insert("method".into(), Value::String(method.clone()));
+    for key in ["threadId", "turnId", "itemId", "status", "type"] {
+        if let Some(value) = params.get(key)
+            && (value.is_string() || value.is_number() || value.is_boolean())
+        {
+            summary.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(turn) = params.get("turn") {
+        for key in ["id", "status"] {
+            if let Some(value) = turn.get(key)
+                && (value.is_string() || value.is_number() || value.is_boolean())
+            {
+                summary.insert(format!("turn_{key}"), value.clone());
+            }
+        }
+    }
+    summary.insert("delta".into(), Value::Bool(method.ends_with("/delta")));
+    Value::Object(summary)
+}
+
 fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("JSON string is valid TOML basic string")
 }
@@ -326,5 +360,22 @@ mod tests {
         let list = json!({ "cursor": "next", "limit": 20 });
         assert_eq!(read["threadId"], "thr_123");
         assert_eq!(list["limit"], 20);
+    }
+
+    #[test]
+    fn notification_summary_excludes_transcript_payloads() {
+        let summary = summarize_notification(&json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "itemId": "item-1",
+                "delta": "secret transcript text",
+                "status": "in_progress"
+            }
+        }));
+        assert_eq!(summary["method"], "item/agentMessage/delta");
+        assert_eq!(summary["itemId"], "item-1");
+        assert_eq!(summary["delta"], true);
+        assert!(summary.get("params").is_none());
+        assert!(summary.get("text").is_none());
     }
 }

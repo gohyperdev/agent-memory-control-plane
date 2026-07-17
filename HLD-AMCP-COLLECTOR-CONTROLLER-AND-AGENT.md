@@ -396,9 +396,15 @@ The initial Codex adapter handles:
 - content hashes, source references, and change planning.
 
 The Controller-side embedded app-server bridge records bounded, redacted turn
-items as normalized `sessions`/`session_items` with a `session.event` runtime
-event. This is an AMCP observation only; the Codex thread and native rollout
-remain authoritative and can be re-read through the app-server or Agent.
+items and metadata-only app-server event summaries as normalized
+`sessions`/`session_items` with a `session.event` runtime event. Delta and
+transcript payloads are not copied into event items. This is an AMCP observation
+only; the Codex thread and native rollout remain authoritative and can be
+re-read through the app-server or Agent.
+
+RAG chunk retention is applied independently from native provider retention. A
+configured retention window purges derived chunks before retrieval; disabling or
+deleting RAG must not remove or mutate native provider state.
 
 The adapter emits one normalized configuration-layer record for each supported
 `config.toml`/profile source and one guidance record for each discovered

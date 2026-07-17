@@ -8,4 +8,5 @@ authors.workspace = true
 [dependencies]
 amcp-domain = { path = "../amcp-domain" }
 anyhow.workspace = true
+chrono.workspace = true
 serde.workspace = true

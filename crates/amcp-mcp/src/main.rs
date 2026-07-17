@@ -3,6 +3,7 @@ use amcp_domain::{LifecycleState, Scope};
 use amcp_platform::default_agent_socket_path;
 use amcp_rag::{DisabledRagManager, LexicalRagManager, RagConfig, RagDocument, RagManager};
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -421,6 +422,9 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                 let mut manager = LexicalRagManager::new(RagConfig {
                     enabled: true,
                     allowed_scopes,
+                    retention_days: env::var("AMCP_RAG_RETENTION_DAYS")
+                        .ok()
+                        .and_then(|value| value.parse::<u32>().ok()),
                     ..RagConfig::default()
                 });
                 let documents = hits
@@ -441,9 +445,14 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                     })
                     .collect::<Vec<_>>();
                 manager.index(&documents)?;
-                Ok(serde_json::to_value(
-                    manager.retrieve(query, &scope, limit)?,
-                )?)
+                let purged = manager.purge_expired(Utc::now())?;
+                let mut context = manager.retrieve(query, &scope, limit)?;
+                if purged > 0 {
+                    context.warning = Some(format!(
+                        "{purged} expired RAG chunks were purged before retrieval."
+                    ));
+                }
+                Ok(serde_json::to_value(context)?)
             } else {
                 let manager = DisabledRagManager::default();
                 Ok(serde_json::to_value(

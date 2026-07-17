@@ -1,5 +1,6 @@
 use amcp_domain::{LifecycleState, Scope, SensitivityClass};
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const RAG_POLICY_VERSION: &str = "amcp-rag-v1";
@@ -63,6 +64,9 @@ pub trait RagManager {
     fn index(&mut self, documents: &[RagDocument]) -> Result<usize>;
     fn retrieve(&self, query: &str, scope: &Scope, limit: usize) -> Result<RetrievalContext>;
     fn invalidate_source(&mut self, source_hash: &str) -> Result<usize>;
+    fn purge_expired(&mut self, _now: DateTime<Utc>) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +85,7 @@ struct IndexedChunk {
     sensitivity: SensitivityClass,
     lifecycle: LifecycleState,
     chunk_index: usize,
+    indexed_at: DateTime<Utc>,
 }
 
 /// A bounded, in-memory lexical retriever used when the user explicitly enables
@@ -120,6 +125,7 @@ impl RagManager for LexicalRagManager {
             return Ok(0);
         }
         let chunk_size = self.config.chunk_size.max(1);
+        let indexed_at = Utc::now();
         let mut indexed = 0;
         for document in documents {
             if !self.scope_allowed(&document.scope)
@@ -142,6 +148,7 @@ impl RagManager for LexicalRagManager {
                     sensitivity: document.sensitivity.clone(),
                     lifecycle: document.lifecycle.clone(),
                     chunk_index,
+                    indexed_at,
                 });
                 indexed += 1;
             }
@@ -204,6 +211,16 @@ impl RagManager for LexicalRagManager {
     fn invalidate_source(&mut self, source_hash: &str) -> Result<usize> {
         let before = self.chunks.len();
         self.chunks.retain(|chunk| chunk.source_hash != source_hash);
+        Ok(before - self.chunks.len())
+    }
+
+    fn purge_expired(&mut self, now: DateTime<Utc>) -> Result<usize> {
+        let Some(days) = self.config.retention_days else {
+            return Ok(0);
+        };
+        let cutoff = now - Duration::days(days as i64);
+        let before = self.chunks.len();
+        self.chunks.retain(|chunk| chunk.indexed_at >= cutoff);
         Ok(before - self.chunks.len())
     }
 }
@@ -301,5 +318,27 @@ mod tests {
                 .context
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn lexical_rag_purges_chunks_after_configured_retention() {
+        let mut manager = LexicalRagManager::new(RagConfig {
+            enabled: true,
+            retention_days: Some(0),
+            ..RagConfig::default()
+        });
+        manager
+            .index(&[RagDocument {
+                record_id: "artifact-ttl".into(),
+                scope: Scope::host("host-test"),
+                title: "memory".into(),
+                content: "short-lived context".into(),
+                source_reference: "/memory.md".into(),
+                source_hash: "ttl-hash".into(),
+                sensitivity: SensitivityClass::Internal,
+                lifecycle: LifecycleState::Active,
+            }])
+            .expect("index retained document");
+        assert_eq!(manager.purge_expired(Utc::now()).expect("purge"), 1);
     }
 }

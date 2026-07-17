@@ -123,6 +123,7 @@ dependencies = [
  "amcp-rag",
  "amcp-storage",
  "anyhow",
+ "chrono",
  "clap",
  "serde",
  "serde_json",
@@ -160,6 +161,7 @@ version = "0.1.0"
 dependencies = [
  "amcp-domain",
  "anyhow",
+ "chrono",
  "serde",
 ]
 
