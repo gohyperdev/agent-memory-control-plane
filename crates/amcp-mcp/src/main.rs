@@ -192,6 +192,30 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_config_layers_list",
+                "description": "List normalized Codex configuration layers with scope, profile and precedence. Content is read through cited artifacts.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "project_id": { "type": "string" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
+                "name": "amcp_guidance_chain_get",
+                "description": "List applicable AGENTS.md and AGENTS.override.md guidance in effective precedence order for a host or project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "project_id": { "type": "string" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_retrieve_context",
                 "description": "Retrieve optional RAG context. It is disabled by default and returns an explicit fallback warning with no uncited context.",
                 "inputSchema": {
@@ -295,6 +319,16 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
             let host_id = arguments.get("host_id").and_then(Value::as_str);
             let project_id = arguments.get("project_id").and_then(Value::as_str);
             Ok(json!({ "memory": catalog.list_memory_records(host_id, project_id)? }))
+        }
+        "amcp_config_layers_list" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            let project_id = arguments.get("project_id").and_then(Value::as_str);
+            Ok(json!({ "config_layers": catalog.list_config_layers(host_id, project_id)? }))
+        }
+        "amcp_guidance_chain_get" => {
+            let host_id = arguments.get("host_id").and_then(Value::as_str);
+            let project_id = arguments.get("project_id").and_then(Value::as_str);
+            Ok(json!({ "guidance": catalog.list_guidance(host_id, project_id)? }))
         }
         "amcp_retrieve_context" => {
             let query = arguments

@@ -1,6 +1,6 @@
 use amcp_domain::{
-    AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, MemoryRecord, ProjectRecord,
-    SessionRecord,
+    AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
+    MemoryRecord, ProjectRecord, SessionRecord,
 };
 use amcp_storage::{Catalog, SearchHit};
 use anyhow::Result;
@@ -59,6 +59,22 @@ impl CatalogService {
         self.catalog.list_memory_records(host_id, project_id)
     }
 
+    pub fn list_config_layers(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<ConfigLayerRecord>> {
+        self.catalog.list_config_layers(host_id, project_id)
+    }
+
+    pub fn list_guidance(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<GuidanceRecord>> {
+        self.catalog.list_guidance(host_id, project_id)
+    }
+
     pub fn list_change_sets(&self, status: Option<ChangeStatus>) -> Result<Vec<ChangeSet>> {
         self.catalog.list_change_sets(status)
     }
@@ -69,6 +85,21 @@ impl CatalogService {
 
     pub fn ingest(&mut self, batch: &CollectionBatch) -> Result<usize> {
         self.catalog.ingest(batch)
+    }
+
+    pub fn latest_cursor(&self, host_id: &str, provider_id: &str) -> Result<Option<String>> {
+        self.catalog.latest_cursor(host_id, provider_id)
+    }
+
+    pub fn save_cursor(
+        &mut self,
+        host_id: &str,
+        provider_id: &str,
+        cursor: Option<&str>,
+        collection_run_id: &str,
+    ) -> Result<()> {
+        self.catalog
+            .save_cursor(host_id, provider_id, cursor, collection_run_id)
     }
 
     pub fn save_change_set(&mut self, change_set: &ChangeSet) -> Result<()> {

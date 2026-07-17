@@ -1,6 +1,7 @@
 use amcp_domain::{
-    AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, HostIdentity, HostRecord, HostStatus,
-    MemoryRecord, ProjectRecord, SensitivityClass, SessionRecord,
+    AuditEvent, ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, GuidanceRecord,
+    HostIdentity, HostRecord, HostStatus, MemoryRecord, ProjectRecord, SensitivityClass,
+    SessionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -123,6 +124,42 @@ impl Catalog {
                 confidence REAL,
                 observed_at TEXT NOT NULL,
                 PRIMARY KEY (memory_record_id, host_id, provider_id)
+            );
+            CREATE TABLE IF NOT EXISTS config_layers (
+                config_layer_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                project_id TEXT,
+                source_reference TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                profile TEXT,
+                precedence_rank INTEGER NOT NULL,
+                source_hash TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (config_layer_id, host_id, provider_id),
+                FOREIGN KEY (host_id) REFERENCES hosts(host_id)
+            );
+            CREATE TABLE IF NOT EXISTS guidance_records (
+                guidance_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                project_id TEXT,
+                source_reference TEXT NOT NULL,
+                relative_scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                precedence_rank INTEGER NOT NULL,
+                source_hash TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (guidance_id, host_id, provider_id),
+                FOREIGN KEY (host_id) REFERENCES hosts(host_id)
+            );
+            CREATE TABLE IF NOT EXISTS guidance_edges (
+                lower_guidance_id TEXT NOT NULL,
+                higher_guidance_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                PRIMARY KEY (lower_guidance_id, higher_guidance_id, host_id, provider_id)
             );
             CREATE TABLE IF NOT EXISTS artifacts (
                 artifact_id TEXT PRIMARY KEY,
@@ -334,6 +371,60 @@ impl Catalog {
                     serde_json::to_string(&memory.lifecycle)?,
                     memory.confidence,
                     memory.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        for layer in &batch.config_layers {
+            transaction.execute(
+                "INSERT INTO config_layers(config_layer_id, host_id, provider_id, project_id, source_reference, scope, profile, precedence_rank, source_hash, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(config_layer_id, host_id, provider_id) DO UPDATE SET project_id=excluded.project_id, source_reference=excluded.source_reference, scope=excluded.scope, profile=excluded.profile, precedence_rank=excluded.precedence_rank, source_hash=excluded.source_hash, observed_at=excluded.observed_at",
+                params![
+                    layer.config_layer_id,
+                    layer.host_id,
+                    layer.provider_id,
+                    layer.project_id,
+                    layer.source_reference,
+                    layer.scope,
+                    layer.profile,
+                    layer.precedence_rank,
+                    layer.source_hash,
+                    layer.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        for guidance in &batch.guidance_records {
+            transaction.execute(
+                "INSERT INTO guidance_records(guidance_id, host_id, provider_id, project_id, source_reference, relative_scope, kind, precedence_rank, source_hash, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(guidance_id, host_id, provider_id) DO UPDATE SET project_id=excluded.project_id, source_reference=excluded.source_reference, relative_scope=excluded.relative_scope, kind=excluded.kind, precedence_rank=excluded.precedence_rank, source_hash=excluded.source_hash, observed_at=excluded.observed_at",
+                params![
+                    guidance.guidance_id,
+                    guidance.host_id,
+                    guidance.provider_id,
+                    guidance.project_id,
+                    guidance.source_reference,
+                    guidance.relative_scope,
+                    guidance.kind,
+                    guidance.precedence_rank,
+                    guidance.source_hash,
+                    guidance.observed_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        for edge in &batch.guidance_edges {
+            transaction.execute(
+                "INSERT INTO guidance_edges(lower_guidance_id, higher_guidance_id, relation, host_id, provider_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(lower_guidance_id, higher_guidance_id, host_id, provider_id) DO UPDATE SET relation=excluded.relation",
+                params![
+                    edge.lower_guidance_id,
+                    edge.higher_guidance_id,
+                    edge.relation,
+                    edge.host_id,
+                    edge.provider_id,
                 ],
             )?;
         }
@@ -574,6 +665,62 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn list_config_layers(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<ConfigLayerRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT config_layer_id, host_id, provider_id, project_id, source_reference, scope, profile, precedence_rank, source_hash, observed_at
+             FROM config_layers WHERE (?1 IS NULL OR host_id = ?1) AND (?2 IS NULL OR project_id = ?2)
+             ORDER BY precedence_rank, source_reference",
+        )?;
+        let rows = statement.query_map(params![host_id, project_id], |row| {
+            let observed_at: String = row.get(9)?;
+            Ok(ConfigLayerRecord {
+                config_layer_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                project_id: row.get(3)?,
+                source_reference: row.get(4)?,
+                scope: row.get(5)?,
+                profile: row.get(6)?,
+                precedence_rank: row.get(7)?,
+                source_hash: row.get(8)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_guidance(
+        &self,
+        host_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<GuidanceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT guidance_id, host_id, provider_id, project_id, source_reference, relative_scope, kind, precedence_rank, source_hash, observed_at
+             FROM guidance_records WHERE (?1 IS NULL OR host_id = ?1) AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL)
+             ORDER BY precedence_rank, source_reference",
+        )?;
+        let rows = statement.query_map(params![host_id, project_id], |row| {
+            let observed_at: String = row.get(9)?;
+            Ok(GuidanceRecord {
+                guidance_id: row.get(0)?,
+                host_id: row.get(1)?,
+                provider_id: row.get(2)?,
+                project_id: row.get(3)?,
+                source_reference: row.get(4)?,
+                relative_scope: row.get(5)?,
+                kind: row.get(6)?,
+                precedence_rank: row.get(7)?,
+                source_hash: row.get(8)?,
+                observed_at: parse_utc(&observed_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn latest_cursor(&self, host_id: &str, provider_id: &str) -> Result<Option<String>> {
         Ok(self
             .connection
@@ -584,6 +731,22 @@ impl Catalog {
             )
             .optional()?
             .flatten())
+    }
+
+    pub fn save_cursor(
+        &mut self,
+        host_id: &str,
+        provider_id: &str,
+        cursor: Option<&str>,
+        collection_run_id: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO collection_cursors(host_id, provider_id, cursor, collection_run_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(host_id, provider_id) DO UPDATE SET cursor=excluded.cursor, collection_run_id=excluded.collection_run_id, updated_at=excluded.updated_at",
+            params![host_id, provider_id, cursor, collection_run_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub fn save_change_set(&mut self, change_set: &ChangeSet) -> Result<()> {
@@ -777,9 +940,9 @@ fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use amcp_domain::{
-        ArtifactKind, ArtifactRecord, EvidenceSnapshot, HostIdentity, LifecycleState, MemoryRecord,
-        ObservationState, ProjectRecord, ProviderDescriptor, SessionRecord, SourceObservation,
-        new_id,
+        ArtifactKind, ArtifactRecord, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
+        GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState,
+        ProjectRecord, ProviderDescriptor, SessionRecord, SourceObservation, new_id,
     };
 
     fn batch() -> CollectionBatch {
@@ -857,6 +1020,37 @@ mod tests {
                 confidence: Some(0.9),
                 observed_at: now,
             }],
+            config_layers: vec![ConfigLayerRecord {
+                config_layer_id: "config-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                project_id: None,
+                source_reference: "/tmp/config.toml".into(),
+                scope: "user".into(),
+                profile: None,
+                precedence_rank: 20,
+                source_hash: "config-hash".into(),
+                observed_at: now,
+            }],
+            guidance_records: vec![GuidanceRecord {
+                guidance_id: "guidance-test".into(),
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                project_id: Some("/tmp/project".into()),
+                source_reference: "/tmp/project/AGENTS.md".into(),
+                relative_scope: "AGENTS.md".into(),
+                kind: "agents".into(),
+                precedence_rank: 40,
+                source_hash: "guidance-hash".into(),
+                observed_at: now,
+            }],
+            guidance_edges: vec![GuidanceEdge {
+                host_id: "host_test".into(),
+                provider_id: "codex".into(),
+                lower_guidance_id: "guidance-test".into(),
+                higher_guidance_id: "guidance-test".into(),
+                relation: "more_specific".into(),
+            }],
             artifacts: vec![ArtifactRecord {
                 artifact_id: new_id("artifact"),
                 host_id: "host_test".into(),
@@ -893,6 +1087,17 @@ mod tests {
         assert_eq!(catalog.search("sandbox", 10).expect("search").len(), 1);
         assert_eq!(catalog.list_projects(None).expect("projects").len(), 1);
         assert_eq!(
+            catalog
+                .list_config_layers(None, None)
+                .expect("config")
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog.list_guidance(None, None).expect("guidance").len(),
+            1
+        );
+        assert_eq!(
             catalog.list_sessions(None, None).expect("sessions").len(),
             1
         );
@@ -915,6 +1120,13 @@ mod tests {
         assert_eq!(
             catalog.latest_cursor("host_test", "codex").expect("cursor"),
             None
+        );
+        catalog
+            .save_cursor("host_test", "codex", Some("run-cursor"), "run")
+            .expect("save cursor");
+        assert_eq!(
+            catalog.latest_cursor("host_test", "codex").expect("cursor"),
+            Some("run-cursor".into())
         );
     }
 

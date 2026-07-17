@@ -1,8 +1,8 @@
 use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
-    ChangeSet, ChangeStatus, CollectionBatch, EvidenceSnapshot, HostIdentity, LifecycleState,
-    MemoryRecord, ObservationState, ProjectRecord, ProviderDescriptor, SensitivityClass,
-    SessionRecord, SourceObservation, new_id,
+    ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
+    GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
+    ProviderDescriptor, SensitivityClass, SessionRecord, SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -74,6 +74,8 @@ impl CodexAdapter {
         let mut projects = Vec::new();
         let mut sessions = Vec::new();
         let mut memory_records = Vec::new();
+        let mut config_layers = Vec::new();
+        let mut guidance_records = Vec::new();
         let mut roots = vec![self.codex_home.clone()];
         roots.extend(self.scan_roots.iter().cloned());
 
@@ -89,6 +91,8 @@ impl CodexAdapter {
                 &mut projects,
                 &mut sessions,
                 &mut memory_records,
+                &mut config_layers,
+                &mut guidance_records,
             )?;
         }
 
@@ -102,6 +106,15 @@ impl CodexAdapter {
             })
         });
         sessions.dedup_by(|left, right| left.session_id == right.session_id);
+        config_layers.sort_by(|left, right| left.source_reference.cmp(&right.source_reference));
+        config_layers.dedup_by(|left, right| left.source_reference == right.source_reference);
+        guidance_records.sort_by(|left, right| {
+            left.source_reference
+                .cmp(&right.source_reference)
+                .then(left.precedence_rank.cmp(&right.precedence_rank))
+        });
+        guidance_records.dedup_by(|left, right| left.source_reference == right.source_reference);
+        let guidance_edges = self.guidance_edges(&guidance_records, &projects);
 
         Ok(CollectionBatch {
             collection_run_id,
@@ -111,6 +124,9 @@ impl CodexAdapter {
             sessions,
             session_items: Vec::new(),
             memory_records,
+            config_layers,
+            guidance_records,
+            guidance_edges,
             artifacts,
             next_cursor: None,
         })
@@ -408,6 +424,8 @@ impl CodexAdapter {
         projects: &mut Vec<ProjectRecord>,
         sessions: &mut Vec<SessionRecord>,
         memory_records: &mut Vec<MemoryRecord>,
+        config_layers: &mut Vec<ConfigLayerRecord>,
+        guidance_records: &mut Vec<GuidanceRecord>,
     ) -> io::Result<()> {
         let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         self.discover_projects(&root, host, projects)?;
@@ -433,6 +451,16 @@ impl CodexAdapter {
                 )?);
                 if kind == ArtifactKind::Session && relative != "history.jsonl" {
                     self.discover_session_file(&path, host, sessions)?;
+                }
+                if kind == ArtifactKind::Configuration && relative != "projects.toml" {
+                    if let Ok(layer) = self.config_layer(&path, host) {
+                        config_layers.push(layer);
+                    }
+                }
+                if kind == ArtifactKind::Instruction {
+                    if let Ok(guidance) = self.guidance_record(&path, host) {
+                        guidance_records.push(guidance);
+                    }
                 }
             }
         }
@@ -493,6 +521,13 @@ impl CodexAdapter {
                     collection_run_id,
                     true,
                 )?);
+                if name == "config.toml" {
+                    if let Ok(layer) = self.config_layer(entry.path(), host) {
+                        config_layers.push(layer);
+                    }
+                } else if let Ok(guidance) = self.guidance_record(entry.path(), host) {
+                    guidance_records.push(guidance);
+                }
             }
         }
 
@@ -821,6 +856,143 @@ impl CodexAdapter {
             .find(|root| path.starts_with(root))
             .map(|root| root.to_string_lossy().into_owned())
     }
+
+    fn config_layer(&self, path: &Path, host: &HostIdentity) -> io::Result<ConfigLayerRecord> {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml");
+        let (scope, profile, precedence_rank, project_id) = if path
+            == codex_home.join("config.toml")
+        {
+            ("user".to_owned(), None, 20, None)
+        } else if path.parent() == Some(codex_home.as_path()) && file_name.ends_with(".config.toml")
+        {
+            (
+                "profile".to_owned(),
+                file_name.strip_suffix(".config.toml").map(str::to_owned),
+                30,
+                None,
+            )
+        } else if let Some(project_id) = self.project_id_for(&path) {
+            let project_root = PathBuf::from(&project_id);
+            let relative = path.strip_prefix(&project_root).unwrap_or(&path);
+            let is_project =
+                relative == Path::new("config.toml") || relative == Path::new(".codex/config.toml");
+            (
+                if is_project { "project" } else { "directory" }.to_owned(),
+                None,
+                40 + if is_project {
+                    0
+                } else {
+                    relative.components().count() as i32
+                },
+                Some(project_id),
+            )
+        } else {
+            ("system".to_owned(), None, 10, None)
+        };
+        let bytes = fs::read(&path)?;
+        Ok(ConfigLayerRecord {
+            config_layer_id: format!("config_{}", hash_bytes(path.to_string_lossy().as_bytes())),
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            project_id,
+            source_reference: path.to_string_lossy().into_owned(),
+            scope,
+            profile,
+            precedence_rank,
+            source_hash: hash_bytes(&bytes),
+            observed_at: Utc::now(),
+        })
+    }
+
+    fn guidance_record(&self, path: &Path, host: &HostIdentity) -> io::Result<GuidanceRecord> {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        let project_id = self.project_id_for(&path);
+        let relative_scope = project_id
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .or_else(|| path.strip_prefix(&codex_home).ok())
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let depth = relative_scope.matches(std::path::MAIN_SEPARATOR).count() as i32;
+        let base_rank = if project_id.is_some() { 40 } else { 20 } + depth;
+        let kind = if path.file_name().and_then(|name| name.to_str()) == Some("AGENTS.override.md")
+        {
+            "override"
+        } else {
+            "agents"
+        };
+        let bytes = fs::read(&path)?;
+        Ok(GuidanceRecord {
+            guidance_id: format!("guidance_{}", hash_bytes(path.to_string_lossy().as_bytes())),
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.to_owned(),
+            project_id,
+            source_reference: path.to_string_lossy().into_owned(),
+            relative_scope,
+            kind: kind.to_owned(),
+            precedence_rank: base_rank + i32::from(kind == "override"),
+            source_hash: hash_bytes(&bytes),
+            observed_at: Utc::now(),
+        })
+    }
+
+    fn guidance_edges(
+        &self,
+        records: &[GuidanceRecord],
+        projects: &[ProjectRecord],
+    ) -> Vec<GuidanceEdge> {
+        let mut edges = Vec::new();
+        let mut scopes = vec![None];
+        scopes.extend(
+            projects
+                .iter()
+                .map(|project| Some(project.project_id.clone())),
+        );
+        for project_id in scopes {
+            let mut applicable = records
+                .iter()
+                .filter(|record| record.project_id.is_none() || record.project_id == project_id)
+                .collect::<Vec<_>>();
+            applicable.sort_by(|left, right| {
+                left.precedence_rank
+                    .cmp(&right.precedence_rank)
+                    .then(left.source_reference.cmp(&right.source_reference))
+            });
+            for pair in applicable.windows(2) {
+                edges.push(GuidanceEdge {
+                    host_id: records[0].host_id.clone(),
+                    provider_id: records[0].provider_id.clone(),
+                    lower_guidance_id: pair[0].guidance_id.clone(),
+                    higher_guidance_id: pair[1].guidance_id.clone(),
+                    relation: if pair[1].kind == "override" {
+                        "overrides"
+                    } else {
+                        "more_specific"
+                    }
+                    .to_owned(),
+                });
+            }
+        }
+        edges.sort_by(|left, right| {
+            left.lower_guidance_id
+                .cmp(&right.lower_guidance_id)
+                .then(left.higher_guidance_id.cmp(&right.higher_guidance_id))
+        });
+        edges.dedup_by(|left, right| {
+            left.lower_guidance_id == right.lower_guidance_id
+                && left.higher_guidance_id == right.higher_guidance_id
+        });
+        edges
+    }
 }
 
 impl ProviderAdapter for CodexAdapter {
@@ -989,6 +1161,22 @@ mod tests {
             .expect("fixture should be readable");
 
         assert_eq!(batch.artifacts.len(), 9);
+        assert_eq!(batch.config_layers.len(), 1);
+        assert_eq!(batch.config_layers[0].scope, "user");
+        assert_eq!(batch.guidance_records.len(), 3);
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|item| item.precedence_rank == 20)
+        );
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|item| item.precedence_rank == 21 && item.kind == "override")
+        );
+        assert!(!batch.guidance_edges.is_empty());
         assert!(
             batch
                 .projects

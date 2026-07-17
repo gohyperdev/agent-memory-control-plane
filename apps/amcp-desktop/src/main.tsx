@@ -55,12 +55,29 @@ type Memory = {
   source_reference: string;
 };
 
+type ConfigLayer = {
+  config_layer_id: string;
+  source_reference: string;
+  scope: string;
+  profile?: string;
+  precedence_rank: number;
+};
+
+type Guidance = {
+  guidance_id: string;
+  source_reference: string;
+  kind: string;
+  precedence_rank: number;
+};
+
 function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [changes, setChanges] = useState<ChangeSet[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [memories, setMemories] = useState<Memory[]>([]);
+  const [configLayers, setConfigLayers] = useState<ConfigLayer[]>([]);
+  const [guidance, setGuidance] = useState<Guidance[]>([]);
   const [query, setQuery] = useState("sandbox");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [selected, setSelected] = useState<SearchHit | null>(null);
@@ -79,13 +96,17 @@ function App() {
       invoke<Project[]>("list_projects"),
       invoke<Session[]>("list_sessions"),
       invoke<Memory[]>("list_memory"),
+      invoke<ConfigLayer[]>("list_config_layers"),
+      invoke<Guidance[]>("list_guidance"),
     ])
-      .then(([nextHosts, nextChanges, nextProjects, nextSessions, nextMemories]) => {
+      .then(([nextHosts, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance]) => {
         setHosts(nextHosts);
         setChanges(nextChanges);
         setProjects(nextProjects);
         setSessions(nextSessions);
         setMemories(nextMemories);
+        setConfigLayers(nextConfigLayers);
+        setGuidance(nextGuidance);
       })
       .catch((reason) => setError(String(reason)));
   }, []);
@@ -108,18 +129,22 @@ function App() {
       setSyncing(true);
       setError(null);
       await invoke("collect_local");
-      const [nextHosts, nextChanges, nextProjects, nextSessions, nextMemories] = await Promise.all([
+      const [nextHosts, nextChanges, nextProjects, nextSessions, nextMemories, nextConfigLayers, nextGuidance] = await Promise.all([
         invoke<Host[]>("list_hosts"),
         invoke<ChangeSet[]>("list_changes"),
         invoke<Project[]>("list_projects"),
         invoke<Session[]>("list_sessions"),
         invoke<Memory[]>("list_memory"),
+        invoke<ConfigLayer[]>("list_config_layers"),
+        invoke<Guidance[]>("list_guidance"),
       ]);
       setHosts(nextHosts);
       setChanges(nextChanges);
       setProjects(nextProjects);
       setSessions(nextSessions);
       setMemories(nextMemories);
+      setConfigLayers(nextConfigLayers);
+      setGuidance(nextGuidance);
       await search();
     } catch (reason) {
       setError(String(reason));
@@ -163,8 +188,8 @@ function App() {
     ["System map", "⌘"],
     ["Hosts", String(hosts.length)],
     ["Projects", String(projects.length)],
-    ["Configuration", "9"],
-    ["Guidance", "24"],
+    ["Configuration", String(configLayers.length)],
+    ["Guidance", String(guidance.length)],
     ["Memories", String(memories.length)],
     ["Sessions", String(sessions.length)],
     ["Changes", String(changes.filter((change) => change.status === "Proposed").length)],
@@ -194,7 +219,7 @@ function App() {
         <section className="content">
           <div className="status-row">
             <div className="status-card"><span className="status-icon violet">⌁</span><div><small>Connected hosts</small><strong>{connectedHosts.length || hosts.length || 0}<span> / {hosts.length || 1}</span></strong></div><span className="trend">↗ healthy</span></div>
-            <div className="status-card"><span className="status-icon blue">⌂</span><div><small>Indexed artifacts</small><strong>{projects.length + sessions.length + memories.length || "—"}</strong></div><span className="muted">normalized catalog</span></div>
+            <div className="status-card"><span className="status-icon blue">⌂</span><div><small>Indexed artifacts</small><strong>{projects.length + sessions.length + memories.length + configLayers.length + guidance.length || "—"}</strong></div><span className="muted">normalized catalog</span></div>
             <div className="status-card"><span className="status-icon orange">◈</span><div><small>Pending approval</small><strong>{changes.filter((change) => change.status === "Proposed").length}</strong></div><span className="muted">review required</span></div>
           </div>
 
@@ -233,6 +258,8 @@ function App() {
           <section className="inventory-section">
             <div className="section-heading"><div><span className="eyebrow">Normalized catalog</span><h2>Projects, memories, sessions</h2></div><span className="scope-pill">Source-linked records</span></div>
             <div className="inventory-grid">
+              <div className="inventory-card"><div className="inventory-card-head"><strong>Configuration</strong><span>{configLayers.length}</span></div>{configLayers.slice(0, 4).map((layer) => <div className="inventory-item" key={layer.config_layer_id}><span className="inventory-symbol">⚙</span><div><strong>{layer.profile ?? layer.scope}</strong><small>precedence {layer.precedence_rank} · {layer.source_reference}</small></div></div>)}{!configLayers.length && <div className="change-empty">No normalized config layers yet.</div>}</div>
+              <div className="inventory-card"><div className="inventory-card-head"><strong>Guidance chain</strong><span>{guidance.length}</span></div>{guidance.slice(0, 4).map((item) => <div className="inventory-item" key={item.guidance_id}><span className="inventory-symbol">☷</span><div><strong>{item.kind}</strong><small>precedence {item.precedence_rank} · {item.source_reference}</small></div></div>)}{!guidance.length && <div className="change-empty">No AGENTS guidance discovered yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Projects</strong><span>{projects.length}</span></div>{projects.slice(0, 4).map((project) => <div className="inventory-item" key={project.project_id}><span className="inventory-symbol">◈</span><div><strong>{project.display_name}</strong><small>{project.trust_level ?? "trust unknown"} · {project.root_path}</small></div></div>)}{!projects.length && <div className="change-empty">No normalized projects yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Memories</strong><span>{memories.length}</span></div>{memories.slice(0, 4).map((memory) => <div className="inventory-item" key={memory.memory_record_id}><span className="inventory-symbol">✦</span><div><strong>{memory.title}</strong><small>{memory.lifecycle} · {memory.source_reference}</small></div></div>)}{!memories.length && <div className="change-empty">No normalized memories yet.</div>}</div>
               <div className="inventory-card"><div className="inventory-card-head"><strong>Sessions</strong><span>{sessions.length}</span></div>{sessions.slice(0, 4).map((session) => <div className="inventory-item" key={session.session_id}><span className="inventory-symbol">◌</span><div><strong>{session.title ?? session.session_id}</strong><small>{session.model ?? "model unknown"} · {session.archived ? "archived" : "active"}</small></div></div>)}{!sessions.length && <div className="change-empty">No normalized sessions yet.</div>}</div>

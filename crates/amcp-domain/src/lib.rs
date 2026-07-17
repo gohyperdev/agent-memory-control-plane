@@ -10,6 +10,8 @@ pub type ProjectId = String;
 pub type ArtifactId = String;
 pub type ObservationId = String;
 pub type EvidenceId = String;
+pub type ConfigLayerId = String;
+pub type GuidanceId = String;
 pub type ChangeSetId = String;
 pub type ChangeOperationId = String;
 pub type ApprovalId = String;
@@ -385,6 +387,43 @@ pub struct MemoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigLayerRecord {
+    pub config_layer_id: ConfigLayerId,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub project_id: Option<ProjectId>,
+    pub source_reference: String,
+    pub scope: String,
+    pub profile: Option<String>,
+    pub precedence_rank: i32,
+    pub source_hash: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidanceRecord {
+    pub guidance_id: GuidanceId,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub project_id: Option<ProjectId>,
+    pub source_reference: String,
+    pub relative_scope: String,
+    pub kind: String,
+    pub precedence_rank: i32,
+    pub source_hash: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuidanceEdge {
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub lower_guidance_id: GuidanceId,
+    pub higher_guidance_id: GuidanceId,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
@@ -414,6 +453,12 @@ pub struct CollectionBatch {
     pub session_items: Vec<SessionItem>,
     #[serde(default)]
     pub memory_records: Vec<MemoryRecord>,
+    #[serde(default)]
+    pub config_layers: Vec<ConfigLayerRecord>,
+    #[serde(default)]
+    pub guidance_records: Vec<GuidanceRecord>,
+    #[serde(default)]
+    pub guidance_edges: Vec<GuidanceEdge>,
     pub artifacts: Vec<ArtifactRecord>,
     pub next_cursor: Option<String>,
 }

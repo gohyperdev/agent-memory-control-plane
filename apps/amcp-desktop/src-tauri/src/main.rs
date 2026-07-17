@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use amcp_domain::{ChangeSet, HostRecord, MemoryRecord, ProjectRecord, SessionRecord};
+use amcp_domain::{ChangeSet, ConfigLayerRecord, GuidanceRecord, HostRecord, MemoryRecord, ProjectRecord, SessionRecord};
 use amcp_app_server::AppServerClient;
 use amcp_core::CatalogService;
 use amcp_storage::SearchHit;
@@ -54,6 +54,22 @@ fn list_memory() -> Result<Vec<MemoryRecord>, String> {
     CatalogService::open(database_path())
         .map_err(|error| error.to_string())?
         .list_memory_records(None, None)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_config_layers() -> Result<Vec<ConfigLayerRecord>, String> {
+    CatalogService::open(database_path())
+        .map_err(|error| error.to_string())?
+        .list_config_layers(None, None)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_guidance() -> Result<Vec<GuidanceRecord>, String> {
+    CatalogService::open(database_path())
+        .map_err(|error| error.to_string())?
+        .list_guidance(None, None)
         .map_err(|error| error.to_string())
 }
 
@@ -137,6 +153,8 @@ fn main() {
             list_projects,
             list_sessions,
             list_memory,
+            list_config_layers,
+            list_guidance,
             search_catalog,
             collect_local,
             approve_change,

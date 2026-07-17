@@ -480,6 +480,8 @@ async fn run_once(
     let mut client = AgentClient::new(stream);
     let (registered_host, agent_version, capabilities) =
         register_and_refresh(&mut client, &token).await?;
+    let mut catalog = Catalog::open(&db)?;
+    let cursor = catalog.latest_cursor(&registered_host.host_id, "codex")?;
     let batch = match client
         .request(
             RequestMethod::Collect {
@@ -488,7 +490,7 @@ async fn run_once(
                 } else {
                     Some(Scope::host(host_id_from_env()))
                 },
-                cursor: None,
+                cursor,
             },
             &token,
         )
@@ -498,7 +500,6 @@ async fn run_once(
         other => bail!("Agent returned unexpected collection response: {other:?}"),
     };
 
-    let mut catalog = Catalog::open(&db)?;
     let endpoint = agent_url
         .clone()
         .unwrap_or_else(|| format!("unix://{}", socket.display()));
@@ -509,6 +510,15 @@ async fn run_once(
         &capabilities,
     )?;
     let inserted = catalog.ingest(&batch)?;
+    catalog.save_cursor(
+        &batch.host.host_id,
+        "codex",
+        batch
+            .next_cursor
+            .as_deref()
+            .or(Some(batch.collection_run_id.as_str())),
+        &batch.collection_run_id,
+    )?;
     let search_results = query
         .as_deref()
         .map(|value| catalog.search(value, 20))

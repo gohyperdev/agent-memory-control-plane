@@ -199,6 +199,9 @@ The storage interface must be abstracted so a future central server can use Post
 hosts
 providers
 projects
+config_layers
+guidance_records
+guidance_edges
 artifacts
 documents
 document_versions
@@ -232,6 +235,13 @@ session 1---N session_item
 artifact 1---N search_content
 search_content 1---N search_chunk
 search_chunk 0---1 embedding
+
+Configuration and guidance are stored as normalized metadata over the source-linked
+artifact records. `config_layers.precedence_rank` makes the effective configuration
+order explicit (system, user, profile, project, then more-specific directory scope).
+`guidance_edges` links lower-precedence guidance to the higher-precedence or
+`AGENTS.override.md` record that supersedes it. The native files remain authoritative;
+these tables are rebuildable projections.
 ```
 
 ### 7.4 Collection coordinator
@@ -380,6 +390,12 @@ The initial Codex adapter handles:
 - MCP, hooks, rules, skills, and safe configuration metadata;
 - Codex app-server connection and thread events;
 - content hashes, source references, and change planning.
+
+The adapter emits one normalized configuration-layer record for each supported
+`config.toml`/profile source and one guidance record for each discovered
+`AGENTS.md` or `AGENTS.override.md`. A collection batch also includes the
+provider-neutral guidance edges, allowing the Controller, UI, and MCP gateway to
+render the same effective chain without re-reading the host filesystem.
 
 The adapter must treat unsupported/private schemas as inventory-only or read-only and must not rewrite them speculatively.
 
