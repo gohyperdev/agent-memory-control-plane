@@ -1,6 +1,6 @@
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
-    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, Scope,
+    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord, Scope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -48,6 +48,12 @@ pub enum RequestMethod {
         after_event_id: Option<String>,
         limit: usize,
         wait_ms: u64,
+    },
+    RuntimeListThreads {
+        provider_id: String,
+        scope: Option<Scope>,
+        cursor: Option<String>,
+        limit: usize,
     },
     AckEvents {
         event_ids: Vec<String>,
@@ -113,6 +119,11 @@ pub enum ResponsePayload {
         events: Vec<RuntimeEvent>,
         next_event_id: Option<String>,
         timed_out: bool,
+    },
+    RuntimeThreadPage {
+        provider_id: String,
+        threads: Vec<RuntimeThreadRecord>,
+        next_cursor: Option<String>,
     },
     RuntimeEventsAcked(usize),
     Artifact(ArtifactRecord),
@@ -269,6 +280,31 @@ mod tests {
                 limit: 16,
                 wait_ms: 250
             }
+        ));
+    }
+
+    #[test]
+    fn runtime_thread_request_round_trip_preserves_scope_and_pagination() {
+        let request = RequestEnvelope::new(
+            RequestMethod::RuntimeListThreads {
+                provider_id: "codex".into(),
+                scope: Some(Scope::host("host-runtime")),
+                cursor: Some("page-2".into()),
+                limit: 32,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode runtime request"))
+                .expect("decode runtime request");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::RuntimeListThreads {
+                provider_id,
+                scope: Some(Scope { host_id: Some(host_id), .. }),
+                cursor: Some(cursor),
+                limit: 32
+            } if provider_id == "codex" && host_id == "host-runtime" && cursor == "page-2"
         ));
     }
 }

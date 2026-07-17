@@ -4,8 +4,8 @@ use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
     GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
-    ProviderDescriptor, RuntimeEvent, SensitivityClass, SessionItem, SessionRecord,
-    SourceObservation, new_id, stable_runtime_event_id,
+    ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord, SensitivityClass, SessionItem,
+    SessionRecord, SourceObservation, new_id, stable_runtime_event_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Result, bail};
@@ -1173,6 +1173,56 @@ impl ProviderAdapter for CodexAdapter {
         sequence: &mut i64,
     ) -> Result<Option<RuntimeEvent>> {
         codex_runtime_event_from_thread(host, thread, sequence)
+    }
+
+    fn map_runtime_thread_record(
+        &self,
+        host: &HostIdentity,
+        thread: &serde_json::Value,
+    ) -> Result<Option<RuntimeThreadRecord>> {
+        let mut sequence = 0;
+        let Some(event) = codex_runtime_event_from_thread(host, thread, &mut sequence)? else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json)?;
+        Ok(Some(RuntimeThreadRecord {
+            thread_id: payload
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.into(),
+            title: payload
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            cwd: payload
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            model: payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            status: payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            archived: payload
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            source_reference: format!(
+                "codex://thread/{}",
+                payload
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .replace('/', "%2F")
+            ),
+            observed_at: event.occurred_at,
+        }))
     }
 
     fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord> {

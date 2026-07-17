@@ -490,11 +490,21 @@ async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
             .context("accept Controller connection")?;
         let auth = auth.clone();
         let codex_home = args.codex_home.clone();
+        let codex_bin = args.codex_bin.clone();
+        let runtime_cwd = args.runtime_cwd.clone();
         let backup_dir = default_backup_dir();
         let state_dir = default_state_dir();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_connection(stream, auth, codex_home, backup_dir, state_dir).await
+            if let Err(error) = handle_connection(
+                stream,
+                auth,
+                codex_home,
+                codex_bin,
+                runtime_cwd,
+                backup_dir,
+                state_dir,
+            )
+            .await
             {
                 eprintln!("AMCP Agent connection error: {error:#}");
             }
@@ -522,13 +532,23 @@ async fn serve_tls(args: Args, bind: String, auth: Arc<Mutex<AgentAuth>>) -> Res
         let acceptor = acceptor.clone();
         let auth = auth.clone();
         let codex_home = args.codex_home.clone();
+        let codex_bin = args.codex_bin.clone();
+        let runtime_cwd = args.runtime_cwd.clone();
         let backup_dir = default_backup_dir();
         let state_dir = default_state_dir();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(stream) => {
-                    if let Err(error) =
-                        handle_connection(stream, auth, codex_home, backup_dir, state_dir).await
+                    if let Err(error) = handle_connection(
+                        stream,
+                        auth,
+                        codex_home,
+                        codex_bin,
+                        runtime_cwd,
+                        backup_dir,
+                        state_dir,
+                    )
+                    .await
                     {
                         eprintln!("AMCP Agent TLS connection error from {peer}: {error:#}");
                     }
@@ -543,6 +563,8 @@ async fn handle_connection<S>(
     stream: S,
     auth: Arc<Mutex<AgentAuth>>,
     codex_home: Option<PathBuf>,
+    codex_bin: PathBuf,
+    runtime_cwd: Option<PathBuf>,
     backup_dir: PathBuf,
     state_dir: PathBuf,
 ) -> Result<()>
@@ -569,6 +591,15 @@ where
         };
         let response = if matches!(&request.method, RequestMethod::SubscribeEvents { .. }) {
             process_subscribe_request(request, &auth, &state_dir).await
+        } else if matches!(&request.method, RequestMethod::RuntimeListThreads { .. }) {
+            process_runtime_list_request(
+                request,
+                &auth,
+                codex_home.clone(),
+                &codex_bin,
+                runtime_cwd.as_deref(),
+            )
+            .await
         } else {
             process_request(request, &auth, codex_home.clone(), &backup_dir, &state_dir)
         };
@@ -762,6 +793,10 @@ fn process_request(
                     error.to_string(),
                 )),
             },
+            RequestMethod::RuntimeListThreads { .. } => Err(ProtocolError::new(
+                "runtime_request_requires_async_handler",
+                "runtime thread requests must use the Agent async handler",
+            )),
             RequestMethod::AckEvents { event_ids } => {
                 match acknowledge_runtime_events(state_dir, &event_ids) {
                     Ok(removed) => Ok(ResponsePayload::RuntimeEventsAcked(removed)),
@@ -992,6 +1027,155 @@ async fn process_subscribe_request(
                 };
             }
         }
+    }
+}
+
+async fn process_runtime_list_request(
+    request: RequestEnvelope,
+    auth: &Arc<Mutex<AgentAuth>>,
+    codex_home: Option<PathBuf>,
+    codex_bin: &Path,
+    runtime_cwd: Option<&Path>,
+) -> ResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let (provider_id, scope, cursor, limit) = match request.method {
+        RequestMethod::RuntimeListThreads {
+            provider_id,
+            scope,
+            cursor,
+            limit,
+        } => (provider_id, scope, cursor, limit.clamp(1, 64)),
+        _ => {
+            return ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "invalid_runtime_request",
+                    "not a runtime thread request",
+                )),
+            };
+        }
+    };
+    let authenticated = auth
+        .lock()
+        .expect("Agent auth mutex")
+        .accepts(request.token.as_deref());
+    if request.protocol_version != PROTOCOL_VERSION {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "protocol_version_mismatch",
+                "unsupported protocol version",
+            )),
+        };
+    }
+    if !authenticated {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("unauthorized", "invalid Agent token")),
+        };
+    }
+    if scope
+        .as_ref()
+        .and_then(|scope| scope.host_id.as_deref())
+        .is_some_and(|host_id| host_id != host_identity().host_id)
+    {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "scope_denied",
+                "requested host is not this Agent",
+            )),
+        };
+    }
+    if scope
+        .as_ref()
+        .and_then(|scope| scope.provider_id.as_deref())
+        .is_some_and(|scope_provider_id| scope_provider_id != provider_id)
+    {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "scope_denied",
+                "requested provider does not match the runtime provider",
+            )),
+        };
+    }
+    if provider_id != "codex" {
+        return ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new(
+                "provider_unavailable",
+                "runtime thread listing is not implemented for this provider",
+            )),
+        };
+    }
+    let registry = provider_registry(codex_home.clone());
+    let provider = match registry.get(&provider_id) {
+        Ok(provider)
+            if provider
+                .descriptor()
+                .capabilities
+                .iter()
+                .any(|capability| capability == "runtime") =>
+        {
+            provider
+        }
+        _ => {
+            return ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: Err(ProtocolError::new(
+                    "runtime_unavailable",
+                    "provider does not expose runtime capability",
+                )),
+            };
+        }
+    };
+    let result = async {
+        let mut client = AppServerClient::spawn(codex_bin, codex_home.as_deref(), runtime_cwd)
+            .await
+            .context("start Codex app-server for runtime read")?;
+        client
+            .initialize("amcp-agent-runtime-read", env!("CARGO_PKG_VERSION"))
+            .await
+            .context("initialize Codex app-server for runtime read")?;
+        let response = client
+            .list_threads(cursor.as_deref(), Some(limit as u32))
+            .await
+            .context("list Codex runtime threads")?;
+        let host = host_identity();
+        let mut threads = Vec::new();
+        for thread in extract_thread_values(&response) {
+            if let Some(record) = provider.map_runtime_thread_record(&host, &thread)? {
+                threads.push(record);
+            }
+        }
+        let next_cursor = extract_next_thread_cursor(&response);
+        let _ = client.shutdown().await;
+        Ok::<_, anyhow::Error>((threads, next_cursor))
+    }
+    .await;
+    match result {
+        Ok((threads, next_cursor)) => ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Ok(ResponsePayload::RuntimeThreadPage {
+                provider_id,
+                threads,
+                next_cursor,
+            }),
+        },
+        Err(error) => ResponseEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: Err(ProtocolError::new("runtime_read_failed", error.to_string())),
+        },
     }
 }
 
@@ -1369,6 +1553,62 @@ mod tests {
             }
             other => panic!("unexpected continued subscription page: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_thread_read_rejects_a_different_host_scope() {
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "runtime-token".into(),
+            None,
+            300,
+        )));
+        let response = process_runtime_list_request(
+            RequestEnvelope::new(
+                RequestMethod::RuntimeListThreads {
+                    provider_id: "codex".into(),
+                    scope: Some(amcp_domain::Scope::host("other-host")),
+                    cursor: None,
+                    limit: 10,
+                },
+                Some("runtime-token".into()),
+            ),
+            &auth,
+            None,
+            Path::new("/does/not/exist"),
+            None,
+        )
+        .await;
+        assert_eq!(response.result.unwrap_err().code, "scope_denied");
+    }
+
+    #[tokio::test]
+    async fn runtime_thread_read_rejects_a_different_provider_scope() {
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "runtime-token".into(),
+            None,
+            300,
+        )));
+        let response = process_runtime_list_request(
+            RequestEnvelope::new(
+                RequestMethod::RuntimeListThreads {
+                    provider_id: "codex".into(),
+                    scope: Some(amcp_domain::Scope {
+                        host_id: None,
+                        provider_id: Some("claude-code".into()),
+                        project_id: None,
+                    }),
+                    cursor: None,
+                    limit: 10,
+                },
+                Some("runtime-token".into()),
+            ),
+            &auth,
+            None,
+            Path::new("/does/not/exist"),
+            None,
+        )
+        .await;
+        assert_eq!(response.result.unwrap_err().code, "scope_denied");
     }
 
     #[test]

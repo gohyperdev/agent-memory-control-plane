@@ -437,6 +437,20 @@ pub struct RuntimeEvent {
     pub occurred_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeThreadRecord {
+    pub thread_id: String,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub status: Option<String>,
+    pub archived: bool,
+    pub source_reference: String,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,

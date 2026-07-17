@@ -1,6 +1,6 @@
 use amcp_domain::{
     ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet, CollectionBatch,
-    HostIdentity, ProviderDescriptor, RuntimeEvent,
+    HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord,
 };
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -72,6 +72,15 @@ pub trait ProviderAdapter: Send + Sync {
         _thread: &serde_json::Value,
         _sequence: &mut i64,
     ) -> Result<Option<RuntimeEvent>> {
+        Ok(None)
+    }
+    /// Convert a provider-native live thread into bounded metadata for a
+    /// read-only runtime inventory request.
+    fn map_runtime_thread_record(
+        &self,
+        _host: &HostIdentity,
+        _thread: &serde_json::Value,
+    ) -> Result<Option<RuntimeThreadRecord>> {
         Ok(None)
     }
     fn read_artifact(&self, _target: &ArtifactRef, _host: &HostIdentity) -> Result<ArtifactRecord> {

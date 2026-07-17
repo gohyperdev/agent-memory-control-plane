@@ -95,6 +95,36 @@ enum CommandKind {
         #[arg(long)]
         iterations: Option<usize>,
     },
+    RuntimeList {
+        #[arg(
+            long,
+            default_value_os_t = default_agent_socket_path(),
+            env = "AMCP_AGENT_SOCKET"
+        )]
+        socket: PathBuf,
+        #[arg(long, env = "AMCP_AGENT_URL")]
+        agent_url: Option<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long)]
+        no_start_agent: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     Search {
         query: String,
         #[arg(long)]
@@ -314,6 +344,32 @@ async fn main() -> Result<()> {
                 agent_bin,
                 interval_seconds,
                 iterations,
+            )
+            .await
+        }
+        CommandKind::RuntimeList {
+            socket,
+            agent_url,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            agent_bin,
+            no_start_agent,
+            limit,
+            json,
+        } => {
+            runtime_list(
+                socket,
+                agent_url,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                agent_bin,
+                no_start_agent,
+                limit,
+                json,
             )
             .await
         }
@@ -698,6 +754,78 @@ async fn watch(
             _ = sleep(StdDuration::from_secs(interval_seconds.max(1))) => {}
         }
     }
+}
+
+async fn runtime_list(
+    socket: PathBuf,
+    agent_url: Option<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    agent_bin: Option<PathBuf>,
+    no_start_agent: bool,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let token = resolve_agent_token(&token);
+    let mut child = if no_start_agent || agent_url.is_some() {
+        None
+    } else {
+        Some(start_agent(&socket, &token, codex_home.as_ref(), agent_bin).await?)
+    };
+    let result = async {
+        let stream = connect_with_retry(
+            &socket,
+            agent_url.as_deref(),
+            tls_ca.as_deref(),
+            tls_server_name.as_deref(),
+        )
+        .await
+        .context("connect to AMCP Agent")?;
+        let mut client = AgentClient::new(stream);
+        let (host, _, _, _) = register_and_refresh(&mut client, &token).await?;
+        let response = client
+            .request(
+                RequestMethod::RuntimeListThreads {
+                    provider_id: "codex".into(),
+                    scope: Some(Scope::host(host.host_id.clone())),
+                    cursor: None,
+                    limit: limit.clamp(1, 64),
+                },
+                &token,
+            )
+            .await?;
+        let _ = client.request(RequestMethod::Shutdown, &token).await;
+        Ok::<_, anyhow::Error>((host, response))
+    }
+    .await;
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let (host, response) = result?;
+    let threads = match response {
+        ResponsePayload::RuntimeThreadPage { threads, .. } => threads,
+        other => bail!("Agent returned unexpected runtime response: {other:?}"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"host_id": host.host_id, "threads": threads})
+        );
+    } else {
+        println!("Live Codex threads on {}:", host.host_id);
+        for thread in threads {
+            println!(
+                "- {} — {} [{}]",
+                thread.thread_id,
+                thread.title.unwrap_or_else(|| "untitled".into()),
+                thread.status.unwrap_or_else(|| "unknown".into())
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn enroll(

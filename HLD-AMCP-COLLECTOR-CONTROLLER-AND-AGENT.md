@@ -421,6 +421,13 @@ deltas in its event payload, and is disabled by default unless the host policy
 explicitly enables it. The Controller projects these metadata events into the
 central session catalog only after event persistence.
 
+The Agent also exposes an authenticated `RuntimeListThreads` read request.
+It enforces the target host scope, requires the provider runtime capability,
+clamps the page to 64 records, and returns provider-neutral thread metadata
+with pagination. It creates a short-lived app-server read connection and never
+exposes raw provider response objects or transcript content through this
+surface.
+
 RAG chunk retention is applied independently from native provider retention. A
 configured retention window purges derived chunks before retrieval; disabling or
 deleting RAG must not remove or mutate native provider state.

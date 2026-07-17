@@ -253,6 +253,18 @@ fn tool_list() -> Value {
                 "annotations": { "readOnlyHint": true, "destructiveHint": false }
             },
             {
+                "name": "amcp_runtime_threads_list",
+                "description": "Read bounded live Codex thread metadata from the selected Agent. Transcript content and provider response internals are excluded.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "host_id": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            },
+            {
                 "name": "amcp_retrieve_context",
                 "description": "Retrieve optional cited context. It is disabled by default; when AMCP_RAG_ENABLED=true, AMCP uses bounded lexical chunks from redacted FTS evidence until an embedding provider is configured.",
                 "inputSchema": {
@@ -389,6 +401,7 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                 .clamp(1, 100) as usize;
             Ok(json!({ "events": catalog.list_runtime_events(host_id, provider_id, limit)? }))
         }
+        "amcp_runtime_threads_list" => runtime_threads_list(args, arguments),
         "amcp_retrieve_context" => {
             let query = arguments
                 .get("query")
@@ -474,6 +487,54 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
         "amcp_change_propose" => propose_change(args, arguments),
         _ => anyhow::bail!("unknown AMCP tool: {name}"),
     }
+}
+
+fn runtime_threads_list(args: &Args, arguments: Value) -> Result<Value> {
+    let requested_host = arguments.get("host_id").and_then(Value::as_str);
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .clamp(1, 64);
+    let mut command = Command::new(&args.controller_bin);
+    command
+        .args(["runtime-list", "--socket"])
+        .arg(&args.agent_socket)
+        .args([
+            "--limit",
+            &limit.to_string(),
+            "--token",
+            &args.agent_token,
+            "--json",
+            "--no-start-agent",
+        ]);
+    if let Some(agent_url) = &args.agent_url {
+        command.args(["--agent-url", agent_url]);
+    }
+    if let Some(tls_ca) = &args.tls_ca {
+        command.args(["--tls-ca"]).arg(tls_ca);
+    }
+    if let Some(server_name) = &args.tls_server_name {
+        command.args(["--tls-server-name", server_name]);
+    }
+    if let Some(codex_home) = &args.codex_home {
+        command.args(["--codex-home"]).arg(codex_home);
+    }
+    let output = command.output().context("start Controller runtime read")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Controller runtime read failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let result: Value =
+        serde_json::from_slice(&output.stdout).context("decode Controller runtime read")?;
+    if requested_host
+        .is_some_and(|host_id| result.get("host_id").and_then(Value::as_str) != Some(host_id))
+    {
+        anyhow::bail!("runtime response host does not match requested host scope");
+    }
+    Ok(result)
 }
 
 fn propose_change(args: &Args, arguments: Value) -> Result<Value> {
