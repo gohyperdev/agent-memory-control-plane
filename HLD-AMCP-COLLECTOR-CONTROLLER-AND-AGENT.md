@@ -391,6 +391,11 @@ The initial Codex adapter handles:
 - Codex app-server connection and thread events;
 - content hashes, source references, and change planning.
 
+The Controller-side embedded app-server bridge records bounded, redacted turn
+items as normalized `sessions`/`session_items` with a `session.event` runtime
+event. This is an AMCP observation only; the Codex thread and native rollout
+remain authoritative and can be re-read through the app-server or Agent.
+
 The adapter emits one normalized configuration-layer record for each supported
 `config.toml`/profile source and one guidance record for each discovered
 `AGENTS.md` or `AGENTS.override.md`. A collection batch also includes the

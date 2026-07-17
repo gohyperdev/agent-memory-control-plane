@@ -175,6 +175,7 @@ function App() {
       setError(null);
       const result = await invoke<{ text: string }>("ask_codex", { prompt: codexPrompt });
       setCodexReply(result.text || "Codex completed without a text response.");
+      setSessions(await invoke<Session[]>("list_sessions"));
     } catch (reason) {
       setError(String(reason));
     } finally {
