@@ -23,7 +23,7 @@ struct Args {
     #[arg(
         long,
         env = "AMCP_AGENT_SOCKET",
-        default_value = "/tmp/amcp-agent.sock"
+        default_value_os_t = default_socket_path()
     )]
     agent_socket: PathBuf,
     #[arg(long, env = "AMCP_AGENT_URL")]
@@ -40,6 +40,12 @@ struct Args {
     agent_token: String,
     #[arg(long, env = "CODEX_HOME")]
     codex_home: Option<PathBuf>,
+}
+
+fn default_socket_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
+        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 #[derive(Debug, Deserialize)]

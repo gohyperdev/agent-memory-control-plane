@@ -38,7 +38,7 @@ enum CommandKind {
     RunOnce {
         #[arg(
             long,
-            default_value = "/tmp/amcp-agent.sock",
+            default_value_os_t = default_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -101,7 +101,7 @@ enum CommandKind {
     ProposeChange {
         #[arg(
             long,
-            default_value = "/tmp/amcp-agent.sock",
+            default_value_os_t = default_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -139,7 +139,7 @@ enum CommandKind {
     ApproveChange {
         #[arg(
             long,
-            default_value = "/tmp/amcp-agent.sock",
+            default_value_os_t = default_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -175,7 +175,7 @@ enum CommandKind {
     RollbackChange {
         #[arg(
             long,
-            default_value = "/tmp/amcp-agent.sock",
+            default_value_os_t = default_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -221,7 +221,7 @@ enum CommandKind {
     Enroll {
         #[arg(
             long,
-            default_value = "/tmp/amcp-agent.sock",
+            default_value_os_t = default_socket_path(),
             env = "AMCP_AGENT_SOCKET"
         )]
         socket: PathBuf,
@@ -617,7 +617,7 @@ async fn watch(
             let result = run_once(
                 PathBuf::from(
                     env::var_os("AMCP_AGENT_SOCKET")
-                        .unwrap_or_else(|| "/tmp/amcp-agent.sock".into()),
+                        .unwrap_or_else(|| default_socket_path().into_os_string()),
                 ),
                 endpoint.clone(),
                 tls_ca.clone(),
@@ -1304,6 +1304,12 @@ fn default_db_path() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from(".amcp/controller.sqlite"))
+}
+
+fn default_socket_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
+        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 fn default_agent_binary() -> PathBuf {

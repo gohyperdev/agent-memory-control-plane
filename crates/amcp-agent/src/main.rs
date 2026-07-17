@@ -31,7 +31,7 @@ struct Args {
     command: Option<Command>,
     #[arg(
         long,
-        default_value = "/tmp/amcp-agent.sock",
+        default_value_os_t = default_socket_path(),
         env = "AMCP_AGENT_SOCKET"
     )]
     socket: PathBuf,
@@ -160,6 +160,9 @@ async fn serve(args: Args) -> Result<()> {
 async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
     if let Some(parent) = args.socket.parent() {
         tokio::fs::create_dir_all(parent).await?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .await?;
     }
     if args.socket.exists() {
         tokio::fs::remove_file(&args.socket)
@@ -167,6 +170,12 @@ async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
             .context("remove stale Agent socket")?;
     }
     let listener = UnixListener::bind(&args.socket).context("bind Agent Unix socket")?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(
+        &args.socket,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .await?;
     println!("AMCP Agent listening on {}", args.socket.display());
 
     loop {
@@ -688,6 +697,12 @@ fn default_backup_dir() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from(".amcp/agent-backups"))
+}
+
+fn default_socket_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/AMCP/agent.sock"))
+        .unwrap_or_else(|| PathBuf::from(".amcp/agent.sock"))
 }
 
 fn default_state_dir() -> PathBuf {

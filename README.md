@@ -7,6 +7,7 @@ The current implementation slice is macOS-first and Codex-first:
 - `amcp-agent` is a separate local process that owns native provider-state access.
 - `amcp-controller` is the central collector with SQLite/FTS5 storage and scoped search.
 - The Agent and Controller communicate over an authenticated JSONL protocol on a Unix socket.
+- The default local socket is `~/Library/Application Support/AMCP/agent.sock` with a `0700` parent directory and `0600` socket permissions; `/tmp` remains available only when explicitly supplied for development.
 - Native provider state remains authoritative; AMCP stores normalized, redacted observations and evidence.
 - Codex configuration layers and `AGENTS.md`/`AGENTS.override.md` guidance are normalized with explicit precedence and source hashes.
 - Existing trusted paths from Codex `projects.toml` are discovered as additional project roots, so project `.codex/config.toml` and guidance are inventoried without manual root configuration.
