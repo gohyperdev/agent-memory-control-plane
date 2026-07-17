@@ -2,6 +2,7 @@ use amcp_domain::{
     ApprovalEnvelope, ArtifactRef, AuditEvent, ChangeRequest, ChangeStatus, HostIdentity, Scope,
     change_set_operations_hash, new_id,
 };
+use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
 use amcp_protocol::{RequestEnvelope, RequestMethod, ResponseEnvelope, ResponsePayload};
 use amcp_storage::Catalog;
 use anyhow::{Context, Result, bail};
@@ -65,6 +66,30 @@ enum CommandKind {
         query: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    Watch {
+        #[arg(long = "agent-url", env = "AMCP_AGENT_URL")]
+        agent_urls: Vec<String>,
+        #[arg(long, env = "AMCP_AGENT_TLS_CA")]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, env = "AMCP_AGENT_TLS_SERVER_NAME")]
+        tls_server_name: Option<String>,
+        #[arg(
+            long,
+            default_value = "amcp-development-token",
+            env = "AMCP_AGENT_TOKEN"
+        )]
+        token: String,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        agent_bin: Option<PathBuf>,
+        #[arg(long, default_value_t = 30)]
+        interval_seconds: u64,
+        #[arg(long)]
+        iterations: Option<usize>,
     },
     Search {
         query: String,
@@ -187,6 +212,12 @@ enum CommandKind {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    KeychainStore {
+        #[arg(long, env = "AMCP_HOST_ID")]
+        host_id: String,
+        #[arg(long, env = "AMCP_AGENT_TOKEN")]
+        token: String,
+    },
 }
 
 #[tokio::main]
@@ -222,6 +253,30 @@ async fn main() -> Result<()> {
         }
         CommandKind::Search { query, db, limit } => {
             search(db.unwrap_or_else(default_db_path), query, limit)
+        }
+        CommandKind::Watch {
+            agent_urls,
+            tls_ca,
+            tls_server_name,
+            token,
+            codex_home,
+            db,
+            agent_bin,
+            interval_seconds,
+            iterations,
+        } => {
+            watch(
+                agent_urls,
+                tls_ca,
+                tls_server_name,
+                token,
+                codex_home,
+                db.unwrap_or_else(default_db_path),
+                agent_bin,
+                interval_seconds,
+                iterations,
+            )
+            .await
         }
         CommandKind::ProposeChange {
             socket,
@@ -322,6 +377,9 @@ async fn main() -> Result<()> {
             .await
         }
         CommandKind::Hosts { db } => list_hosts(db.unwrap_or_else(default_db_path)),
+        CommandKind::KeychainStore { host_id, token } => {
+            store_keychain_credential(&host_id, &token)
+        }
     }
 }
 
@@ -338,6 +396,7 @@ async fn run_once(
     query: Option<String>,
     json: bool,
 ) -> Result<()> {
+    let token = resolve_agent_token(&token);
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent).context("create Controller data directory")?;
     }
@@ -428,6 +487,57 @@ async fn run_once(
     Ok(())
 }
 
+async fn watch(
+    agent_urls: Vec<String>,
+    tls_ca: Option<PathBuf>,
+    tls_server_name: Option<String>,
+    token: String,
+    codex_home: Option<PathBuf>,
+    db: PathBuf,
+    agent_bin: Option<PathBuf>,
+    interval_seconds: u64,
+    iterations: Option<usize>,
+) -> Result<()> {
+    let endpoints = if agent_urls.is_empty() {
+        vec![None]
+    } else {
+        agent_urls.into_iter().map(Some).collect()
+    };
+    let mut completed = 0usize;
+    loop {
+        for endpoint in &endpoints {
+            let result = run_once(
+                PathBuf::from(
+                    env::var_os("AMCP_AGENT_SOCKET")
+                        .unwrap_or_else(|| "/tmp/amcp-agent.sock".into()),
+                ),
+                endpoint.clone(),
+                tls_ca.clone(),
+                tls_server_name.clone(),
+                token.clone(),
+                codex_home.clone(),
+                db.clone(),
+                agent_bin.clone(),
+                endpoint.is_some(),
+                None,
+                true,
+            )
+            .await;
+            if let Err(error) = result {
+                eprintln!("AMCP watch collection failed for {:?}: {error:#}", endpoint);
+            }
+        }
+        completed += 1;
+        if iterations.is_some_and(|limit| completed >= limit) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = sleep(StdDuration::from_secs(interval_seconds.max(1))) => {}
+        }
+    }
+}
+
 fn search(db: PathBuf, query: String, limit: usize) -> Result<()> {
     let catalog = Catalog::open(&db)?;
     for hit in catalog.search(&query, limit)? {
@@ -452,6 +562,7 @@ async fn propose_change(
     host_id: String,
     json: bool,
 ) -> Result<()> {
+    let token = resolve_agent_token(&token);
     let replacement_content = std::fs::read_to_string(&replacement_file)
         .with_context(|| format!("read replacement file {}", replacement_file.display()))?;
     let mut child = if no_start_agent || agent_url.is_some() {
@@ -548,6 +659,7 @@ async fn approve_change(
     expires_minutes: i64,
     json: bool,
 ) -> Result<()> {
+    let token = resolve_agent_token(&token);
     let mut catalog = Catalog::open(&db)?;
     let mut change_set = catalog
         .load_change_set(&change_set_id)?
@@ -657,6 +769,7 @@ async fn rollback_change(
     expires_minutes: i64,
     json: bool,
 ) -> Result<()> {
+    let token = resolve_agent_token(&token);
     let mut catalog = Catalog::open(&db)?;
     let mut change_set = catalog
         .load_change_set(&change_set_id)?
@@ -756,6 +869,12 @@ fn list_hosts(db: PathBuf) -> Result<()> {
             host.identity.host_id, host.identity.platform, host.status, host.identity.hostname
         );
     }
+    Ok(())
+}
+
+fn store_keychain_credential(host_id: &str, token: &str) -> Result<()> {
+    MacOsKeychain::new(keychain_account_for_host(host_id)).set(token)?;
+    println!("Stored AMCP Agent credential for {host_id} in the macOS Keychain");
     Ok(())
 }
 
@@ -941,4 +1060,20 @@ fn default_agent_binary() -> PathBuf {
 fn host_id_from_env() -> String {
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into());
     env::var("AMCP_HOST_ID").unwrap_or_else(|_| format!("host_{}", hostname.replace('.', "-")))
+}
+
+const DEVELOPMENT_TOKEN: &str = "amcp-development-token";
+
+fn resolve_agent_token(token: &str) -> String {
+    if token != DEVELOPMENT_TOKEN {
+        return token.to_owned();
+    }
+    let account = env::var("AMCP_AGENT_KEYCHAIN_ACCOUNT")
+        .unwrap_or_else(|_| keychain_account_for_host(&host_id_from_env()));
+    MacOsKeychain::new(account)
+        .get()
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| token.to_owned())
 }

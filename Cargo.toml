@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/amcp-domain",
     "crates/amcp-core",
+    "crates/amcp-platform",
     "crates/amcp-provider-api",
     "crates/amcp-app-server",
     "crates/amcp-rag",

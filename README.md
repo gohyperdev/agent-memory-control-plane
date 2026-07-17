@@ -59,6 +59,27 @@ AMCP_HOST_ID=mac-2 ./target/debug/amcp-agent \
   --json
 ```
 
+For a central Collector loop over several remote Agents, pass `--agent-url` once per host:
+
+```bash
+./target/debug/amcp-controller watch \
+  --agent-url tcp://mac-1.example:45432 \
+  --agent-url tcp://mac-2.example:45432 \
+  --tls-ca /path/to/agent-ca.crt \
+  --token "$AMCP_AGENT_TOKEN" \
+  --interval-seconds 30
+```
+
+On macOS, the development/default token can be replaced by a host-scoped Keychain credential:
+
+```bash
+./target/debug/amcp-controller keychain-store \
+  --host-id mac-2 \
+  --token "$AMCP_AGENT_TOKEN"
+```
+
+When the default token is used, Controller and Agent first look up `agent:<host_id>` (or `AMCP_AGENT_KEYCHAIN_ACCOUNT`) and fall back to the development token only when no Keychain entry exists.
+
 Run the desktop shell from `apps/amcp-desktop` with `npm install` followed by `npm run tauri dev`. The bundled UI reads the same central catalog used by the CLI and MCP gateway.
 
 See [PLAN-IMPLEMENTACJI.md](PLAN-IMPLEMENTACJI.md) for the full implementation roadmap.

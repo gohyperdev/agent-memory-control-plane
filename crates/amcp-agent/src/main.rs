@@ -1,6 +1,7 @@
 use amcp_codex::CodexAdapter;
 use amcp_domain::HostIdentity;
 use amcp_domain::change_set_operations_hash;
+use amcp_platform::{MacOsKeychain, SecretStore, keychain_account_for_host};
 use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
     ResponsePayload,
@@ -80,13 +81,14 @@ fn collect_once(args: Args, json: bool) -> Result<()> {
 }
 
 async fn serve(args: Args) -> Result<()> {
+    let token = resolve_agent_token(&args.token);
     if let Some(bind) = args.tcp_bind.clone() {
-        return serve_tls(args, bind).await;
+        return serve_tls(args, bind, token).await;
     }
-    serve_unix(args).await
+    serve_unix(args, token).await
 }
 
-async fn serve_unix(args: Args) -> Result<()> {
+async fn serve_unix(args: Args, token: String) -> Result<()> {
     if let Some(parent) = args.socket.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -103,7 +105,7 @@ async fn serve_unix(args: Args) -> Result<()> {
             .accept()
             .await
             .context("accept Controller connection")?;
-        let token = args.token.clone();
+        let token = token.clone();
         let codex_home = args.codex_home.clone();
         let backup_dir = default_backup_dir();
         tokio::spawn(async move {
@@ -114,7 +116,7 @@ async fn serve_unix(args: Args) -> Result<()> {
     }
 }
 
-async fn serve_tls(args: Args, bind: String) -> Result<()> {
+async fn serve_tls(args: Args, bind: String, token: String) -> Result<()> {
     let cert_path = args
         .tls_cert
         .as_deref()
@@ -132,7 +134,7 @@ async fn serve_tls(args: Args, bind: String) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        let token = args.token.clone();
+        let token = token.clone();
         let codex_home = args.codex_home.clone();
         let backup_dir = default_backup_dir();
         tokio::spawn(async move {
@@ -390,6 +392,21 @@ fn host_identity() -> HostIdentity {
         platform: std::env::consts::OS.to_owned(),
         hostname,
     }
+}
+
+fn resolve_agent_token(token: &str) -> String {
+    const DEVELOPMENT_TOKEN: &str = "amcp-development-token";
+    if token != DEVELOPMENT_TOKEN {
+        return token.to_owned();
+    }
+    let account = env::var("AMCP_AGENT_KEYCHAIN_ACCOUNT")
+        .unwrap_or_else(|_| keychain_account_for_host(&host_identity().host_id));
+    MacOsKeychain::new(account)
+        .get()
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| token.to_owned())
 }
 
 fn default_backup_dir() -> PathBuf {

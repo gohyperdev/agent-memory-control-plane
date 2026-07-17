@@ -24,6 +24,8 @@ pub struct Catalog {
     connection: Connection,
 }
 
+pub const HEARTBEAT_STALE_AFTER_SECONDS: i64 = 90;
+
 impl Catalog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path).context("open AMCP catalog")?;
@@ -719,6 +721,26 @@ impl Catalog {
             let provider_ids: Option<String> = row.get(9)?;
             let status: Option<String> = row.get(7)?;
             let capabilities_json: Option<String> = row.get(8)?;
+            let parsed_last_seen = last_seen.as_deref().and_then(parse_utc);
+            let stored_status = status
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok());
+            let effective_status = match stored_status.unwrap_or_else(|| {
+                if parsed_last_seen.is_some() {
+                    HostStatus::Connected
+                } else {
+                    HostStatus::Disconnected
+                }
+            }) {
+                HostStatus::Connected
+                    if parsed_last_seen.is_some_and(|value| {
+                        (Utc::now() - value).num_seconds() > HEARTBEAT_STALE_AFTER_SECONDS
+                    }) =>
+                {
+                    HostStatus::Disconnected
+                }
+                value => value,
+            };
             Ok(HostRecord {
                 identity: amcp_domain::HostIdentity {
                     host_id: row.get(0)?,
@@ -730,16 +752,7 @@ impl Catalog {
                 agent_version: row
                     .get::<_, Option<String>>(6)?
                     .and_then(|value| value.split(',').next().map(str::to_owned)),
-                status: status
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str(value).ok())
-                    .unwrap_or_else(|| {
-                        if last_seen.is_some() {
-                            HostStatus::Connected
-                        } else {
-                            HostStatus::Disconnected
-                        }
-                    }),
+                status: effective_status,
                 capabilities: capabilities_json
                     .and_then(|value| serde_json::from_str(&value).ok())
                     .or_else(|| {
@@ -747,11 +760,7 @@ impl Catalog {
                     })
                     .unwrap_or_default(),
                 enrolled_at: Utc::now(),
-                last_seen: last_seen.and_then(|value| {
-                    DateTime::parse_from_rfc3339(&value)
-                        .ok()
-                        .map(|value| value.with_timezone(&Utc))
-                }),
+                last_seen: parsed_last_seen,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
