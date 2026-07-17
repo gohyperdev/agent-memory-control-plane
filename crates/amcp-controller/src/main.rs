@@ -799,6 +799,10 @@ async fn run_once(
     {
         Ok(ResponsePayload::RuntimeEventPage { events, .. })
         | Ok(ResponsePayload::RuntimeEvents(events)) => {
+            let events = events
+                .into_iter()
+                .filter(|event| event.host_id == registered_host.host_id)
+                .collect::<Vec<_>>();
             let received = events.len();
             let persisted = catalog.ingest_runtime_events(&events)?;
             let event_ids = events
@@ -843,6 +847,9 @@ async fn run_once(
         Ok(ResponsePayload::CollectionReplay { batches, .. }) => {
             let mut count = 0usize;
             for replay in batches {
+                if replay.host.host_id != registered_host.host_id {
+                    continue;
+                }
                 catalog.ingest(&replay)?;
                 catalog.save_cursor(
                     &replay.host.host_id,
@@ -1093,6 +1100,10 @@ async fn stream_events(
                         heartbeats += 1;
                         continue;
                     }
+                    let events = events
+                        .into_iter()
+                        .filter(|event| event.host_id == host.host_id)
+                        .collect::<Vec<_>>();
                     received += events.len();
                     let event_ids = events
                         .iter()

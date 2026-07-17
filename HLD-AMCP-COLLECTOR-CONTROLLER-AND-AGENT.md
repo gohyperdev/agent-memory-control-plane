@@ -331,6 +331,12 @@ and performs no network egress. Lexical search must remain fully useful without
 embeddings; remote or model-backed providers require a separate consent and
 egress policy.
 
+The Controller stores the derived projection in SQLite `rag_chunks` and records
+each context request in `rag_retrieval_runs`. A retrieval load invalidates chunks
+whose catalog source hash changed or disappeared, and a changed embedding model
+invalidates the stored vector payload while retaining the lexical chunk. The
+projection is rebuildable and independently deletable from native provider data.
+
 ### 7.7 Embedded Codex integration
 
 The Controller supervises the embedded Codex app-server client. The AMCP MCP gateway exposes Controller-level tools to Codex.
@@ -401,6 +407,13 @@ These capabilities are persisted
 centrally and do not imply runtime access or mutation support. Full adapters can
 replace or extend these readers later without changing the Agent–Controller protocol,
 central schema, or UI contract.
+
+Runtime support uses a separate capability descriptor with a named transport and
+operation set (`list`, `read`, `archive`, `unarchive`). The current Codex adapter
+declares `codex-app-server`; Claude Code, Kiro and Antigravity remain
+inventory/read-only until their native runtime connectors are implemented. The
+Agent selects runtime behavior from this descriptor rather than from provider
+IDs embedded in the protocol.
 
 ### 8.3 Codex adapter for macOS
 

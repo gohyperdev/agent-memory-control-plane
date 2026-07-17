@@ -7,7 +7,7 @@ use amcp_domain::{
     ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord, SensitivityClass, SessionItem,
     SessionRecord, SourceObservation, new_id, stable_runtime_event_id,
 };
-use amcp_provider_api::ProviderAdapter;
+use amcp_provider_api::{ProviderAdapter, RuntimeAdapterDescriptor};
 use anyhow::{Result, bail};
 use chrono::Utc;
 use regex::Regex;
@@ -1156,6 +1156,18 @@ impl CodexAdapter {
 impl ProviderAdapter for CodexAdapter {
     fn descriptor(&self) -> ProviderDescriptor {
         self.provider()
+    }
+
+    fn runtime_descriptor(&self) -> Option<RuntimeAdapterDescriptor> {
+        Some(RuntimeAdapterDescriptor {
+            transport: "codex-app-server".into(),
+            operations: vec![
+                "list".into(),
+                "read".into(),
+                "archive".into(),
+                "unarchive".into(),
+            ],
+        })
     }
 
     fn collection_cursor(&self) -> Option<String> {

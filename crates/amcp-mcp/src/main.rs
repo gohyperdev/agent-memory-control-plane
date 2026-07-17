@@ -2,8 +2,8 @@ use amcp_core::CatalogService;
 use amcp_domain::{LifecycleState, Scope};
 use amcp_platform::default_agent_socket_path;
 use amcp_rag::{
-    DisabledRagManager, HashedEmbeddingProvider, LexicalRagManager, RagConfig, RagDocument,
-    RagManager,
+    DisabledRagManager, EmbeddingProvider, HashedEmbeddingProvider, LexicalRagManager,
+    PersistentRagIndex, RagConfig, RagDocument, RagManager,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -478,7 +478,7 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                         .and_then(|value| value.parse::<u32>().ok()),
                     ..RagConfig::default()
                 };
-                let mut manager = if rag_config
+                let embedding_provider: Option<Box<dyn EmbeddingProvider>> = if rag_config
                     .embedding_provider
                     .as_deref()
                     .is_some_and(|provider| matches!(provider, "local-hash" | "hash"))
@@ -494,10 +494,18 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                             .unwrap_or_else(|| "hash-v1".into()),
                         dimensions,
                     )?;
-                    LexicalRagManager::with_embedding_provider(rag_config, Box::new(provider))
+                    Some(Box::new(provider))
                 } else {
-                    LexicalRagManager::new(rag_config)
+                    None
                 };
+                let mut persistent_index = PersistentRagIndex::open(&args.db)?;
+                let current_sources = catalog.artifact_source_hashes()?;
+                persistent_index.invalidate_stale_sources(&current_sources)?;
+                let mut manager = LexicalRagManager::load_from_index(
+                    rag_config,
+                    embedding_provider,
+                    &persistent_index,
+                )?;
                 let documents = hits
                     .into_iter()
                     .map(|hit| RagDocument {
@@ -517,7 +525,14 @@ fn call_tool(args: &Args, name: &str, arguments: Value) -> Result<Value> {
                     .collect::<Vec<_>>();
                 manager.index(&documents)?;
                 let purged = manager.purge_expired(Utc::now())?;
+                manager.persist_to_index(&mut persistent_index)?;
                 let mut context = manager.retrieve(query, &scope, limit)?;
+                manager.record_retrieval(
+                    &mut persistent_index,
+                    query,
+                    &scope,
+                    context.citations.len(),
+                )?;
                 if purged > 0 {
                     context.warning = Some(format!(
                         "{purged} expired RAG chunks were purged before retrieval."

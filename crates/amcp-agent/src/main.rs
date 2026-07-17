@@ -1521,27 +1521,9 @@ async fn process_runtime_list_request(
             )),
         };
     }
-    if provider_id != "codex" {
-        return ResponseEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            request_id,
-            result: Err(ProtocolError::new(
-                "provider_unavailable",
-                "runtime thread listing is not implemented for this provider",
-            )),
-        };
-    }
     let registry = provider_registry(codex_home.clone());
     let provider = match registry.get(&provider_id) {
-        Ok(provider)
-            if provider
-                .descriptor()
-                .capabilities
-                .iter()
-                .any(|capability| capability == "runtime") =>
-        {
-            provider
-        }
+        Ok(provider) if runtime_provider_supports(provider, "list") => provider,
         _ => {
             return ResponseEnvelope {
                 protocol_version: PROTOCOL_VERSION,
@@ -1679,27 +1661,9 @@ async fn process_runtime_read_request(
             )),
         };
     }
-    if provider_id != "codex" {
-        return ResponseEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            request_id,
-            result: Err(ProtocolError::new(
-                "provider_unavailable",
-                "runtime thread reads are not implemented for this provider",
-            )),
-        };
-    }
     let registry = provider_registry(codex_home.clone());
     let provider = match registry.get(&provider_id) {
-        Ok(provider)
-            if provider
-                .descriptor()
-                .capabilities
-                .iter()
-                .any(|capability| capability == "runtime") =>
-        {
-            provider
-        }
+        Ok(provider) if runtime_provider_supports(provider, "read") => provider,
         _ => {
             return ResponseEnvelope {
                 protocol_version: PROTOCOL_VERSION,
@@ -1807,11 +1771,10 @@ async fn process_runtime_change_request(
             let registry = provider_registry(codex_home.clone());
             let provider = match registry.get(&request.target.provider_id) {
                 Ok(provider)
-                    if provider
-                        .descriptor()
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == "runtime") =>
+                    if runtime_provider_supports(
+                        provider,
+                        runtime_operation_name(&request.operation),
+                    ) =>
                 {
                     provider
                 }
@@ -1980,11 +1943,10 @@ async fn process_runtime_change_request(
             let registry = provider_registry(codex_home.clone());
             let provider = match registry.get(&change_set.provider_id) {
                 Ok(provider)
-                    if provider
-                        .descriptor()
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == "runtime") =>
+                    if runtime_provider_supports(
+                        provider,
+                        runtime_operation_name(&operation.operation),
+                    ) =>
                 {
                     provider
                 }
@@ -2101,9 +2063,6 @@ fn runtime_change_parts(
     operation: &ChangeOperationKind,
     host_id: &str,
 ) -> Result<(String, bool)> {
-    if target.provider_id != "codex" {
-        anyhow::bail!("runtime mutation is not implemented for this provider");
-    }
     if target.host_id != host_id || scope.host_id.as_deref() != Some(host_id) {
         anyhow::bail!("runtime mutation target is outside this Agent host");
     }
@@ -2117,7 +2076,7 @@ fn runtime_change_parts(
     if target.native_id.trim().is_empty() || target.native_id.len() > 512 {
         anyhow::bail!("runtime thread id must be non-empty and bounded");
     }
-    if target.source_reference != format!("codex://thread/{}", target.native_id) {
+    if target.source_reference != format!("{}://thread/{}", target.provider_id, target.native_id) {
         anyhow::bail!("runtime mutation source reference is invalid");
     }
     let desired_archived = match operation {
@@ -2126,6 +2085,24 @@ fn runtime_change_parts(
         _ => anyhow::bail!("change operation is not a runtime archive operation"),
     };
     Ok((target.native_id.clone(), desired_archived))
+}
+
+fn runtime_operation_name(operation: &ChangeOperationKind) -> &'static str {
+    match operation {
+        ChangeOperationKind::RuntimeArchive => "archive",
+        ChangeOperationKind::RuntimeUnarchive => "unarchive",
+        _ => "unsupported",
+    }
+}
+
+fn runtime_provider_supports(provider: &dyn ProviderAdapter, operation: &str) -> bool {
+    provider.runtime_descriptor().is_some_and(|descriptor| {
+        descriptor.transport == "codex-app-server"
+            && descriptor
+                .operations
+                .iter()
+                .any(|candidate| candidate == operation)
+    })
 }
 
 fn runtime_event_page(

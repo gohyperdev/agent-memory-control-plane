@@ -59,7 +59,7 @@ Discovery remains read-only and does not read credentials. Session bodies are co
 - Embedded desktop Codex turns are persisted as bounded, redacted session items and `session.event` runtime events, while delta/transcript payloads are excluded from event items and native Codex state remains authoritative.
 - `amcp-rag` defines the consent, citation, invalidation, and retrieval contract; its default implementation is disabled and lexical search remains the fallback.
 - Setting `AMCP_RAG_ENABLED=true` enables the bounded, cited RAG manager over redacted FTS previews; `AMCP_RAG_RETENTION_DAYS` purges expired chunks before retrieval, model-backed embeddings remain a separate opt-in provider, and RAG stays disabled by default.
-- `AMCP_RAG_EMBEDDING_PROVIDER=local-hash` optionally enables a deterministic local feature-hashing vector baseline with embedding metadata in citations; it performs no network egress and does not replace lexical search.
+- `AMCP_RAG_EMBEDDING_PROVIDER=local-hash` optionally enables a deterministic local feature-hashing vector baseline with embedding metadata in citations; it performs no network egress, persists derived `rag_chunks`/retrieval runs in SQLite, and does not replace lexical search.
 - `amcp-core` exposes the shared functional catalog API used by the desktop UI, MCP gateway, and Controller; all surfaces therefore share scope and storage behavior.
 - Collection cursors are persisted only after a successful catalog transaction, allowing the Controller to resume per-host/provider collection safely.
 - `apps/amcp-desktop` is the Tauri 2 + React desktop shell. It renders host/index/approval status, search evidence, provenance, safe local sync, and the human approval action for proposed changes.

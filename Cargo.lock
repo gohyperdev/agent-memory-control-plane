@@ -180,7 +180,9 @@ dependencies = [
  "amcp-domain",
  "anyhow",
  "chrono",
+ "rusqlite",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

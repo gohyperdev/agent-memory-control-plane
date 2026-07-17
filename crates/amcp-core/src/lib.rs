@@ -35,6 +35,10 @@ impl CatalogService {
             .search_scoped(query, limit, host_id, provider_id, project_id)
     }
 
+    pub fn artifact_source_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        self.catalog.artifact_source_hashes()
+    }
+
     pub fn list_hosts(&self) -> Result<Vec<amcp_domain::HostRecord>> {
         self.catalog.list_hosts()
     }

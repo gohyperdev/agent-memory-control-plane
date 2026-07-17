@@ -14,6 +14,12 @@ pub struct InventoryProviderAdapter {
     descriptor: ProviderDescriptor,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeAdapterDescriptor {
+    pub transport: String,
+    pub operations: Vec<String>,
+}
+
 impl InventoryProviderAdapter {
     pub fn new(
         id: impl Into<String>,
@@ -58,6 +64,12 @@ impl ProviderAdapter for InventoryProviderAdapter {
 
 pub trait ProviderAdapter: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
+    /// Provider-neutral runtime capability declaration. The Agent selects the
+    /// connector by transport and operation instead of hard-coding provider
+    /// IDs into the protocol or UI.
+    fn runtime_descriptor(&self) -> Option<RuntimeAdapterDescriptor> {
+        None
+    }
     /// Return a cheap source-state cursor when the provider supports incremental discovery.
     fn collection_cursor(&self) -> Option<String> {
         None

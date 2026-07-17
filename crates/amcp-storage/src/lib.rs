@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
@@ -789,6 +789,14 @@ impl Catalog {
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         self.search_scoped(query, limit, None, None, None)
+    }
+
+    pub fn artifact_source_hashes(&self) -> Result<HashMap<String, String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT artifact_id, source_hash FROM artifacts")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
     pub fn search_scoped(

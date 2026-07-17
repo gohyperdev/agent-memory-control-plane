@@ -3,6 +3,10 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 pub const RAG_POLICY_VERSION: &str = "amcp-rag-v1";
 
@@ -164,6 +168,231 @@ struct IndexedChunk {
     embedding_model: Option<String>,
 }
 
+/// Durable derived RAG projection owned by the central Controller database.
+/// Native provider files remain authoritative; this table can be rebuilt or
+/// deleted independently from the catalog and lexical FTS projection.
+pub struct PersistentRagIndex {
+    connection: rusqlite::Connection,
+}
+
+impl PersistentRagIndex {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = rusqlite::Connection::open(path)?;
+        let index = Self { connection };
+        index.migrate()?;
+        Ok(index)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let index = Self {
+            connection: rusqlite::Connection::open_in_memory()?,
+        };
+        index.migrate()?;
+        Ok(index)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rag_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                title TEXT NOT NULL,
+                text TEXT NOT NULL,
+                source_reference TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                lifecycle TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS rag_chunks_source_hash_idx
+                ON rag_chunks(source_hash);
+            CREATE TABLE IF NOT EXISTS rag_retrieval_runs (
+                run_id TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                result_count INTEGER NOT NULL,
+                policy_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn load_chunks(&self) -> Result<Vec<IndexedChunk>> {
+        let mut statement = self.connection.prepare(
+            "SELECT record_id, scope_json, title, text, source_reference, source_hash,
+                    sensitivity, lifecycle, chunk_index, indexed_at, embedding_provider,
+                    embedding_model, embedding_json
+             FROM rag_chunks ORDER BY record_id, chunk_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let scope_json: String = row.get(1)?;
+            let sensitivity_json: String = row.get(6)?;
+            let lifecycle_json: String = row.get(7)?;
+            let indexed_at: String = row.get(9)?;
+            let embedding_json: Option<String> = row.get(12)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                scope_json,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                sensitivity_json,
+                lifecycle_json,
+                row.get::<_, i64>(8)?,
+                indexed_at,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                embedding_json,
+            ))
+        })?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            let (
+                record_id,
+                scope_json,
+                title,
+                text,
+                source_reference,
+                source_hash,
+                sensitivity_json,
+                lifecycle_json,
+                chunk_index,
+                indexed_at,
+                embedding_provider,
+                embedding_model,
+                embedding_json,
+            ) = row?;
+            chunks.push(IndexedChunk {
+                record_id,
+                title,
+                text,
+                scope: serde_json::from_str(&scope_json)?,
+                source_reference,
+                source_hash,
+                sensitivity: serde_json::from_str(&sensitivity_json)?,
+                lifecycle: serde_json::from_str(&lifecycle_json)?,
+                chunk_index: usize::try_from(chunk_index)?,
+                indexed_at: DateTime::parse_from_rfc3339(&indexed_at)?.with_timezone(&Utc),
+                embedding: embedding_json
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+                embedding_provider,
+                embedding_model,
+            });
+        }
+        Ok(chunks)
+    }
+
+    fn replace_chunks(&mut self, chunks: &[IndexedChunk]) -> Result<usize> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM rag_chunks", [])?;
+        for chunk in chunks {
+            let chunk_id = format!("{}#{}", chunk.record_id, chunk.chunk_index);
+            transaction.execute(
+                "INSERT INTO rag_chunks(
+                    chunk_id, record_id, scope_json, title, text, source_reference,
+                    source_hash, sensitivity, lifecycle, chunk_index, indexed_at,
+                    embedding_provider, embedding_model, embedding_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    chunk_id,
+                    chunk.record_id,
+                    serde_json::to_string(&chunk.scope)?,
+                    chunk.title,
+                    chunk.text,
+                    chunk.source_reference,
+                    chunk.source_hash,
+                    serde_json::to_string(&chunk.sensitivity)?,
+                    serde_json::to_string(&chunk.lifecycle)?,
+                    chunk.chunk_index as i64,
+                    chunk.indexed_at.to_rfc3339(),
+                    chunk.embedding_provider,
+                    chunk.embedding_model,
+                    chunk
+                        .embedding
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(chunks.len())
+    }
+
+    /// Remove derived chunks whose catalog source disappeared or changed.
+    /// The caller supplies the current central artifact projection; this
+    /// keeps native provider state authoritative and prevents stale RAG hits.
+    pub fn invalidate_stale_sources(
+        &mut self,
+        current_sources: &HashMap<String, String>,
+    ) -> Result<usize> {
+        let stale_records = self
+            .load_chunks()?
+            .into_iter()
+            .filter(|chunk| {
+                current_sources
+                    .get(&chunk.record_id)
+                    .is_none_or(|source_hash| source_hash != &chunk.source_hash)
+            })
+            .map(|chunk| chunk.record_id)
+            .collect::<HashSet<_>>();
+        if stale_records.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction()?;
+        let mut removed = 0;
+        for record_id in stale_records {
+            removed += transaction.execute(
+                "DELETE FROM rag_chunks WHERE record_id = ?1",
+                rusqlite::params![record_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    fn record_retrieval(
+        &mut self,
+        query: &str,
+        scope: &Scope,
+        embedding_provider: Option<&str>,
+        embedding_model: Option<&str>,
+        result_count: usize,
+    ) -> Result<()> {
+        let run_id = format!(
+            "rag-retrieval-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        self.connection.execute(
+            "INSERT INTO rag_retrieval_runs(
+                run_id, query, scope_json, embedding_provider, embedding_model,
+                result_count, policy_version, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                run_id,
+                query,
+                serde_json::to_string(scope)?,
+                embedding_provider,
+                embedding_model,
+                result_count as i64,
+                RAG_POLICY_VERSION,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 /// A bounded, in-memory lexical retriever used when the user explicitly enables
 /// RAG without configuring an embedding provider. It keeps the same citation and
 /// invalidation contract as a future vector implementation.
@@ -194,6 +423,57 @@ impl LexicalRagManager {
             chunks: Vec::new(),
             embedding_provider: Some(provider),
         }
+    }
+
+    pub fn load_from_index(
+        config: RagConfig,
+        provider: Option<Box<dyn EmbeddingProvider>>,
+        index: &PersistentRagIndex,
+    ) -> Result<Self> {
+        let descriptor = provider.as_ref().map(|provider| provider.descriptor());
+        let mut manager = match provider {
+            Some(provider) => Self::with_embedding_provider(config, provider),
+            None => Self::new(config),
+        };
+        for mut chunk in index.load_chunks()? {
+            let embedding_is_current = descriptor.as_ref().is_some_and(|descriptor| {
+                chunk.embedding_provider.as_deref() == Some(descriptor.id.as_str())
+                    && chunk.embedding_model.as_deref() == Some(descriptor.model.as_str())
+            });
+            if !embedding_is_current {
+                chunk.embedding = None;
+                chunk.embedding_provider = None;
+                chunk.embedding_model = None;
+            }
+            manager.chunks.push(chunk);
+        }
+        Ok(manager)
+    }
+
+    pub fn persist_to_index(&self, index: &mut PersistentRagIndex) -> Result<usize> {
+        index.replace_chunks(&self.chunks)
+    }
+
+    pub fn record_retrieval(
+        &self,
+        index: &mut PersistentRagIndex,
+        query: &str,
+        scope: &Scope,
+        result_count: usize,
+    ) -> Result<()> {
+        let descriptor = self
+            .embedding_provider
+            .as_ref()
+            .map(|provider| provider.descriptor());
+        index.record_retrieval(
+            query,
+            scope,
+            descriptor.as_ref().map(|descriptor| descriptor.id.as_str()),
+            descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.model.as_str()),
+            result_count,
+        )
     }
 
     fn scope_allowed(&self, scope: &Scope) -> bool {
@@ -521,6 +801,110 @@ mod tests {
         assert_eq!(
             context.citations[0].embedding_model.as_deref(),
             Some("hash-v1")
+        );
+    }
+
+    #[test]
+    fn persistent_index_round_trips_and_invalidates_changed_embedding_model() {
+        let mut index = PersistentRagIndex::open_in_memory().expect("persistent index");
+        let mut manager = LexicalRagManager::with_embedding_provider(
+            RagConfig {
+                enabled: true,
+                ..RagConfig::default()
+            },
+            Box::new(HashedEmbeddingProvider::new("hash-v1", 32).expect("provider")),
+        );
+        manager
+            .index(&[RagDocument {
+                record_id: "artifact-persisted".into(),
+                scope: Scope::host("host-test"),
+                title: "persistent memory".into(),
+                content: "durable context".into(),
+                source_reference: "/memory.md".into(),
+                source_hash: "persisted-hash".into(),
+                sensitivity: SensitivityClass::Internal,
+                lifecycle: LifecycleState::Active,
+            }])
+            .expect("index document");
+        assert_eq!(manager.persist_to_index(&mut index).expect("persist"), 1);
+        manager
+            .record_retrieval(&mut index, "durable", &Scope::host("host-test"), 1)
+            .expect("record retrieval");
+
+        let restored = LexicalRagManager::load_from_index(
+            RagConfig {
+                enabled: true,
+                ..RagConfig::default()
+            },
+            Some(Box::new(
+                HashedEmbeddingProvider::new("hash-v1", 32).expect("provider"),
+            )),
+            &index,
+        )
+        .expect("restore index");
+        let context = restored
+            .retrieve("durable", &Scope::host("host-test"), 1)
+            .expect("retrieve restored");
+        assert_eq!(
+            context.citations[0].embedding_model.as_deref(),
+            Some("hash-v1")
+        );
+
+        let changed = LexicalRagManager::load_from_index(
+            RagConfig {
+                enabled: true,
+                ..RagConfig::default()
+            },
+            Some(Box::new(
+                HashedEmbeddingProvider::new("hash-v2", 32).expect("provider"),
+            )),
+            &index,
+        )
+        .expect("restore changed model");
+        let context = changed
+            .retrieve("durable", &Scope::host("host-test"), 1)
+            .expect("retrieve changed model");
+        assert_eq!(context.citations[0].embedding_model, None);
+    }
+
+    #[test]
+    fn persistent_index_removes_missing_or_changed_catalog_sources() {
+        let mut index = PersistentRagIndex::open_in_memory().expect("persistent index");
+        let mut manager = LexicalRagManager::new(RagConfig {
+            enabled: true,
+            ..RagConfig::default()
+        });
+        manager
+            .index(&[RagDocument {
+                record_id: "artifact-stale".into(),
+                scope: Scope::host("host-test"),
+                title: "stale".into(),
+                content: "old context".into(),
+                source_reference: "/old.md".into(),
+                source_hash: "old-hash".into(),
+                sensitivity: SensitivityClass::Internal,
+                lifecycle: LifecycleState::Active,
+            }])
+            .expect("index stale document");
+        manager
+            .persist_to_index(&mut index)
+            .expect("persist stale document");
+        let mut current = HashMap::new();
+        current.insert("artifact-stale".into(), "new-hash".into());
+        assert_eq!(
+            index
+                .invalidate_stale_sources(&current)
+                .expect("invalidate"),
+            1
+        );
+        let restored = LexicalRagManager::load_from_index(RagConfig::default(), None, &index)
+            .expect("load after invalidation");
+        assert!(
+            restored
+                .retrieve("old", &Scope::host("host-test"), 1)
+                .expect("retrieve after invalidation")
+                .context
+                .is_empty()
         );
     }
 }
