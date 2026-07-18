@@ -1,6 +1,6 @@
 [package]
 name = "amcp-desktop"
-version = "0.1.5"
+version = "0.1.6"
 description = "AMCP desktop controller"
 authors = ["HyperDev"]
 edition = "2021"
