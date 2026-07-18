@@ -17,7 +17,11 @@ jobs:
         include:
           - runner: macos-14
             target: aarch64-apple-darwin
-          - runner: macos-13
+          # macos-14 is Apple Silicon but its SDK can cross-compile the
+          # Agent's pure-Rust dependency graph for Intel. Keeping both
+          # artifacts on this available runner avoids the scarce macos-13
+          # hosted-runner queue.
+          - runner: macos-14
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
