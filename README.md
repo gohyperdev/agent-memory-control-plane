@@ -17,6 +17,64 @@ The current implementation slice is macOS-first and Codex-first:
 - Existing trusted paths from Codex `projects.toml` are discovered as additional project roots, so project `.codex/config.toml` and guidance are inventoried without manual root configuration.
 - The Desktop can add local project directories to the next collection (one absolute path per line). They are validated as existing directories, passed only to the local Agent, deduplicated, and remain read-only unless Codex itself marks the project `trusted`.
 
+## Install a remote macOS Agent from GitHub Release
+
+Use this on the **remote Mac**. It installs the correct Apple Silicon or Intel
+Agent automatically, and verifies its published SHA-256 checksum. No repository
+clone is required. These are developer/test artifacts; they are not Developer
+ID-signed or notarized.
+
+```bash
+amcp_version=v0.1.6
+amcp_bootstrap=$(mktemp -d)
+cd "$amcp_bootstrap"
+curl --fail --location \
+  "https://github.com/gohyperdev/agent-memory-control-plane/releases/download/$amcp_version/amcp-agent-macos-tools.tar.gz" \
+  -o amcp-agent-macos-tools.tar.gz
+curl --fail --location \
+  "https://github.com/gohyperdev/agent-memory-control-plane/releases/download/$amcp_version/SHA256SUMS" \
+  -o SHA256SUMS
+grep ' amcp-agent-macos-tools.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf amcp-agent-macos-tools.tar.gz
+./amcp-agent-macos-tools/scripts/install-agent-macos-release.sh \
+  --repo gohyperdev/agent-memory-control-plane --version "$amcp_version"
+```
+
+Then provision a TLS certificate/key for the remote Mac, start the Agent once
+with a one-time pairing code, enroll it from the Controller Mac, and persist it
+as a per-user LaunchAgent:
+
+```bash
+# Remote Mac: replace the IP address and certificate paths.
+read -r -s AMCP_AGENT_PAIRING_CODE
+export AMCP_HOST_ID=mac-2 AMCP_AGENT_PAIRING_CODE
+"$HOME/Library/Application Support/AMCP/bin/amcp-agent" \
+  --tcp-bind 192.0.2.42:45432 \
+  --tls-cert /absolute/path/to/mac-2.crt \
+  --tls-key /absolute/path/to/mac-2.key serve
+
+# Controller Mac, while the command above is running:
+read -r -s AMCP_CONTROLLER_PAIRING_CODE
+./target/release/amcp-controller enroll \
+  --agent-url tcp://mac-2.example:45432 \
+  --tls-ca /absolute/path/to/private-ca.crt \
+  --tls-server-name mac-2.example \
+  --pairing-code "$AMCP_CONTROLLER_PAIRING_CODE" \
+  --db "$HOME/Library/Application Support/AMCP/controller.sqlite" --json
+
+# Remote Mac, after enrollment succeeds:
+./amcp-agent-macos-tools/scripts/configure-macos-remote-agent.sh \
+  --agent-bin "$HOME/Library/Application Support/AMCP/bin/amcp-agent" \
+  --host-id mac-2 --listen 192.0.2.42:45432 \
+  --tls-cert /absolute/path/to/mac-2.crt \
+  --tls-key /absolute/path/to/mac-2.key
+```
+
+The pairing code is short-lived and must be transferred to the Controller over
+an out-of-band channel. The persistent LaunchAgent uses the rotated credential
+in the remote Mac's Keychain; it does not store a pairing code or token. The
+detailed deployment notes remain in [Remote Agent deployment](#remote-agent-example-tls-is-required-for-tcp-mode).
+
 ## Run the first vertical slice
 
 ```bash
@@ -244,8 +302,8 @@ To bootstrap a clean second Mac without cloning this repository, download the
 small tooling archive and verify it first (replace the placeholders):
 
 ```bash
-amcp_repo=OWNER/REPOSITORY
-amcp_version=v0.1.0
+amcp_repo=gohyperdev/agent-memory-control-plane
+amcp_version=v0.1.6
 amcp_bootstrap=$(mktemp -d)
 cd "$amcp_bootstrap"
 curl --fail --location --proto '=https' --tlsv1.2 \
