@@ -6,12 +6,14 @@ use amcp_app_server::AppServerClient;
 use amcp_codex::CodexAdapter;
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRef, ChangeOperation, ChangeOperationKind, ChangeReceipt, ChangeSet,
-    ChangeStatus, HostIdentity, RuntimeEvent, RuntimeThreadSnapshot, new_id,
+    ChangeStatus, HostIdentity, LocalSearchHit, ProviderHealth, RuntimeEvent,
+    RuntimeThreadSnapshot, new_id, stable_runtime_event_id,
 };
 use amcp_domain::{change_set_operations_hash, runtime_thread_state_hash};
 use amcp_file_providers::{AntigravityAdapter, ClaudeCodeAdapter, KiroAdapter};
 use amcp_platform::{
-    MacOsKeychain, SecretStore, default_agent_socket_path, keychain_account_for_host,
+    SecretStore, credential_store_for_account, default_agent_backup_dir, default_agent_socket_path,
+    default_agent_state_dir, keychain_account_for_host,
 };
 use amcp_protocol::{
     PROTOCOL_VERSION, ProtocolError, RequestEnvelope, RequestMethod, ResponseEnvelope,
@@ -32,9 +34,13 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration as StdDuration, Instant},
 };
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(target_os = "windows")]
+use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{TcpListener, UnixListener},
+    net::TcpListener,
     time::{interval, sleep},
 };
 use tokio_rustls::TlsAcceptor;
@@ -200,7 +206,24 @@ async fn serve(args: Args) -> Result<()> {
     if let Some(bind) = args.tcp_bind.clone() {
         return serve_tls(args, bind, auth).await;
     }
+    serve_local(args, auth).await
+}
+
+#[cfg(unix)]
+async fn serve_local(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
     serve_unix(args, auth).await
+}
+
+#[cfg(target_os = "windows")]
+async fn serve_local(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
+    serve_windows(args, auth).await
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+async fn serve_local(_args: Args, _auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
+    anyhow::bail!(
+        "AMCP local IPC is not implemented for this platform; configure --tcp-bind with TLS"
+    )
 }
 
 fn start_local_watcher(
@@ -292,6 +315,7 @@ fn start_local_watcher(
                         payload_json: serde_json::json!({
                             "watcher": "notify",
                             "kind": kind,
+                            "root": watch_root,
                             "paths": relative_paths,
                         })
                         .to_string(),
@@ -401,7 +425,12 @@ async fn poll_runtime_threads(
     let mut events = Vec::new();
     let mut cursor = None;
     for _ in 0..8 {
-        let response = client.list_threads(cursor.as_deref(), Some(64)).await?;
+        let runtime_request = provider
+            .runtime_list_request(cursor.as_deref(), 64)?
+            .context("provider runtime list request unavailable")?;
+        let response = client
+            .request(&runtime_request.method, runtime_request.params)
+            .await?;
         for thread in extract_thread_values(&response) {
             if let Some(event) = provider.map_runtime_thread(host, &thread, sequence)? {
                 events.push(event);
@@ -535,6 +564,7 @@ fn extract_next_thread_cursor(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
 async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
     let secure_default_socket = args.socket == default_agent_socket_path();
     if let Some(parent) = args.socket.parent() {
@@ -583,6 +613,54 @@ async fn serve_unix(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
             .await
             {
                 eprintln!("AMCP Agent connection error: {error:#}");
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn serve_windows(args: Args, auth: Arc<Mutex<AgentAuth>>) -> Result<()> {
+    let pipe_name = args
+        .socket
+        .to_str()
+        .context("AMCP Windows named-pipe name must be valid Unicode")?;
+    if !pipe_name.starts_with(r"\\.\pipe\") {
+        anyhow::bail!(
+            "AMCP Windows local IPC must use a named-pipe path beginning with \\\\.\\pipe\\"
+        );
+    }
+    println!("AMCP Agent listening on Windows named pipe {pipe_name}");
+    let mut first_instance = true;
+    loop {
+        let server = ServerOptions::new()
+            .first_pipe_instance(first_instance)
+            .reject_remote_clients(true)
+            .create(pipe_name)
+            .with_context(|| format!("create AMCP Windows named pipe {pipe_name}"))?;
+        first_instance = false;
+        server
+            .connect()
+            .await
+            .with_context(|| format!("accept Controller connection on {pipe_name}"))?;
+        let auth = auth.clone();
+        let codex_home = args.codex_home.clone();
+        let codex_bin = args.codex_bin.clone();
+        let runtime_cwd = args.runtime_cwd.clone();
+        let backup_dir = default_backup_dir();
+        let state_dir = default_state_dir();
+        tokio::spawn(async move {
+            if let Err(error) = handle_connection(
+                server,
+                auth,
+                codex_home,
+                codex_bin,
+                runtime_cwd,
+                backup_dir,
+                state_dir,
+            )
+            .await
+            {
+                eprintln!("AMCP Agent named-pipe connection error: {error:#}");
             }
         });
     }
@@ -1151,9 +1229,67 @@ fn process_request(
                         }
                     }
                     Err(error) => match load_collection_cache(state_dir, provider_id) {
-                        Ok(Some(batch)) => Ok(ResponsePayload::Collection(batch)),
+                        Ok(Some(mut batch)) => {
+                            mark_provider_health(&mut batch, provider_id, ProviderHealth::Degraded);
+                            let diagnostic = provider_collection_failure_diagnostic(
+                                &batch.host,
+                                provider_id,
+                                &batch.runtime_events,
+                            );
+                            batch.runtime_events.push(diagnostic.clone());
+                            let _ = append_runtime_event_outbox(state_dir, &[diagnostic]);
+                            Ok(ResponsePayload::Collection(batch))
+                        }
                         _ => Err(ProtocolError::new("collection_failed", error.to_string())),
                     },
+                }
+            }
+            RequestMethod::SearchLocal {
+                query,
+                scope,
+                limit,
+            } => {
+                if scope
+                    .as_ref()
+                    .and_then(|scope| scope.host_id.as_deref())
+                    .is_some_and(|host_id| host_id != host_identity().host_id)
+                {
+                    Err(ProtocolError::new(
+                        "scope_denied",
+                        "requested host is not this Agent",
+                    ))
+                } else if query.trim().is_empty() || query.len() > 512 {
+                    Err(ProtocolError::new(
+                        "invalid_query",
+                        "local search query must contain at most 512 characters",
+                    ))
+                } else {
+                    let provider_ids = scope
+                        .as_ref()
+                        .and_then(|scope| scope.provider_id.clone())
+                        .map(|provider_id| vec![provider_id])
+                        .unwrap_or_else(|| {
+                            provider_registry(codex_home)
+                                .descriptors()
+                                .into_iter()
+                                .map(|descriptor| descriptor.id)
+                                .collect()
+                        });
+                    match search_collection_cache(
+                        state_dir,
+                        &provider_ids,
+                        query.trim(),
+                        scope.as_ref(),
+                        limit,
+                    ) {
+                        Ok((results, cache_available)) => Ok(ResponsePayload::LocalSearch {
+                            results,
+                            cache_available,
+                        }),
+                        Err(error) => {
+                            Err(ProtocolError::new("local_search_failed", error.to_string()))
+                        }
+                    }
                 }
             }
             RequestMethod::ReplayCollection { provider_id, limit } => {
@@ -1543,10 +1679,13 @@ async fn process_runtime_list_request(
             .initialize("amcp-agent-runtime-read", env!("CARGO_PKG_VERSION"))
             .await
             .context("initialize Codex app-server for runtime read")?;
+        let runtime_request = provider
+            .runtime_list_request(cursor.as_deref(), limit)?
+            .context("provider runtime list request unavailable")?;
         let response = client
-            .list_threads(cursor.as_deref(), Some(limit as u32))
+            .request(&runtime_request.method, runtime_request.params)
             .await
-            .context("list Codex runtime threads")?;
+            .context("list provider runtime threads")?;
         let host = host_identity();
         let mut threads = Vec::new();
         for thread in extract_thread_values(&response) {
@@ -1683,10 +1822,13 @@ async fn process_runtime_read_request(
             .initialize("amcp-agent-runtime-thread-read", env!("CARGO_PKG_VERSION"))
             .await
             .context("initialize Codex app-server for runtime thread read")?;
+        let runtime_request = provider
+            .runtime_read_request(&thread_id)?
+            .context("provider runtime read request unavailable")?;
         let response = client
-            .read_thread(&thread_id)
+            .request(&runtime_request.method, runtime_request.params)
             .await
-            .context("read Codex runtime thread")?;
+            .context("read provider runtime thread")?;
         let thread = extract_runtime_thread_value(&response)
             .context("Codex runtime read returned no thread metadata")?;
         let host = host_identity();
@@ -1801,7 +1943,12 @@ async fn process_runtime_change_request(
                     )
                     .await
                     .context("initialize Codex app-server for runtime change proposal")?;
-                let response = client.read_thread(&thread_id).await?;
+                let runtime_request = provider
+                    .runtime_read_request(&thread_id)?
+                    .context("provider runtime read request unavailable")?;
+                let response = client
+                    .request(&runtime_request.method, runtime_request.params)
+                    .await?;
                 let thread = extract_runtime_thread_value(&response)
                     .context("Codex runtime read returned no thread metadata")?;
                 let record = provider
@@ -1970,7 +2117,12 @@ async fn process_runtime_change_request(
                     .initialize("amcp-agent-runtime-change", env!("CARGO_PKG_VERSION"))
                     .await
                     .context("initialize Codex app-server for runtime change")?;
-                let before_response = client.read_thread(&thread_id).await?;
+                let read_request = provider
+                    .runtime_read_request(&thread_id)?
+                    .context("provider runtime read request unavailable")?;
+                let before_response = client
+                    .request(&read_request.method, read_request.params)
+                    .await?;
                 let before_thread = extract_runtime_thread_value(&before_response)
                     .context("Codex runtime read returned no thread metadata")?;
                 let before = provider
@@ -2001,12 +2153,18 @@ async fn process_runtime_change_request(
                         message: "runtime thread is already in the requested archive state".into(),
                     });
                 }
-                if desired_archived {
-                    client.archive_thread(&thread_id).await?;
-                } else {
-                    client.unarchive_thread(&thread_id).await?;
-                }
-                let after_response = client.read_thread(&thread_id).await?;
+                let change_request = provider
+                    .runtime_change_request(&thread_id, desired_archived)?
+                    .context("provider runtime change request unavailable")?;
+                client
+                    .request(&change_request.method, change_request.params)
+                    .await?;
+                let after_read_request = provider
+                    .runtime_read_request(&thread_id)?
+                    .context("provider runtime read request unavailable")?;
+                let after_response = client
+                    .request(&after_read_request.method, after_read_request.params)
+                    .await?;
                 let after_thread = extract_runtime_thread_value(&after_response)
                     .context("Codex runtime read returned no thread metadata after apply")?;
                 let after = provider
@@ -2175,10 +2333,9 @@ fn resolve_agent_token(token: &str) -> String {
     }
     let account = env::var("AMCP_AGENT_KEYCHAIN_ACCOUNT")
         .unwrap_or_else(|_| keychain_account_for_host(&host_identity().host_id));
-    MacOsKeychain::new(account)
-        .get()
+    credential_store_for_account(account)
         .ok()
-        .flatten()
+        .and_then(|store| store.get().ok().flatten())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| token.to_owned())
 }
@@ -2186,7 +2343,9 @@ fn resolve_agent_token(token: &str) -> String {
 fn persist_enrolled_credential(credential: &str) -> Result<()> {
     #[cfg(not(test))]
     {
-        MacOsKeychain::new(keychain_account_for_host(&host_identity().host_id)).set(credential)?;
+        credential_store_for_account(keychain_account_for_host(&host_identity().host_id))
+            .context("resolve credential store for enrollment")?
+            .set(credential)?;
     }
     #[cfg(test)]
     {
@@ -2286,6 +2445,177 @@ mod tests {
                 .content
                 .contains("fixture-secret-must-not-be-indexed")
         }));
+    }
+
+    #[test]
+    fn local_cache_search_is_bounded_redacted_and_project_scoped() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host_identity())
+        .expect("fixture collection");
+        save_collection_cache(directory.path(), "codex", &batch).expect("save cache");
+
+        let (hits, cache_available) = search_collection_cache(
+            directory.path(),
+            &["codex".into()],
+            "fixture",
+            Some(&amcp_domain::Scope::host(host_identity().host_id)),
+            2,
+        )
+        .expect("search cached collection");
+        assert!(cache_available);
+        assert!(!hits.is_empty());
+        assert!(hits.len() <= 2);
+        assert!(hits.iter().all(|hit| hit.preview.len() <= 1_203));
+        assert!(
+            hits.iter()
+                .all(|hit| !hit.preview.contains("fixture-secret-must-not-be-indexed"))
+        );
+    }
+
+    #[test]
+    fn authenticated_local_search_serves_only_cached_redacted_evidence() {
+        let directory = tempfile::tempdir().expect("Agent state directory");
+        let batch = CodexAdapter::from_environment(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex"),
+        ))
+        .discover(host_identity())
+        .expect("fixture collection");
+        save_collection_cache(directory.path(), "codex", &batch).expect("save cache");
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "local-search-token".into(),
+            Some("12345678".into()),
+            300,
+        )));
+        let response = process_request(
+            RequestEnvelope::new(
+                RequestMethod::SearchLocal {
+                    query: "fixture".into(),
+                    scope: Some(amcp_domain::Scope::host(host_identity().host_id)),
+                    limit: 3,
+                },
+                Some("local-search-token".into()),
+            ),
+            &auth,
+            None,
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        let ResponsePayload::LocalSearch {
+            results,
+            cache_available,
+        } = response.result.expect("local search response")
+        else {
+            panic!("expected local search response");
+        };
+        assert!(cache_available);
+        assert!(!results.is_empty());
+        assert!(results.len() <= 3);
+        assert!(
+            results
+                .iter()
+                .all(|hit| !hit.preview.contains("fixture-secret-must-not-be-indexed"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_provider_collection_returns_cached_batch_with_a_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary Agent state");
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("Codex home");
+        let host = host_identity();
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "test-token".into(),
+            Some("12345678".into()),
+            300,
+        )));
+        let collection_request = || {
+            RequestEnvelope::new(
+                RequestMethod::Collect {
+                    scope: Some(amcp_domain::Scope::host(host.host_id.clone())),
+                    cursor: None,
+                },
+                Some("test-token".into()),
+            )
+        };
+        let first = process_request(
+            collection_request(),
+            &auth,
+            Some(codex_home.clone()),
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        assert!(matches!(first.result, Ok(ResponsePayload::Collection(_))));
+
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o000))
+            .expect("make Codex home inaccessible");
+        let fallback = process_request(
+            collection_request(),
+            &auth,
+            Some(codex_home.clone()),
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o700))
+            .expect("restore Codex home permissions");
+
+        let ResponsePayload::Collection(batch) = fallback.result.expect("cached response") else {
+            panic!("expected cached collection response");
+        };
+        assert_eq!(batch.providers[0].health, ProviderHealth::Degraded);
+        assert!(batch.runtime_events.iter().any(|event| {
+            event.event_type == "diagnostic.updated"
+                && event.payload_json.contains("provider_collection_failed")
+                && event.payload_json.contains("cached_collection")
+        }));
+    }
+
+    #[test]
+    fn cached_provider_failure_diagnostic_is_stable_and_content_free() {
+        let host = HostIdentity {
+            host_id: "host-provider-failure".into(),
+            display_name: "Provider failure host".into(),
+            platform: "macos".into(),
+            hostname: "provider-failure.local".into(),
+        };
+        let diagnostic = provider_collection_failure_diagnostic(&host, "codex", &[]);
+        assert_eq!(diagnostic.event_type, "diagnostic.updated");
+        assert_eq!(diagnostic.sequence, 1);
+        assert!(diagnostic.payload_json.contains("cached_collection"));
+        assert!(diagnostic.payload_json.contains("content_included"));
+        assert!(!diagnostic.payload_json.contains("provider-secret"));
+        assert_eq!(
+            diagnostic.event_id,
+            provider_collection_failure_diagnostic(&host, "codex", &[]).event_id
+        );
+    }
+
+    #[test]
+    fn incompatible_protocol_is_rejected_before_processing_the_request() {
+        let directory = tempfile::tempdir().expect("temporary Agent state");
+        let auth = Arc::new(Mutex::new(AgentAuth::new(
+            "test-token".into(),
+            Some("12345678".into()),
+            300,
+        )));
+        let mut request = RequestEnvelope::new(RequestMethod::Heartbeat, Some("test-token".into()));
+        request.protocol_version = PROTOCOL_VERSION.saturating_add(1);
+        let response = process_request(
+            request,
+            &auth,
+            None,
+            &directory.path().join("backups"),
+            directory.path(),
+        );
+        let error = response
+            .result
+            .expect_err("protocol mismatch must be rejected");
+        assert_eq!(error.code, "protocol_version_mismatch");
     }
 
     #[test]
@@ -2984,23 +3314,13 @@ mod tests {
 fn default_backup_dir() -> PathBuf {
     env::var_os("AMCP_AGENT_BACKUP_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join("Library/Application Support/AMCP/agent-backups")
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from(".amcp/agent-backups"))
+        .unwrap_or_else(default_agent_backup_dir)
 }
 
 fn default_state_dir() -> PathBuf {
     env::var_os("AMCP_AGENT_STATE_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join("Library/Application Support/AMCP/agent-state")
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from(".amcp/agent-state"))
+        .unwrap_or_else(default_agent_state_dir)
 }
 
 fn collection_cache_path(state_dir: &Path, provider_id: &str) -> PathBuf {
@@ -3088,6 +3408,127 @@ fn load_collection_cache(
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Search only the Agent's already-redacted collection cache. This is the
+/// local/offline fallback; it never opens a native provider file and it does
+/// not create a cross-host index.
+fn search_collection_cache(
+    state_dir: &Path,
+    provider_ids: &[String],
+    query: &str,
+    scope: Option<&amcp_domain::Scope>,
+    limit: usize,
+) -> Result<(Vec<LocalSearchHit>, bool)> {
+    let terms = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut results = Vec::new();
+    let mut cache_available = false;
+    for provider_id in provider_ids {
+        let Some(batch) = load_collection_cache(state_dir, provider_id)? else {
+            continue;
+        };
+        cache_available = true;
+        for artifact in batch.artifacts {
+            if artifact.provider_id != *provider_id
+                || scope
+                    .and_then(|scope| scope.project_id.as_deref())
+                    .is_some_and(|project_id| artifact.project_id.as_deref() != Some(project_id))
+            {
+                continue;
+            }
+            let searchable = format!(
+                "{}\n{}\n{}",
+                artifact.title, artifact.source_reference, artifact.content
+            )
+            .to_ascii_lowercase();
+            if !terms.iter().all(|term| searchable.contains(term)) {
+                continue;
+            }
+            results.push(LocalSearchHit {
+                artifact_id: artifact.artifact_id,
+                host_id: artifact.host_id,
+                provider_id: artifact.provider_id,
+                project_id: artifact.project_id,
+                title: artifact.title,
+                source_reference: artifact.source_reference,
+                preview: bounded_local_preview(&artifact.content),
+                sensitivity: artifact.sensitivity,
+                lifecycle: artifact.lifecycle,
+                observed_at: artifact.observation.observed_at,
+            });
+            if results.len() >= limit.clamp(1, 50) {
+                return Ok((results, cache_available));
+            }
+        }
+    }
+    Ok((results, cache_available))
+}
+
+fn bounded_local_preview(content: &str) -> String {
+    const MAX_PREVIEW_BYTES: usize = 1_200;
+    if content.len() <= MAX_PREVIEW_BYTES {
+        return content.to_owned();
+    }
+    let end = content
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_PREVIEW_BYTES)
+        .last()
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    format!("{}…", &content[..end])
+}
+
+fn provider_collection_failure_diagnostic(
+    host: &HostIdentity,
+    provider_id: &str,
+    existing_events: &[RuntimeEvent],
+) -> RuntimeEvent {
+    let event_type = "diagnostic.updated";
+    let payload_json = serde_json::json!({
+        "kind": "provider_collection_failed",
+        "provider_id": provider_id,
+        "fallback": "cached_collection",
+        "content_included": false,
+    })
+    .to_string();
+    let sequence = existing_events
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or_default()
+        + 1;
+    RuntimeEvent {
+        event_id: stable_runtime_event_id(
+            &host.host_id,
+            provider_id,
+            event_type,
+            "cached-collection",
+            &payload_json,
+        ),
+        host_id: host.host_id.clone(),
+        provider_id: provider_id.to_owned(),
+        event_type: event_type.to_owned(),
+        sequence,
+        payload_json,
+        occurred_at: Utc::now(),
+    }
+}
+
+fn mark_provider_health(
+    batch: &mut amcp_domain::CollectionBatch,
+    provider_id: &str,
+    health: ProviderHealth,
+) {
+    if let Some(provider) = batch
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    {
+        provider.health = health;
     }
 }
 
@@ -3190,6 +3631,7 @@ fn load_server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Result<ServerConfig> {
+    ensure_rustls_crypto_provider();
     let mut cert_reader = StdBufReader::new(File::open(cert_path)?);
     let certificates =
         rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3202,4 +3644,12 @@ fn load_server_config(
     Ok(ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)?)
+}
+
+/// `reqwest` enables Rustls' ring provider while the direct Agent dependency
+/// enables aws-lc-rs. Select one process-wide provider explicitly before any
+/// TLS config builder runs so local TLS listeners never panic on feature
+/// unification.
+fn ensure_rustls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }

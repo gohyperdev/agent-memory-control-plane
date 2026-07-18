@@ -53,6 +53,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -89,7 +90,9 @@ dependencies = [
  "clap",
  "rustls",
  "rustls-pemfile",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]
@@ -101,6 +104,7 @@ dependencies = [
  "amcp-domain",
  "amcp-storage",
  "anyhow",
+ "chrono",
 ]
 
 [[package]]
@@ -153,6 +157,8 @@ name = "amcp-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -179,6 +185,7 @@ name = "amcp-rag"
 version = "0.1.0"
 dependencies = [
  "amcp-domain",
+ "amcp-storage",
  "anyhow",
  "chrono",
  "reqwest",
@@ -186,6 +193,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

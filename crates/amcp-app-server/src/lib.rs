@@ -4,6 +4,7 @@ use std::{collections::VecDeque, path::Path, process::Stdio};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::watch,
 };
 
 pub struct AppServerClient {
@@ -196,23 +197,67 @@ impl AppServerClient {
             "turn/start",
             json!({
                 "threadId": thread_id,
-                "input": [{ "type": "text", "text": text }]
+                "input": [{ "type": "text", "text": text }],
+                "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user"
             }),
         )
         .await
     }
 
     pub async fn run_turn(&mut self, thread_id: &str, text: &str) -> Result<Value> {
+        let (_cancel_sender, mut cancellation) = watch::channel(false);
+        self.run_turn_cancellable(thread_id, text, &mut cancellation)
+            .await
+    }
+
+    pub async fn run_turn_cancellable(
+        &mut self,
+        thread_id: &str,
+        text: &str,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<Value> {
+        self.run_turn_cancellable_with_events(thread_id, text, cancellation, |_| {})
+            .await
+    }
+
+    pub async fn run_turn_cancellable_with_events<F>(
+        &mut self,
+        thread_id: &str,
+        text: &str,
+        cancellation: &mut watch::Receiver<bool>,
+        mut on_event: F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Value),
+    {
         let started = self.start_turn(thread_id, text).await?;
         let turn_id = started
             .get("turn")
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .context("Codex app-server did not return a turn id")?;
         let mut answer = String::new();
         let mut events = Vec::new();
+        let mut interrupt_requested = false;
         loop {
-            let message = self.next_message().await?;
+            if *cancellation.borrow() && !interrupt_requested {
+                self.interrupt_turn(thread_id, &turn_id).await?;
+                interrupt_requested = true;
+            }
+            let message = match self.next_message_or_cancellation(cancellation).await? {
+                TurnStreamEvent::Message(message) => message,
+                TurnStreamEvent::CancellationRequested => {
+                    if !interrupt_requested {
+                        self.interrupt_turn(thread_id, &turn_id).await?;
+                        interrupt_requested = true;
+                    }
+                    continue;
+                }
+            };
+            on_event(&message);
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
@@ -230,10 +275,7 @@ impl AppServerClient {
                     .get("turn")
                     .and_then(|turn| turn.get("id"))
                     .and_then(Value::as_str);
-                if turn_id.as_deref().is_none()
-                    || event_turn_id.is_none()
-                    || event_turn_id == turn_id.as_deref()
-                {
+                if event_turn_id.is_none() || event_turn_id == Some(turn_id.as_str()) {
                     if answer.is_empty() {
                         answer = extract_agent_text(&params);
                     }
@@ -274,18 +316,37 @@ impl AppServerClient {
         Ok(())
     }
 
-    async fn next_message(&mut self) -> Result<Value> {
+    async fn next_message_or_cancellation(
+        &mut self,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<TurnStreamEvent> {
         if let Some(message) = self.notifications.pop_front() {
-            return Ok(message);
+            return Ok(TurnStreamEvent::Message(message));
         }
-        let line = self
-            .stdout
-            .next_line()
-            .await?
-            .context("Codex app-server closed stdout")?;
-        serde_json::from_str(&line)
-            .with_context(|| format!("decode Codex app-server message: {line}"))
+        tokio::select! {
+            changed = cancellation.changed() => {
+                if changed.is_ok() && *cancellation.borrow() {
+                    Ok(TurnStreamEvent::CancellationRequested)
+                } else {
+                    let line = self.stdout.next_line().await?.context("Codex app-server closed stdout")?;
+                    serde_json::from_str(&line)
+                        .map(TurnStreamEvent::Message)
+                        .with_context(|| format!("decode Codex app-server message: {line}"))
+                }
+            }
+            line = self.stdout.next_line() => {
+                let line = line?.context("Codex app-server closed stdout")?;
+                serde_json::from_str(&line)
+                    .map(TurnStreamEvent::Message)
+                    .with_context(|| format!("decode Codex app-server message: {line}"))
+            }
+        }
     }
+}
+
+enum TurnStreamEvent {
+    Message(Value),
+    CancellationRequested,
 }
 
 fn summarize_notification(message: &Value) -> Value {
@@ -348,10 +409,24 @@ mod tests {
     fn thread_turn_payload_matches_app_server_contract() {
         let params = json!({
             "threadId": "thr_123",
-            "input": [{ "type": "text", "text": "hello" }]
+            "input": [{ "type": "text", "text": "hello" }],
+            "sandboxPolicy": { "type": "readOnly", "networkAccess": false },
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user"
         });
         assert_eq!(params["input"][0]["type"], "text");
         assert_eq!(params["threadId"], "thr_123");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["sandboxPolicy"]["networkAccess"], false);
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["approvalsReviewer"], "user");
+    }
+
+    #[test]
+    fn interrupt_payload_is_bound_to_thread_and_turn() {
+        let params = json!({ "threadId": "thr_123", "turnId": "turn_456" });
+        assert_eq!(params["threadId"], "thr_123");
+        assert_eq!(params["turnId"], "turn_456");
     }
 
     #[test]
@@ -377,5 +452,91 @@ mod tests {
         assert_eq!(summary["delta"], true);
         assert!(summary.get("params").is_none());
         assert!(summary.get("text").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_interrupts_the_active_turn_and_waits_for_completion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("mock app-server directory");
+        let server = directory.path().join("mock-app-server.sh");
+        std::fs::write(
+            &server,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      echo '{"id":1,"result":{}}'
+      ;;
+    *'"method":"thread/start"'*)
+      echo '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      echo '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+      echo '{"method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"item-1","delta":"partial reply"}}'
+      ;;
+    *'"method":"turn/interrupt"'*)
+      echo '{"id":4,"result":{}}'
+      echo '{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"interrupted"}}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock app-server");
+        let mut permissions = std::fs::metadata(&server)
+            .expect("read mock app-server permissions")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&server, permissions).expect("make mock app-server executable");
+
+        let mut client = AppServerClient::spawn(&server, None, None)
+            .await
+            .expect("start mock app-server");
+        client
+            .initialize("amcp-test", "0.1.0")
+            .await
+            .expect("initialize mock app-server");
+        let thread = client
+            .start_thread(None, None)
+            .await
+            .expect("start mock thread");
+        assert_eq!(thread["thread"]["id"], "thread-1");
+        let (cancel, mut cancellation) = watch::channel(false);
+        cancel.send(true).expect("request cancellation");
+        let observed_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let event_sink = observed_events.clone();
+
+        let result = client
+            .run_turn_cancellable_with_events(
+                "thread-1",
+                "cancel this turn",
+                &mut cancellation,
+                move |event| {
+                    event_sink
+                        .lock()
+                        .expect("event sink lock")
+                        .push(event.clone());
+                },
+            )
+            .await
+            .expect("receive interrupted completion");
+        assert_eq!(result["turn"]["id"], "turn-1");
+        assert_eq!(result["turn"]["status"], "interrupted");
+        {
+            let events = observed_events.lock().expect("event sink lock");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["method"] == "item/agentMessage/delta")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["method"] == "turn/completed")
+            );
+        }
+        client.shutdown().await.expect("stop mock app-server");
     }
 }

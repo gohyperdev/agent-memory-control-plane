@@ -78,6 +78,7 @@ dependencies = [
  "amcp-domain",
  "amcp-storage",
  "anyhow",
+ "chrono",
 ]
 
 [[package]]
@@ -88,6 +89,7 @@ dependencies = [
  "amcp-codex",
  "amcp-core",
  "amcp-domain",
+ "amcp-platform",
  "amcp-rag",
  "amcp-storage",
  "anyhow",
@@ -114,6 +116,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amcp-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "amcp-provider-api"
 version = "0.1.0"
 dependencies = [
@@ -127,6 +137,7 @@ name = "amcp-rag"
 version = "0.1.0"
 dependencies = [
  "amcp-domain",
+ "amcp-storage",
  "anyhow",
  "chrono",
  "reqwest 0.12.28",

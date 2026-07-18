@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gohyperdev.amcp.remote-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AMCP_AGENT_BIN__</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AMCP_HOST_ID</key><string>__AMCP_HOST_ID__</string>
+        <key>CODEX_HOME</key><string>__CODEX_HOME__</string>
+        <key>AMCP_AGENT_STATE_DIR</key><string>__AMCP_STATE_DIR__</string>
+        <key>AMCP_AGENT_BACKUP_DIR</key><string>__AMCP_BACKUP_DIR__</string>
+        <key>AMCP_AGENT_TCP_BIND</key><string>__AMCP_TCP_BIND__</string>
+        <key>AMCP_AGENT_TLS_CERT</key><string>__AMCP_TLS_CERT__</string>
+        <key>AMCP_AGENT_TLS_KEY</key><string>__AMCP_TLS_KEY__</string>
+        <key>AMCP_AGENT_APP_SERVER_ENABLED</key><string>__AMCP_APP_SERVER_ENABLED__</string>
+    </dict>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>__AMCP_LOG_DIR__/remote-agent.stdout.log</string>
+    <key>StandardErrorPath</key><string>__AMCP_LOG_DIR__/remote-agent.stderr.log</string>
+</dict>
+</plist>

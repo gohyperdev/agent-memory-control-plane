@@ -12,3 +12,4 @@ fixtures/codex/skills/
 fixtures/codex/installation_id
 fixtures/codex/.personality_migration
 fixtures/replacement-*.toml
+crates/amcp-mcp/:memory:

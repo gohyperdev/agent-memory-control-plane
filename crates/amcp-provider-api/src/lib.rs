@@ -1,6 +1,7 @@
 use amcp_domain::{
     ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet, CollectionBatch,
-    HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord,
+    HostIdentity, ProviderCompatibility, ProviderDescriptor, ProviderHealth, ProviderSupportLevel,
+    RuntimeEvent, RuntimeThreadRecord,
 };
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -20,6 +21,15 @@ pub struct RuntimeAdapterDescriptor {
     pub operations: Vec<String>,
 }
 
+/// Provider-owned app-server/host runtime call. The Agent owns transport,
+/// authentication and scope checks; the provider owns the method and bounded
+/// parameters needed by its native runtime.
+#[derive(Debug, Clone)]
+pub struct RuntimeRequest {
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
 impl InventoryProviderAdapter {
     pub fn new(
         id: impl Into<String>,
@@ -32,6 +42,11 @@ impl InventoryProviderAdapter {
                 display_name: display_name.into(),
                 version: None,
                 adapter_version: adapter_version.into(),
+                schema_fingerprint: "inventory-adapter-v1".into(),
+                support_level: ProviderSupportLevel::InventoryOnly,
+                health: ProviderHealth::Healthy,
+                compatibility: ProviderCompatibility::Compatible,
+                native_roots: Vec::new(),
                 capabilities: vec!["inventory".into()],
             },
         }
@@ -93,6 +108,23 @@ pub trait ProviderAdapter: Send + Sync {
         _host: &HostIdentity,
         _thread: &serde_json::Value,
     ) -> Result<Option<RuntimeThreadRecord>> {
+        Ok(None)
+    }
+    fn runtime_list_request(
+        &self,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<Option<RuntimeRequest>> {
+        Ok(None)
+    }
+    fn runtime_read_request(&self, _thread_id: &str) -> Result<Option<RuntimeRequest>> {
+        Ok(None)
+    }
+    fn runtime_change_request(
+        &self,
+        _thread_id: &str,
+        _archived: bool,
+    ) -> Result<Option<RuntimeRequest>> {
         Ok(None)
     }
     fn read_artifact(&self, _target: &ArtifactRef, _host: &HostIdentity) -> Result<ArtifactRecord> {
@@ -163,6 +195,11 @@ mod tests {
                 display_name: "Fake".into(),
                 version: None,
                 adapter_version: "test".into(),
+                schema_fingerprint: "fake-test-v1".into(),
+                support_level: ProviderSupportLevel::InventoryOnly,
+                health: ProviderHealth::Healthy,
+                compatibility: ProviderCompatibility::Compatible,
+                native_roots: Vec::new(),
                 capabilities: vec!["inventory".into()],
             }
         }
@@ -209,6 +246,11 @@ mod tests {
                 display_name: "Inventory only".into(),
                 version: None,
                 adapter_version: "test".into(),
+                schema_fingerprint: "inventory-only-test-v1".into(),
+                support_level: ProviderSupportLevel::InventoryOnly,
+                health: ProviderHealth::Healthy,
+                compatibility: ProviderCompatibility::Compatible,
+                native_roots: Vec::new(),
                 capabilities: vec!["inventory".into()],
             }
         }
@@ -258,8 +300,23 @@ mod tests {
     #[test]
     fn inventory_adapter_reports_capability_without_mutation_claims() {
         let adapter = InventoryProviderAdapter::new("claude-code", "Claude Code", "fixture");
-        assert_eq!(adapter.descriptor().id, "claude-code");
-        assert_eq!(adapter.descriptor().capabilities, vec!["inventory"]);
+        let descriptor = adapter.descriptor();
+        assert_eq!(descriptor.id, "claude-code");
+        assert_eq!(descriptor.schema_fingerprint, "inventory-adapter-v1");
+        assert_eq!(
+            descriptor.support_level,
+            ProviderSupportLevel::InventoryOnly
+        );
+        assert_eq!(descriptor.health, ProviderHealth::Healthy);
+        assert_eq!(descriptor.compatibility, ProviderCompatibility::Compatible);
+        assert!(descriptor.native_roots.is_empty());
+        assert_eq!(descriptor.capabilities, vec!["inventory"]);
+        assert!(
+            adapter
+                .runtime_list_request(None, 10)
+                .expect("runtime capability query")
+                .is_none()
+        );
         assert!(
             adapter
                 .propose_change(&ChangeRequest {

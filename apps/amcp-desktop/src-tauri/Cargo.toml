@@ -17,12 +17,13 @@ amcp-domain = { path = "../../../crates/amcp-domain" }
 amcp-codex = { path = "../../../crates/amcp-codex" }
 amcp-app-server = { path = "../../../crates/amcp-app-server" }
 amcp-core = { path = "../../../crates/amcp-core" }
+amcp-platform = { path = "../../../crates/amcp-platform" }
 amcp-rag = { path = "../../../crates/amcp-rag" }
 amcp-storage = { path = "../../../crates/amcp-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.5", features = [] }
-tokio = { version = "1.48", features = ["time"] }
+tokio = { version = "1.48", features = ["sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3.23"

@@ -1,0 +1,70 @@
+{
+  "documents": [
+    {
+      "record_id": "guidance-alpha",
+      "scope": {
+        "host_id": "host-alpha",
+        "provider_id": "codex",
+        "project_id": "project-alpha"
+      },
+      "title": "AGENTS.md",
+      "content": "Run cargo test before creating a change proposal.",
+      "source_reference": "/projects/alpha/AGENTS.md",
+      "source_hash": "guidance-alpha-hash",
+      "sensitivity": "Internal",
+      "lifecycle": "Active"
+    },
+    {
+      "record_id": "memory-beta",
+      "scope": {
+        "host_id": "host-beta",
+        "provider_id": "claude-code",
+        "project_id": "project-beta"
+      },
+      "title": "memory.md",
+      "content": "The remote deployment uses a separate private environment.",
+      "source_reference": "/projects/beta/memory.md",
+      "source_hash": "memory-beta-hash",
+      "sensitivity": "Internal",
+      "lifecycle": "Active"
+    },
+    {
+      "record_id": "stale-alpha",
+      "scope": {
+        "host_id": "host-alpha",
+        "provider_id": "codex",
+        "project_id": "project-alpha"
+      },
+      "title": "old-memory.md",
+      "content": "Retired deployment details must not be retrieved.",
+      "source_reference": "/projects/alpha/old-memory.md",
+      "source_hash": "stale-alpha-hash",
+      "sensitivity": "Internal",
+      "lifecycle": "Stale"
+    }
+  ],
+  "cases": [
+    {
+      "id": "alpha-guidance",
+      "query": "cargo test change proposal",
+      "scope": {
+        "host_id": "host-alpha",
+        "provider_id": "codex",
+        "project_id": "project-alpha"
+      },
+      "expected_record_ids": ["guidance-alpha"],
+      "forbidden_record_ids": ["memory-beta", "stale-alpha"]
+    },
+    {
+      "id": "cross-host-isolation",
+      "query": "remote deployment private environment",
+      "scope": {
+        "host_id": "host-alpha",
+        "provider_id": "codex",
+        "project_id": "project-alpha"
+      },
+      "expected_record_ids": [],
+      "forbidden_record_ids": ["memory-beta", "stale-alpha"]
+    }
+  ]
+}

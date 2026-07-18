@@ -3,7 +3,8 @@
 use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, CollectionBatch, ConfigLayerRecord,
     EvidenceSnapshot, GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState,
-    ProjectRecord, ProviderDescriptor, SensitivityClass, SourceObservation, new_id,
+    ProjectRecord, ProviderCompatibility, ProviderDescriptor, ProviderHealth, ProviderSupportLevel,
+    SensitivityClass, SourceObservation, new_id,
 };
 use amcp_provider_api::ProviderAdapter;
 use anyhow::{Context, Result, bail};
@@ -53,6 +54,16 @@ enum ProviderFamily {
     ClaudeCode,
     Kiro,
     Antigravity,
+}
+
+impl ProviderFamily {
+    fn schema_fingerprint(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code-file-state-v1",
+            Self::Kiro => "kiro-file-state-v1",
+            Self::Antigravity => "antigravity-file-state-v1",
+        }
+    }
 }
 
 pub type ClaudeCodeAdapter = FileProviderAdapter;
@@ -115,12 +126,18 @@ impl FileProviderAdapter {
         project_roots: Vec<PathBuf>,
         family: ProviderFamily,
     ) -> Self {
+        let native_roots = native_root_references(&user_root, &project_roots);
         Self {
             descriptor: ProviderDescriptor {
                 id: id.into(),
                 display_name: display_name.into(),
                 version: None,
                 adapter_version: ADAPTER_VERSION.into(),
+                schema_fingerprint: family.schema_fingerprint().into(),
+                support_level: ProviderSupportLevel::ReadOnly,
+                health: ProviderHealth::Healthy,
+                compatibility: ProviderCompatibility::Compatible,
+                native_roots,
                 capabilities: vec![
                     "inventory".into(),
                     "search".into(),
@@ -750,6 +767,19 @@ fn project_roots(variable: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+fn native_root_references(user_root: &Path, project_roots: &[PathBuf]) -> Vec<String> {
+    let mut roots = Vec::with_capacity(project_roots.len() + 1);
+    roots.push(user_root.to_string_lossy().into_owned());
+    roots.extend(
+        project_roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned()),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn project_id(root: &Path) -> Option<String> {
     fs::canonicalize(root)
         .ok()
@@ -834,6 +864,25 @@ mod tests {
         );
         let batch = adapter.discover(host()).expect("Claude fixture");
         assert_eq!(batch.providers[0].id, CLAUDE_CODE_PROVIDER_ID);
+        assert_eq!(
+            batch.providers[0].schema_fingerprint,
+            "claude-code-file-state-v1"
+        );
+        assert_eq!(
+            batch.providers[0].support_level,
+            ProviderSupportLevel::ReadOnly
+        );
+        assert_eq!(batch.providers[0].health, ProviderHealth::Healthy);
+        assert_eq!(
+            batch.providers[0].compatibility,
+            ProviderCompatibility::Compatible
+        );
+        assert!(
+            batch.providers[0]
+                .native_roots
+                .iter()
+                .any(|root| root.ends_with("fixtures/claude-code/.claude"))
+        );
         assert!(
             batch
                 .memory_records
@@ -898,6 +947,11 @@ mod tests {
         ];
 
         for (adapter, title) in providers {
+            assert_eq!(
+                adapter.descriptor().support_level,
+                ProviderSupportLevel::ReadOnly
+            );
+            assert!(adapter.descriptor().schema_fingerprint.ends_with("-v1"));
             let batch = adapter.discover(host.clone()).expect("provider fixture");
             let source_reference = batch
                 .artifacts

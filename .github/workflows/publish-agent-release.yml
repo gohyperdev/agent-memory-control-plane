@@ -1,0 +1,72 @@
+name: Publish Agent release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build Agent
+        run: cargo build --release --target ${{ matrix.target }} --bin amcp-agent
+      - name: Package Agent and checksum
+        run: ./scripts/package-agent-release.sh ${{ matrix.target }} dist/agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/agent
+          if-no-files-found: error
+
+  tools:
+    name: Package macOS bootstrap tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source-only bootstrap tools and checksum
+        run: ./scripts/package-agent-macos-tools.sh dist/tools
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-macos-tools
+          path: dist/tools
+          if-no-files-found: error
+
+  publish:
+    needs: [package, tools]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+      - name: Assemble checksums
+        run: |
+          mkdir release
+          find artifacts -type f -name 'amcp-agent-*.tar.gz' -exec cp {} release/ \;
+          find artifacts -type f -name SHA256SUMS -exec cat {} \; > release/SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release/* --generate-notes --title "AMCP ${GITHUB_REF_NAME}"
+          fi

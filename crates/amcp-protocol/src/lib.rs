@@ -1,7 +1,7 @@
 use amcp_domain::{
     ApprovalEnvelope, ArtifactRecord, ArtifactRef, ChangeReceipt, ChangeRequest, ChangeSet,
-    CollectionBatch, HostIdentity, ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord,
-    RuntimeThreadSnapshot, Scope,
+    CollectionBatch, HostIdentity, LocalSearchHit, ProviderDescriptor, RuntimeEvent,
+    RuntimeThreadRecord, RuntimeThreadSnapshot, Scope,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,6 +36,11 @@ pub enum RequestMethod {
     Collect {
         scope: Option<Scope>,
         cursor: Option<String>,
+    },
+    SearchLocal {
+        query: String,
+        scope: Option<Scope>,
+        limit: usize,
     },
     ReplayCollection {
         provider_id: String,
@@ -132,6 +137,10 @@ pub enum ResponsePayload {
         agent_version: String,
     },
     Collection(CollectionBatch),
+    LocalSearch {
+        results: Vec<LocalSearchHit>,
+        cache_available: bool,
+    },
     CollectionReplay {
         provider_id: String,
         batches: Vec<CollectionBatch>,
@@ -257,6 +266,29 @@ mod tests {
         assert!(matches!(
             decoded.method,
             RequestMethod::ReplayCollection { limit: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn local_search_request_round_trip_preserves_scope_and_limit() {
+        let request = RequestEnvelope::new(
+            RequestMethod::SearchLocal {
+                query: "guidance fixture".into(),
+                scope: Some(Scope {
+                    host_id: Some("host-local".into()),
+                    provider_id: Some("codex".into()),
+                    project_id: Some("project-a".into()),
+                }),
+                limit: 7,
+            },
+            Some("token".into()),
+        );
+        let decoded: RequestEnvelope =
+            serde_json::from_str(&serde_json::to_string(&request).expect("encode local search"))
+                .expect("decode local search");
+        assert!(matches!(
+            decoded.method,
+            RequestMethod::SearchLocal { limit: 7, .. }
         ));
     }
 

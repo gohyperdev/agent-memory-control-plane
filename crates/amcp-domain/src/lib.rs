@@ -96,6 +96,43 @@ pub enum PolicyDecision {
     Unsupported,
 }
 
+/// Declares how safely AMCP can interpret and act on a provider's native
+/// state. Adapters must never imply mutation support from inventory alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderSupportLevel {
+    Full,
+    ReadOnly,
+    #[default]
+    InventoryOnly,
+    Unsupported,
+}
+
+/// Health of the adapter's most recently reported native-state interaction.
+/// This is operational metadata only: detailed provider failures remain local
+/// and are represented centrally by content-free diagnostic events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+    #[default]
+    Unknown,
+}
+
+/// Whether the Controller can safely consume the provider descriptor and its
+/// normalized schema. Support level says what the provider can do; this field
+/// says whether the current adapter/schema can be used at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderCompatibility {
+    Compatible,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Scope {
     pub host_id: Option<HostId>,
@@ -332,6 +369,24 @@ pub struct ArtifactRecord {
     pub evidence: Option<EvidenceSnapshot>,
 }
 
+/// Bounded, redacted result served from an Agent's local collection cache when
+/// the Controller is unavailable. It is deliberately separate from the
+/// central search projection: no ranking state or native content is shared
+/// across hosts by this fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSearchHit {
+    pub artifact_id: ArtifactId,
+    pub host_id: HostId,
+    pub provider_id: ProviderId,
+    pub project_id: Option<ProjectId>,
+    pub title: String,
+    pub source_reference: String,
+    pub preview: String,
+    pub sensitivity: SensitivityClass,
+    pub lifecycle: LifecycleState,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub project_id: ProjectId,
@@ -468,8 +523,21 @@ pub struct RuntimeThreadSnapshot {
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
+    #[serde(rename = "provider_version", alias = "version", default)]
     pub version: Option<String>,
     pub adapter_version: String,
+    #[serde(default)]
+    pub schema_fingerprint: String,
+    #[serde(default)]
+    pub support_level: ProviderSupportLevel,
+    #[serde(default)]
+    pub health: ProviderHealth,
+    #[serde(default)]
+    pub compatibility: ProviderCompatibility,
+    /// Paths the adapter is authorized to inspect. These are inventory
+    /// metadata, not a claim that every file below a root was collected.
+    #[serde(default)]
+    pub native_roots: Vec<String>,
     pub capabilities: Vec<String>,
 }
 
@@ -478,8 +546,19 @@ pub struct ProviderRecord {
     pub host_id: HostId,
     pub provider_id: ProviderId,
     pub display_name: String,
+    #[serde(rename = "provider_version", alias = "version", default)]
     pub version: Option<String>,
     pub adapter_version: String,
+    #[serde(default)]
+    pub schema_fingerprint: String,
+    #[serde(default)]
+    pub support_level: ProviderSupportLevel,
+    #[serde(default)]
+    pub health: ProviderHealth,
+    #[serde(default)]
+    pub compatibility: ProviderCompatibility,
+    #[serde(default)]
+    pub native_roots: Vec<String>,
     pub capabilities: Vec<String>,
 }
 
@@ -584,6 +663,35 @@ mod tests {
         let scope = Scope::host("host_local");
         let json = serde_json::to_string(&scope).expect("scope should serialize");
         assert!(json.contains("host_local"));
+    }
+
+    #[test]
+    fn provider_version_uses_the_public_contract_name_and_accepts_legacy_data() {
+        let descriptor = ProviderDescriptor {
+            id: "codex".into(),
+            display_name: "Codex".into(),
+            version: Some("1.2.3".into()),
+            adapter_version: "adapter-test".into(),
+            schema_fingerprint: "codex-test-v1".into(),
+            support_level: ProviderSupportLevel::Full,
+            health: ProviderHealth::Healthy,
+            compatibility: ProviderCompatibility::Compatible,
+            native_roots: vec!["/tmp/codex".into()],
+            capabilities: vec!["inventory".into()],
+        };
+        let encoded = serde_json::to_value(&descriptor).expect("serialize descriptor");
+        assert_eq!(encoded["provider_version"], "1.2.3");
+        assert!(encoded.get("version").is_none());
+
+        let legacy: ProviderDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "display_name": "Legacy provider",
+            "version": "0.1.0",
+            "adapter_version": "legacy-adapter",
+            "capabilities": []
+        }))
+        .expect("deserialize legacy descriptor");
+        assert_eq!(legacy.version.as_deref(), Some("0.1.0"));
     }
 
     #[test]

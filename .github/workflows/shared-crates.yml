@@ -1,0 +1,84 @@
+name: Shared crates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+
+      - name: Test portable workspace crates
+        run: >-
+          cargo test --workspace
+          --exclude amcp-agent
+          --exclude amcp-controller
+          --exclude amcp-mcp
+
+      - name: Lint portable workspace crates
+        run: >-
+          cargo clippy --workspace --all-targets --all-features
+          --exclude amcp-agent
+          --exclude amcp-controller
+          --exclude amcp-mcp
+          -- -D warnings
+
+      - name: Test Windows named-pipe Agent and Controller
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p amcp-agent -p amcp-controller
+
+      - name: Lint Windows named-pipe Agent and Controller
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy -p amcp-agent -p amcp-controller --all-targets --all-features -- -D warnings
+
+  desktop-macos:
+    name: macOS desktop bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/amcp-desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: apps/amcp-desktop
+        run: npm ci
+
+      - name: Test and lint desktop backend
+        working-directory: apps/amcp-desktop
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Build and verify desktop bundle
+        run: ./scripts/acceptance-desktop-bundle.sh

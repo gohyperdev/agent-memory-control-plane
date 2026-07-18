@@ -4,10 +4,11 @@ use amcp_domain::{
     ArtifactKind, ArtifactRecord, ArtifactRef, ChangeOperationKind, ChangeReceipt, ChangeRequest,
     ChangeSet, ChangeStatus, CollectionBatch, ConfigLayerRecord, EvidenceSnapshot, GuidanceEdge,
     GuidanceRecord, HostIdentity, LifecycleState, MemoryRecord, ObservationState, ProjectRecord,
-    ProviderDescriptor, RuntimeEvent, RuntimeThreadRecord, SensitivityClass, SessionItem,
-    SessionRecord, SourceObservation, new_id, stable_runtime_event_id,
+    ProviderCompatibility, ProviderDescriptor, ProviderHealth, ProviderSupportLevel, RuntimeEvent,
+    RuntimeThreadRecord, SensitivityClass, SessionItem, SessionRecord, SourceObservation, new_id,
+    stable_runtime_event_id,
 };
-use amcp_provider_api::{ProviderAdapter, RuntimeAdapterDescriptor};
+use amcp_provider_api::{ProviderAdapter, RuntimeAdapterDescriptor, RuntimeRequest};
 use anyhow::{Result, bail};
 use chrono::Utc;
 use regex::Regex;
@@ -18,11 +19,13 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    process::Command,
 };
 use walkdir::WalkDir;
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const ADAPTER_VERSION: &str = "0.1.0";
+pub const PROVIDER_SCHEMA_FINGERPRINT: &str = "codex-file-state-v1";
 pub const REDACTION_POLICY_VERSION: &str = "amcp-redaction-v1";
 
 #[derive(Debug, Clone)]
@@ -56,20 +59,46 @@ impl CodexAdapter {
     }
 
     pub fn provider(&self) -> ProviderDescriptor {
+        let installation = codex_installation_metadata(&self.codex_home);
+        let mut capabilities = vec![
+            "inventory".to_owned(),
+            "read".to_owned(),
+            "search".to_owned(),
+            "projects".to_owned(),
+            "sessions".to_owned(),
+            "memory".to_owned(),
+            "runtime".to_owned(),
+        ];
+        if installation.codex_home_detected {
+            capabilities.push("codex-home-detected".to_owned());
+        }
+        if installation.sqlite_home_detected {
+            capabilities.push("codex-sqlite-home-detected".to_owned());
+        } else if installation.sqlite_home_configured {
+            capabilities.push("codex-sqlite-home-unavailable".to_owned());
+        }
+        if installation.executable_detected {
+            capabilities.push("codex-cli-detected".to_owned());
+        }
+        if installation.version.is_some() {
+            capabilities.push("codex-version-detected".to_owned());
+        }
+        let native_roots = self
+            .discovery_roots()
+            .into_iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect();
         ProviderDescriptor {
             id: CODEX_PROVIDER_ID.to_owned(),
             display_name: "OpenAI Codex".to_owned(),
-            version: None,
+            version: installation.version,
             adapter_version: ADAPTER_VERSION.to_owned(),
-            capabilities: vec![
-                "inventory".to_owned(),
-                "read".to_owned(),
-                "search".to_owned(),
-                "projects".to_owned(),
-                "sessions".to_owned(),
-                "memory".to_owned(),
-                "runtime".to_owned(),
-            ],
+            schema_fingerprint: PROVIDER_SCHEMA_FINGERPRINT.to_owned(),
+            support_level: ProviderSupportLevel::Full,
+            health: ProviderHealth::Healthy,
+            compatibility: ProviderCompatibility::Compatible,
+            native_roots,
+            capabilities,
         }
     }
 
@@ -101,6 +130,8 @@ impl CodexAdapter {
                 &mut guidance_records,
             )?;
         }
+
+        self.discover_projects_from_session_metadata(&host, &mut projects, &mut sessions);
 
         artifacts.sort_by(|left, right| left.source_reference.cmp(&right.source_reference));
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
@@ -163,6 +194,7 @@ impl CodexAdapter {
             bail!("change target has no host id");
         }
         let path = self.authorized_path(&request.target.source_reference)?;
+        self.ensure_project_is_writable(&path)?;
         if matches!(request.operation, ChangeOperationKind::DeleteFile) {
             bail!("Codex adapter does not allow file deletion in this release");
         }
@@ -187,6 +219,7 @@ impl CodexAdapter {
         if redacted != replacement {
             bail!("replacement content contains secret-like material");
         }
+        validate_replacement(&path, replacement)?;
         let after_hash = hash_bytes(replacement.as_bytes());
         let before_text = redact_text(&String::from_utf8_lossy(
             current.as_deref().unwrap_or_default(),
@@ -228,11 +261,19 @@ impl CodexAdapter {
         if target.provider_id != CODEX_PROVIDER_ID || target.host_id != host.host_id {
             bail!("artifact target is outside this Codex Agent scope");
         }
-        let path = self.authorized_path(&target.source_reference)?;
-        let kind = match path.file_name().and_then(|name| name.to_str()) {
-            Some("AGENTS.md") | Some("AGENTS.override.md") => ArtifactKind::Instruction,
-            Some("config.toml") => ArtifactKind::Configuration,
-            _ => bail!("artifact is not a supported safe Codex document"),
+        let (path, kind) = match self.authorized_path(&target.source_reference) {
+            Ok(path) => {
+                let kind = match path.file_name().and_then(|name| name.to_str()) {
+                    Some("AGENTS.md") | Some("AGENTS.override.md") => ArtifactKind::Instruction,
+                    Some(name) if is_config_document_name(name) => ArtifactKind::Configuration,
+                    _ => bail!("artifact is not a supported safe Codex document"),
+                };
+                (path, kind)
+            }
+            Err(_) => (
+                self.authorized_session_read_path(&target.source_reference)?,
+                ArtifactKind::Session,
+            ),
         };
         let metadata = fs::metadata(&path)?;
         if metadata.len() > 1_000_000 {
@@ -244,6 +285,18 @@ impl CodexAdapter {
     pub fn apply_change(&self, change_set: &ChangeSet, backup_dir: &Path) -> Result<ChangeReceipt> {
         if change_set.operations.is_empty() {
             bail!("change set contains no operations");
+        }
+        for operation in &change_set.operations {
+            let path = self.authorized_path(&operation.target.source_reference)?;
+            self.ensure_project_is_writable(&path)?;
+            let replacement = operation
+                .replacement_content
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("replacement content is required"))?;
+            if redact_text(replacement) != replacement {
+                bail!("replacement content contains secret-like material");
+            }
+            validate_replacement(&path, replacement)?;
         }
         let mut backups = Vec::new();
         let mut before_hashes = Vec::new();
@@ -273,9 +326,6 @@ impl CodexAdapter {
                 .replacement_content
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("replacement content is required"))?;
-            if redact_text(replacement) != replacement {
-                bail!("replacement content contains secret-like material");
-            }
             fs::create_dir_all(backup_dir)?;
             if path.is_file() {
                 let backup = backup_path(backup_dir, &change_set.change_set_id, index, &path);
@@ -403,9 +453,8 @@ impl CodexAdapter {
         if !requested.is_absolute() {
             bail!("change target must be an absolute path");
         }
-        let mut roots = vec![self.codex_home.clone()];
-        roots.extend(self.scan_roots.iter().cloned());
-        let roots = roots
+        let roots = self
+            .discovery_roots()
             .into_iter()
             .filter_map(|root| fs::canonicalize(root).ok())
             .collect::<Vec<_>>();
@@ -422,6 +471,8 @@ impl CodexAdapter {
         if !roots.iter().any(|root| canonical.starts_with(root)) {
             bail!("change target is outside configured provider roots");
         }
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
         if requested
             .file_name()
             .and_then(|name| name.to_str())
@@ -430,14 +481,56 @@ impl CodexAdapter {
         {
             bail!("change target is not writable by Codex policy");
         }
-        if !matches!(
-            requested.file_name().and_then(|name| name.to_str()),
-            Some("config.toml") | Some("AGENTS.md") | Some("AGENTS.override.md")
-        ) {
+        let file_name = requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("change target has no valid filename"))?;
+        let supported_document = matches!(file_name, "AGENTS.md" | "AGENTS.override.md")
+            || file_name == "config.toml"
+            || (file_name.ends_with(".config.toml")
+                && canonical.parent() == Some(codex_home.as_path()));
+        if !supported_document {
             bail!("change target is not a supported Codex text document");
         }
         if requested.exists() && fs::symlink_metadata(&requested)?.file_type().is_symlink() {
             bail!("symlink targets are not writable");
+        }
+        Ok(canonical)
+    }
+
+    /// Session source files are evidence-only: they can be read through the
+    /// normal bounded redaction path, but are deliberately excluded from the
+    /// write allowlist in `authorized_path`.
+    fn authorized_session_read_path(&self, source_reference: &str) -> Result<PathBuf> {
+        let requested = PathBuf::from(source_reference);
+        if !requested.is_absolute() {
+            bail!("session source must be an absolute path");
+        }
+        if requested.exists() && fs::symlink_metadata(&requested)?.file_type().is_symlink() {
+            bail!("symlink session sources are not readable");
+        }
+        let canonical_parent = requested
+            .parent()
+            .map(fs::canonicalize)
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("session source has no parent"))?;
+        let canonical = canonical_parent.join(
+            requested
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("session source has no filename"))?,
+        );
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        let in_session_directory = canonical.starts_with(codex_home.join("sessions"))
+            || canonical.starts_with(codex_home.join("archived_sessions"));
+        if !in_session_directory
+            || canonical
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("jsonl")
+            || !canonical.is_file()
+        {
+            bail!("artifact is not a supported read-only Codex session source");
         }
         Ok(canonical)
     }
@@ -490,6 +583,33 @@ impl CodexAdapter {
                     && let Ok(guidance) = self.guidance_record(&path, host)
                 {
                     guidance_records.push(guidance);
+                }
+            }
+        }
+
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        if root == codex_home {
+            for entry in fs::read_dir(&root)? {
+                let entry = entry?;
+                let path = entry.path();
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if !path.is_file()
+                    || file_name == "config.toml"
+                    || !file_name.ends_with(".config.toml")
+                {
+                    continue;
+                }
+                artifacts.push(self.file_artifact(
+                    &path,
+                    ArtifactKind::Configuration,
+                    host,
+                    collection_run_id,
+                    true,
+                )?);
+                if let Ok(layer) = self.config_layer(&path, host) {
+                    config_layers.push(layer);
                 }
             }
         }
@@ -556,6 +676,19 @@ impl CodexAdapter {
                         config_layers.push(layer);
                     }
                 } else if let Ok(guidance) = self.guidance_record(entry.path(), host) {
+                    guidance_records.push(guidance);
+                }
+            } else if let Some(kind) = codex_auxiliary_artifact_kind(entry.path(), &root) {
+                artifacts.push(self.file_artifact(
+                    entry.path(),
+                    kind.clone(),
+                    host,
+                    collection_run_id,
+                    true,
+                )?);
+                if kind == ArtifactKind::Instruction
+                    && let Ok(guidance) = self.guidance_record(entry.path(), host)
+                {
                     guidance_records.push(guidance);
                 }
             }
@@ -665,6 +798,46 @@ impl CodexAdapter {
             }
         }
         Ok(())
+    }
+
+    /// Session metadata is provider-owned inventory, so it can establish a
+    /// project record without reading any project file. When a Git root is
+    /// present, use it; otherwise retain the validated session cwd itself.
+    fn discover_projects_from_session_metadata(
+        &self,
+        host: &HostIdentity,
+        projects: &mut Vec<ProjectRecord>,
+        sessions: &mut [SessionRecord],
+    ) {
+        for session in sessions {
+            let Some(cwd) = session.cwd.as_deref() else {
+                continue;
+            };
+            let Some(root) = project_root_from_session_cwd(Path::new(cwd)) else {
+                continue;
+            };
+            let project_id = root.to_string_lossy().into_owned();
+            if !projects
+                .iter()
+                .any(|project| project.project_id == project_id)
+            {
+                projects.push(ProjectRecord {
+                    project_id: project_id.clone(),
+                    host_id: host.host_id.clone(),
+                    provider_id: CODEX_PROVIDER_ID.to_owned(),
+                    root_path: project_id.clone(),
+                    display_name: root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project")
+                        .to_owned(),
+                    trust_level: self.project_trust_level(&root),
+                    discovered_from: "codex-session-cwd".to_owned(),
+                    observed_at: Utc::now(),
+                });
+            }
+            session.project_id = Some(project_id);
+        }
     }
 
     fn discover_session_file(
@@ -925,6 +1098,44 @@ impl CodexAdapter {
             .map(|root| root.to_string_lossy().into_owned())
     }
 
+    fn ensure_project_is_writable(&self, path: &Path) -> Result<()> {
+        let codex_home =
+            fs::canonicalize(&self.codex_home).unwrap_or_else(|_| self.codex_home.clone());
+        if path.starts_with(&codex_home) {
+            return Ok(());
+        }
+        let project_root = self
+            .discovery_roots()
+            .into_iter()
+            .filter(|root| root != &codex_home)
+            .find(|root| path.starts_with(root))
+            .ok_or_else(|| anyhow::anyhow!("change target is outside a trusted project root"))?;
+        let trust_level = self.project_trust_level(&project_root);
+        if trust_level
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("trusted"))
+        {
+            return Ok(());
+        }
+        bail!(
+            "project is not trusted for mutation: {} ({})",
+            project_root.display(),
+            trust_level.unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+
+    fn project_trust_level(&self, project_root: &Path) -> Option<String> {
+        let content = fs::read_to_string(self.codex_home.join("projects.toml")).ok()?;
+        let document = content.parse::<toml::Value>().ok()?;
+        let entries = document.get("projects")?.as_table()?;
+        entries.iter().find_map(|(path, metadata)| {
+            let configured_root = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            (configured_root == project_root)
+                .then(|| metadata.get("trust_level")?.as_str().map(str::to_owned))
+                .flatten()
+        })
+    }
+
     fn discovery_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.codex_home.clone()];
         roots.extend(self.scan_roots.iter().cloned());
@@ -1086,12 +1297,7 @@ impl CodexAdapter {
             .into_owned();
         let depth = relative_scope.matches(std::path::MAIN_SEPARATOR).count() as i32;
         let base_rank = if project_id.is_some() { 40 } else { 20 } + depth;
-        let kind = if path.file_name().and_then(|name| name.to_str()) == Some("AGENTS.override.md")
-        {
-            "override"
-        } else {
-            "agents"
-        };
+        let kind = guidance_kind(&path);
         let bytes = fs::read(&path)?;
         Ok(GuidanceRecord {
             guidance_id: format!("guidance_{}", hash_bytes(path.to_string_lossy().as_bytes())),
@@ -1241,6 +1447,48 @@ impl ProviderAdapter for CodexAdapter {
         }))
     }
 
+    fn runtime_list_request(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<RuntimeRequest>> {
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), serde_json::Value::String(cursor.into()));
+        }
+        params.insert(
+            "limit".into(),
+            serde_json::Value::Number((limit.clamp(1, 256) as u64).into()),
+        );
+        Ok(Some(RuntimeRequest {
+            method: "thread/list".into(),
+            params: serde_json::Value::Object(params),
+        }))
+    }
+
+    fn runtime_read_request(&self, thread_id: &str) -> Result<Option<RuntimeRequest>> {
+        Ok(Some(RuntimeRequest {
+            method: "thread/read".into(),
+            params: serde_json::json!({ "threadId": thread_id }),
+        }))
+    }
+
+    fn runtime_change_request(
+        &self,
+        thread_id: &str,
+        archived: bool,
+    ) -> Result<Option<RuntimeRequest>> {
+        Ok(Some(RuntimeRequest {
+            method: if archived {
+                "thread/archive"
+            } else {
+                "thread/unarchive"
+            }
+            .into(),
+            params: serde_json::json!({ "threadId": thread_id }),
+        }))
+    }
+
     fn read_artifact(&self, target: &ArtifactRef, host: &HostIdentity) -> Result<ArtifactRecord> {
         Self::read_artifact(self, target, host)
     }
@@ -1344,6 +1592,26 @@ fn canonical_project_path(path: &Path) -> String {
         .into_owned()
 }
 
+fn project_root_from_session_cwd(cwd: &Path) -> Option<PathBuf> {
+    let cwd = fs::canonicalize(cwd).ok()?;
+    let cwd = if cwd.is_file() {
+        cwd.parent()?.to_path_buf()
+    } else if cwd.is_dir() {
+        cwd
+    } else {
+        return None;
+    };
+    for ancestor in cwd.ancestors().take(32) {
+        // A Git worktree can expose `.git` as either a directory or a file.
+        // Metadata inspection is sufficient; AMCP does not execute Git or
+        // read project contents during this inventory step.
+        if fs::symlink_metadata(ancestor.join(".git")).is_ok() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    Some(cwd)
+}
+
 fn parse_datetime(value: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
     value
         .as_str()
@@ -1367,6 +1635,62 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexInstallationMetadata {
+    codex_home_detected: bool,
+    sqlite_home_configured: bool,
+    sqlite_home_detected: bool,
+    executable_detected: bool,
+    version: Option<String>,
+}
+
+fn codex_installation_metadata(codex_home: &Path) -> CodexInstallationMetadata {
+    let sqlite_home = env::var_os("CODEX_SQLITE_HOME").map(PathBuf::from);
+    let configured_executable = env::var_os("AMCP_CODEX_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let executable = resolve_executable(&configured_executable);
+    let version = executable.as_deref().and_then(read_codex_version);
+    CodexInstallationMetadata {
+        codex_home_detected: codex_home.is_dir(),
+        sqlite_home_configured: sqlite_home.is_some(),
+        sqlite_home_detected: sqlite_home.is_some_and(|path| path.is_dir()),
+        executable_detected: executable.is_some(),
+        version,
+    }
+}
+
+fn resolve_executable(configured: &Path) -> Option<PathBuf> {
+    if configured.components().count() > 1 {
+        return configured.is_file().then(|| configured.to_path_buf());
+    }
+    let command = configured.to_str()?;
+    env::var_os("PATH")
+        .and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|directory| directory.join(command))
+                .find(|candidate| candidate.is_file())
+        })
+        .or_else(|| configured.is_file().then(|| configured.to_path_buf()))
+}
+
+fn read_codex_version(executable: &Path) -> Option<String> {
+    let output = Command::new(executable).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_codex_version(&output.stdout)
+}
+
+fn parse_codex_version(output: &[u8]) -> Option<String> {
+    String::from_utf8(output.to_vec())
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(256).collect())
+}
+
 fn backup_path(backup_dir: &Path, change_set_id: &str, index: usize, path: &Path) -> PathBuf {
     backup_dir.join(format!(
         "{}-{}-{}.bak",
@@ -1376,6 +1700,23 @@ fn backup_path(backup_dir: &Path, change_set_id: &str, index: usize, path: &Path
             .and_then(|name| name.to_str())
             .unwrap_or("source")
     ))
+}
+
+fn validate_replacement(path: &Path, replacement: &str) -> Result<()> {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_config_document_name)
+    {
+        replacement
+            .parse::<toml::Value>()
+            .map_err(|error| anyhow::anyhow!("replacement is not valid TOML: {error}"))?;
+    }
+    Ok(())
+}
+
+fn is_config_document_name(name: &str) -> bool {
+    name == "config.toml" || name.ends_with(".config.toml")
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1438,6 +1779,69 @@ fn should_descend(path: &Path, root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+fn codex_auxiliary_artifact_kind(path: &Path, root: &Path) -> Option<ArtifactKind> {
+    let relative = path.strip_prefix(root).ok()?;
+    let name = path.file_name()?.to_string_lossy();
+    if matches!(name.as_ref(), "auth.json" | ".env" | ".env.local") {
+        return None;
+    }
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let is_text = matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "md" | "toml"
+                | "json"
+                | "jsonc"
+                | "yaml"
+                | "yml"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "py"
+                | "js"
+                | "ts"
+        )
+    );
+    let in_rules = components.contains(&"rules");
+    let in_skills = components.contains(&"skills");
+    let in_hooks = components.contains(&"hooks");
+    let in_mcp = components.contains(&"mcp");
+    if in_skills && components.contains(&".system") {
+        return None;
+    }
+    let is_mcp_config = matches!(
+        name.as_ref(),
+        "mcp.json" | ".mcp.json" | "mcp.toml" | "mcp.yaml" | "mcp.yml" | "mcp_servers.json"
+    );
+
+    if (in_rules || (in_skills && name == "SKILL.md")) && is_text {
+        Some(ArtifactKind::Instruction)
+    } else if (in_hooks || in_mcp || is_mcp_config) && is_text {
+        Some(ArtifactKind::Tooling)
+    } else {
+        None
+    }
+}
+
+fn guidance_kind(path: &Path) -> &'static str {
+    if path.file_name().and_then(|name| name.to_str()) == Some("AGENTS.override.md") {
+        "override"
+    } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        "skill"
+    } else if path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| component == "rules")
+    {
+        "rule"
+    } else {
+        "agents"
+    }
+}
+
 fn is_cursor_file(path: &Path, root: &Path) -> bool {
     if path == root {
         return false;
@@ -1452,7 +1856,7 @@ fn is_cursor_file(path: &Path, root: &Path) -> bool {
                 | "history.jsonl"
                 | "session_index.jsonl",
         )
-    )
+    ) || codex_auxiliary_artifact_kind(path, root).is_some()
 }
 
 #[cfg(test)]
@@ -1470,8 +1874,31 @@ mod tests {
     #[test]
     fn provider_descriptor_is_codex() {
         let adapter = CodexAdapter::from_environment(Some(PathBuf::from("/tmp/codex")));
-        assert_eq!(adapter.provider().id, CODEX_PROVIDER_ID);
-        assert!(adapter.provider().capabilities.contains(&"runtime".into()));
+        let descriptor = adapter.provider();
+        assert_eq!(descriptor.id, CODEX_PROVIDER_ID);
+        assert_eq!(descriptor.schema_fingerprint, PROVIDER_SCHEMA_FINGERPRINT);
+        assert_eq!(descriptor.support_level, ProviderSupportLevel::Full);
+        assert_eq!(descriptor.health, ProviderHealth::Healthy);
+        assert_eq!(descriptor.compatibility, ProviderCompatibility::Compatible);
+        assert_eq!(descriptor.native_roots, vec!["/tmp/codex"]);
+        assert!(descriptor.capabilities.contains(&"runtime".into()));
+    }
+
+    #[test]
+    fn parses_a_bounded_codex_version_line() {
+        assert_eq!(
+            parse_codex_version(b"\n codex 1.2.3 \nextra output\n"),
+            Some("codex 1.2.3".to_owned())
+        );
+        assert_eq!(parse_codex_version(b"\n\n"), None);
+    }
+
+    #[test]
+    fn resolves_an_explicit_existing_codex_executable() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let executable = directory.path().join("codex");
+        fs::write(&executable, "fixture executable").expect("fixture executable");
+        assert_eq!(resolve_executable(&executable), Some(executable));
     }
 
     #[test]
@@ -1506,6 +1933,36 @@ mod tests {
         assert!(event.payload_json.contains("metadata_only"));
         assert!(!event.payload_json.contains("secret-value"));
         assert!(!event.payload_json.contains("must not be persisted"));
+    }
+
+    #[test]
+    fn codex_owns_runtime_requests_while_agent_owns_transport() {
+        let adapter = CodexAdapter::from_environment(Some(PathBuf::from("/tmp/codex")));
+        let list = adapter
+            .runtime_list_request(Some("cursor-1"), 999)
+            .expect("list request")
+            .expect("Codex runtime capability");
+        assert_eq!(list.method, "thread/list");
+        assert_eq!(list.params["cursor"], "cursor-1");
+        assert_eq!(list.params["limit"], 256);
+
+        let read = adapter
+            .runtime_read_request("thread-1")
+            .expect("read request")
+            .expect("Codex runtime capability");
+        assert_eq!(read.method, "thread/read");
+        assert_eq!(read.params["threadId"], "thread-1");
+
+        let archive = adapter
+            .runtime_change_request("thread-1", true)
+            .expect("archive request")
+            .expect("Codex runtime capability");
+        assert_eq!(archive.method, "thread/archive");
+        let unarchive = adapter
+            .runtime_change_request("thread-1", false)
+            .expect("unarchive request")
+            .expect("Codex runtime capability");
+        assert_eq!(unarchive.method, "thread/unarchive");
     }
 
     #[test]
@@ -1573,6 +2030,272 @@ mod tests {
             artifact.kind == ArtifactKind::Session
                 && artifact.content.starts_with("metadata-only file")
         }));
+    }
+
+    #[test]
+    fn codex_home_profile_is_discovered_as_a_redacted_profile_layer() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let codex_home = directory.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        fs::write(
+            codex_home.join("review.config.toml"),
+            "model = \"gpt-test\"\napi_key = \"profile-secret\"\n",
+        )
+        .expect("profile configuration");
+
+        let batch = CodexAdapter::from_environment(Some(codex_home.clone()))
+            .discover(HostIdentity {
+                host_id: "host-profile".into(),
+                display_name: "Profile host".into(),
+                platform: "macos".into(),
+                hostname: "profile.local".into(),
+            })
+            .expect("profile discovery");
+
+        let profile = batch
+            .config_layers
+            .iter()
+            .find(|layer| layer.source_reference.ends_with("/review.config.toml"))
+            .expect("profile layer");
+        assert_eq!(profile.scope, "profile");
+        assert_eq!(profile.profile.as_deref(), Some("review"));
+        assert!(batch.artifacts.iter().any(|artifact| {
+            artifact.source_reference.ends_with("/review.config.toml")
+                && artifact.kind == ArtifactKind::Configuration
+                && !artifact.content.contains("profile-secret")
+        }));
+    }
+
+    #[test]
+    fn codex_home_profile_can_be_proposed_applied_and_rolled_back() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let profile = directory.path().join("review.config.toml");
+        fs::write(&profile, "model = \"gpt-test\"\n").expect("profile configuration");
+        let adapter = CodexAdapter::from_environment(Some(directory.path().to_path_buf()));
+        let request = ChangeRequest {
+            actor: "test-human".into(),
+            scope: Scope::host("host-profile"),
+            target: ArtifactRef {
+                host_id: "host-profile".into(),
+                provider_id: CODEX_PROVIDER_ID.into(),
+                native_id: profile.to_string_lossy().into_owned(),
+                source_reference: profile.to_string_lossy().into_owned(),
+            },
+            expected_source_hash: Some(hash_bytes(&fs::read(&profile).expect("profile bytes"))),
+            operation: ChangeOperationKind::ReplaceText,
+            replacement_content: Some("model = \"gpt-updated\"\n".into()),
+            reason: "update profile fixture".into(),
+            evidence_ids: Vec::new(),
+        };
+        let change_set = adapter.propose_change(&request).expect("profile proposal");
+        let receipt = adapter
+            .apply_change(&change_set, &directory.path().join("backups"))
+            .expect("profile apply");
+        assert_eq!(receipt.status, ChangeStatus::Applied);
+        assert_eq!(
+            fs::read_to_string(&profile).expect("updated profile"),
+            "model = \"gpt-updated\"\n"
+        );
+        let rollback = adapter
+            .rollback_change(&change_set, &directory.path().join("backups"))
+            .expect("profile rollback");
+        assert_eq!(rollback.status, ChangeStatus::RolledBack);
+        assert_eq!(
+            fs::read_to_string(&profile).expect("restored profile"),
+            "model = \"gpt-test\"\n"
+        );
+    }
+
+    #[test]
+    fn profile_outside_codex_home_is_not_a_mutation_target() {
+        let codex_home = tempfile::tempdir().expect("Codex home");
+        let project = tempfile::tempdir().expect("project");
+        let profile = project.path().join("review.config.toml");
+        fs::write(&profile, "model = \"gpt-test\"\n").expect("project profile");
+        fs::write(
+            codex_home.path().join("projects.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.path().display()
+            ),
+        )
+        .expect("project registry");
+        let adapter = CodexAdapter::from_environment(Some(codex_home.path().to_path_buf()));
+        let request = ChangeRequest {
+            actor: "test-human".into(),
+            scope: Scope::host("host-project"),
+            target: ArtifactRef {
+                host_id: "host-project".into(),
+                provider_id: CODEX_PROVIDER_ID.into(),
+                native_id: profile.to_string_lossy().into_owned(),
+                source_reference: profile.to_string_lossy().into_owned(),
+            },
+            expected_source_hash: None,
+            operation: ChangeOperationKind::ReplaceText,
+            replacement_content: Some("model = \"gpt-updated\"\n".into()),
+            reason: "reject non-root profile".into(),
+            evidence_ids: Vec::new(),
+        };
+        let error = adapter
+            .propose_change(&request)
+            .expect_err("only root-level Codex profiles are writable");
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported Codex text document")
+        );
+    }
+
+    #[test]
+    fn recognized_rules_skills_hooks_and_mcp_configuration_are_discovered_without_execution() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let codex_home = directory.path().join("codex-home");
+        fs::create_dir_all(codex_home.join("rules")).expect("rules directory");
+        fs::create_dir_all(codex_home.join("skills/review")).expect("skills directory");
+        fs::create_dir_all(codex_home.join("hooks")).expect("hooks directory");
+        fs::create_dir_all(codex_home.join("mcp")).expect("MCP directory");
+        fs::write(
+            codex_home.join("rules/security.md"),
+            "Never expose credentials.\n",
+        )
+        .expect("rule");
+        fs::write(
+            codex_home.join("skills/review/SKILL.md"),
+            "Review the diff first.\n",
+        )
+        .expect("skill");
+        fs::write(
+            codex_home.join("hooks/pre-commit.sh"),
+            "token=hook-secret\necho never-runs\n",
+        )
+        .expect("hook");
+        fs::write(
+            codex_home.join("mcp/servers.toml"),
+            "[servers.local]\ncommand = \"tool\"\n",
+        )
+        .expect("MCP configuration");
+
+        let batch = CodexAdapter::from_environment(Some(codex_home))
+            .discover(HostIdentity {
+                host_id: "host-auxiliary".into(),
+                display_name: "Auxiliary host".into(),
+                platform: "macos".into(),
+                hostname: "auxiliary.local".into(),
+            })
+            .expect("auxiliary discovery");
+
+        assert!(batch.artifacts.iter().any(|artifact| {
+            artifact.source_reference.ends_with("/rules/security.md")
+                && artifact.kind == ArtifactKind::Instruction
+        }));
+        assert!(batch.artifacts.iter().any(|artifact| {
+            artifact
+                .source_reference
+                .ends_with("/skills/review/SKILL.md")
+                && artifact.kind == ArtifactKind::Instruction
+        }));
+        assert!(batch.artifacts.iter().any(|artifact| {
+            artifact.source_reference.ends_with("/hooks/pre-commit.sh")
+                && artifact.kind == ArtifactKind::Tooling
+                && !artifact.content.contains("hook-secret")
+        }));
+        assert!(batch.artifacts.iter().any(|artifact| {
+            artifact.source_reference.ends_with("/mcp/servers.toml")
+                && artifact.kind == ArtifactKind::Tooling
+        }));
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|guidance| guidance.kind == "rule")
+        );
+        assert!(
+            batch
+                .guidance_records
+                .iter()
+                .any(|guidance| guidance.kind == "skill")
+        );
+    }
+
+    #[test]
+    fn session_source_can_be_read_as_redacted_evidence_but_not_mutated() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let codex_home = directory.path().join("codex-home");
+        let session_source = codex_home.join("sessions/session-evidence.jsonl");
+        fs::create_dir_all(session_source.parent().expect("session parent"))
+            .expect("session directory");
+        fs::write(
+            &session_source,
+            "{\"session_id\":\"session-evidence\",\"message\":\"token=session-secret\"}\n",
+        )
+        .expect("session source");
+        let adapter = CodexAdapter::from_environment(Some(codex_home));
+        let host = HostIdentity {
+            host_id: "host-session-evidence".into(),
+            display_name: "Session evidence host".into(),
+            platform: "macos".into(),
+            hostname: "session-evidence.local".into(),
+        };
+        let target = ArtifactRef {
+            host_id: host.host_id.clone(),
+            provider_id: CODEX_PROVIDER_ID.into(),
+            native_id: session_source.display().to_string(),
+            source_reference: session_source.display().to_string(),
+        };
+
+        let artifact = adapter
+            .read_artifact(&target, &host)
+            .expect("read-only session evidence");
+        assert_eq!(artifact.kind, ArtifactKind::Session);
+        assert!(artifact.content.contains("session-evidence"));
+        assert!(!artifact.content.contains("session-secret"));
+        assert!(
+            adapter
+                .authorized_path(&session_source.display().to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_cwd_discovers_and_assigns_a_git_project_without_reading_project_files() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let codex_home = directory.path().join("codex-home");
+        let project_root = directory.path().join("workspace/project");
+        let project_cwd = project_root.join("src");
+        std::fs::create_dir_all(codex_home.join("sessions")).expect("session directory");
+        std::fs::create_dir_all(project_root.join(".git")).expect("Git directory");
+        std::fs::create_dir_all(&project_cwd).expect("project cwd");
+        std::fs::write(
+            codex_home.join("sessions/session-cwd.jsonl"),
+            format!(
+                "{{\"session_id\":\"session-from-cwd\",\"cwd\":\"{}\",\"title\":\"Session project discovery\"}}\n",
+                project_cwd.display()
+            ),
+        )
+        .expect("session metadata");
+
+        let batch = CodexAdapter::from_environment(Some(codex_home))
+            .discover(HostIdentity {
+                host_id: "host-session-project".into(),
+                display_name: "Session project host".into(),
+                platform: "macos".into(),
+                hostname: "session-project.local".into(),
+            })
+            .expect("session project discovery");
+        let project_id = canonical_project_path(&project_root);
+        assert!(batch.projects.iter().any(|project| {
+            project.project_id == project_id
+                && project.discovered_from == "codex-session-cwd"
+                && project.root_path == project_id
+        }));
+        assert_eq!(
+            batch
+                .sessions
+                .iter()
+                .find(|session| session.session_id == "session-from-cwd")
+                .and_then(|session| session.project_id.as_deref()),
+            Some(project_id.as_str())
+        );
     }
 
     #[test]
@@ -1719,6 +2442,120 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&config).expect("read rollback"),
             "sandbox_mode = \"workspace-write\"\n"
+        );
+    }
+
+    #[test]
+    fn invalid_toml_is_rejected_before_a_change_set_is_created() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "sandbox_mode = \"read-only\"\n").expect("write fixture");
+        let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));
+        let request = ChangeRequest {
+            actor: "test-human".into(),
+            scope: Scope::host("host_fixture"),
+            target: ArtifactRef {
+                host_id: "host_fixture".into(),
+                provider_id: CODEX_PROVIDER_ID.into(),
+                native_id: config.to_string_lossy().into_owned(),
+                source_reference: config.to_string_lossy().into_owned(),
+            },
+            expected_source_hash: None,
+            operation: ChangeOperationKind::ReplaceText,
+            replacement_content: Some("sandbox_mode = [\n".into()),
+            reason: "invalid TOML fixture".into(),
+            evidence_ids: Vec::new(),
+        };
+        let error = adapter
+            .propose_change(&request)
+            .expect_err("invalid TOML is rejected");
+        assert!(error.to_string().contains("not valid TOML"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("source remains untouched"),
+            "sandbox_mode = \"read-only\"\n"
+        );
+    }
+
+    #[test]
+    fn untrusted_project_configuration_cannot_be_proposed_for_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project = project_dir.path().to_path_buf();
+        let config = project.join(".codex/config.toml");
+        std::fs::create_dir_all(config.parent().expect("config parent")).expect("project dirs");
+        std::fs::write(&config, "sandbox_mode = \"read-only\"\n").expect("write fixture");
+        std::fs::write(
+            temp.path().join("projects.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                project.display()
+            ),
+        )
+        .expect("write project trust registry");
+        let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));
+        let request = ChangeRequest {
+            actor: "test-human".into(),
+            scope: Scope::host("host_fixture"),
+            target: ArtifactRef {
+                host_id: "host_fixture".into(),
+                provider_id: CODEX_PROVIDER_ID.into(),
+                native_id: config.to_string_lossy().into_owned(),
+                source_reference: config.to_string_lossy().into_owned(),
+            },
+            expected_source_hash: None,
+            operation: ChangeOperationKind::ReplaceText,
+            replacement_content: Some("sandbox_mode = \"workspace-write\"\n".into()),
+            reason: "untrusted project fixture".into(),
+            evidence_ids: Vec::new(),
+        };
+        let error = adapter
+            .propose_change(&request)
+            .expect_err("untrusted project is proposal-only at most");
+        assert!(
+            error.to_string().contains("not trusted for mutation"),
+            "unexpected policy error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("source remains untouched"),
+            "sandbox_mode = \"read-only\"\n"
+        );
+    }
+
+    #[test]
+    fn trusted_registered_project_configuration_can_be_proposed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let config = project_dir.path().join(".codex/config.toml");
+        std::fs::create_dir_all(config.parent().expect("config parent")).expect("project dirs");
+        std::fs::write(&config, "sandbox_mode = \"read-only\"\n").expect("write fixture");
+        std::fs::write(
+            temp.path().join("projects.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project_dir.path().display()
+            ),
+        )
+        .expect("write project trust registry");
+        let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));
+        let request = ChangeRequest {
+            actor: "test-human".into(),
+            scope: Scope::host("host_fixture"),
+            target: ArtifactRef {
+                host_id: "host_fixture".into(),
+                provider_id: CODEX_PROVIDER_ID.into(),
+                native_id: config.to_string_lossy().into_owned(),
+                source_reference: config.to_string_lossy().into_owned(),
+            },
+            expected_source_hash: None,
+            operation: ChangeOperationKind::ReplaceText,
+            replacement_content: Some("sandbox_mode = \"workspace-write\"\n".into()),
+            reason: "trusted project fixture".into(),
+            evidence_ids: Vec::new(),
+        };
+        assert!(adapter.propose_change(&request).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("proposal does not write"),
+            "sandbox_mode = \"read-only\"\n"
         );
     }
 }
