@@ -42,14 +42,7 @@ impl CodexAdapter {
             .unwrap_or_else(|| PathBuf::from(".codex"));
 
         let scan_roots = env::var_os("AMCP_SCAN_ROOTS")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(':')
-                    .filter(|part| !part.is_empty())
-                    .map(PathBuf::from)
-                    .collect()
-            })
+            .map(|value| env::split_paths(&value).collect())
             .unwrap_or_default();
 
         Self {
@@ -1864,6 +1857,18 @@ mod tests {
     use super::*;
     use amcp_domain::{ArtifactRef, ChangeOperationKind, ChangeRequest, Scope};
 
+    fn project_registry_entry(path: &Path, trust_level: &str) -> String {
+        let escaped = path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        format!("[projects.\"{escaped}\"]\ntrust_level = \"{trust_level}\"\n")
+    }
+
+    fn source_ends_with(source: &str, suffix: &str) -> bool {
+        source.replace('\\', "/").ends_with(suffix)
+    }
+
     #[test]
     fn redacts_secret_like_values() {
         let result = redact_text("api_key=abc123\nauthorization: Bearer token");
@@ -2005,6 +2010,7 @@ mod tests {
             session.session_id == "fixture-session-1"
                 && session
                     .source_reference
+                    .replace('\\', "/")
                     .ends_with("sessions/fixture-session-1.jsonl")
         }));
         assert_eq!(batch.session_items.len(), 1);
@@ -2017,9 +2023,7 @@ mod tests {
                     && memory.content.contains("Memory fixture"))
         );
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact
-                .source_reference
-                .ends_with("projects/alpha/AGENTS.md")
+            source_ends_with(&artifact.source_reference, "projects/alpha/AGENTS.md")
         }));
         assert!(batch.artifacts.iter().all(|artifact| {
             !artifact
@@ -2055,12 +2059,12 @@ mod tests {
         let profile = batch
             .config_layers
             .iter()
-            .find(|layer| layer.source_reference.ends_with("/review.config.toml"))
+            .find(|layer| source_ends_with(&layer.source_reference, "/review.config.toml"))
             .expect("profile layer");
         assert_eq!(profile.scope, "profile");
         assert_eq!(profile.profile.as_deref(), Some("review"));
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact.source_reference.ends_with("/review.config.toml")
+            source_ends_with(&artifact.source_reference, "/review.config.toml")
                 && artifact.kind == ArtifactKind::Configuration
                 && !artifact.content.contains("profile-secret")
         }));
@@ -2114,10 +2118,7 @@ mod tests {
         fs::write(&profile, "model = \"gpt-test\"\n").expect("project profile");
         fs::write(
             codex_home.path().join("projects.toml"),
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                project.path().display()
-            ),
+            project_registry_entry(project.path(), "trusted"),
         )
         .expect("project registry");
         let adapter = CodexAdapter::from_environment(Some(codex_home.path().to_path_buf()));
@@ -2185,22 +2186,20 @@ mod tests {
             .expect("auxiliary discovery");
 
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact.source_reference.ends_with("/rules/security.md")
+            source_ends_with(&artifact.source_reference, "/rules/security.md")
                 && artifact.kind == ArtifactKind::Instruction
         }));
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact
-                .source_reference
-                .ends_with("/skills/review/SKILL.md")
+            source_ends_with(&artifact.source_reference, "/skills/review/SKILL.md")
                 && artifact.kind == ArtifactKind::Instruction
         }));
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact.source_reference.ends_with("/hooks/pre-commit.sh")
+            source_ends_with(&artifact.source_reference, "/hooks/pre-commit.sh")
                 && artifact.kind == ArtifactKind::Tooling
                 && !artifact.content.contains("hook-secret")
         }));
         assert!(batch.artifacts.iter().any(|artifact| {
-            artifact.source_reference.ends_with("/mcp/servers.toml")
+            source_ends_with(&artifact.source_reference, "/mcp/servers.toml")
                 && artifact.kind == ArtifactKind::Tooling
         }));
         assert!(
@@ -2268,8 +2267,12 @@ mod tests {
         std::fs::write(
             codex_home.join("sessions/session-cwd.jsonl"),
             format!(
-                "{{\"session_id\":\"session-from-cwd\",\"cwd\":\"{}\",\"title\":\"Session project discovery\"}}\n",
-                project_cwd.display()
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "session-from-cwd",
+                    "cwd": project_cwd,
+                    "title": "Session project discovery",
+                })
             ),
         )
         .expect("session metadata");
@@ -2310,10 +2313,7 @@ mod tests {
         .expect("user config");
         fs::write(
             directory.path().join("projects.toml"),
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                project.display()
-            ),
+            project_registry_entry(&project, "trusted"),
         )
         .expect("projects registry");
         fs::write(
@@ -2486,10 +2486,7 @@ mod tests {
         std::fs::write(&config, "sandbox_mode = \"read-only\"\n").expect("write fixture");
         std::fs::write(
             temp.path().join("projects.toml"),
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
-                project.display()
-            ),
+            project_registry_entry(&project, "untrusted"),
         )
         .expect("write project trust registry");
         let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));
@@ -2530,10 +2527,7 @@ mod tests {
         std::fs::write(&config, "sandbox_mode = \"read-only\"\n").expect("write fixture");
         std::fs::write(
             temp.path().join("projects.toml"),
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                project_dir.path().display()
-            ),
+            project_registry_entry(project_dir.path(), "trusted"),
         )
         .expect("write project trust registry");
         let adapter = CodexAdapter::from_environment(Some(temp.path().to_path_buf()));

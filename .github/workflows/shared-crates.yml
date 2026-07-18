@@ -74,6 +74,9 @@ jobs:
         working-directory: apps/amcp-desktop
         run: npm ci
 
+      - name: Build desktop sidecars required by Tauri
+        run: ./scripts/build-desktop-sidecars.sh
+
       - name: Test and lint desktop backend
         working-directory: apps/amcp-desktop
         run: |
