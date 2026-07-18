@@ -3106,8 +3106,14 @@ mod tests {
             },
             Some("runtime-token".into()),
         );
+        let fixture_name = if cfg!(windows) {
+            "fake-codex-app-server.cmd"
+        } else {
+            "fake-codex-app-server.py"
+        };
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/fake-codex-app-server.py");
+            .join("../../fixtures")
+            .join(fixture_name);
         let response =
             process_runtime_change_request(request, &auth, None, &fixture, None, directory.path())
                 .await;
