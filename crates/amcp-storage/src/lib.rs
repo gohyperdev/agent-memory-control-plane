@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::Instant,
 };
 #[cfg(unix)]
@@ -1290,8 +1290,7 @@ impl Catalog {
         let Some(root) = payload.get("root").and_then(serde_json::Value::as_str) else {
             return Ok(());
         };
-        let root = Path::new(root);
-        if !root.is_absolute() {
+        if !is_absolute_source_root(root) {
             return Ok(());
         }
         let Some(paths) = payload.get("paths").and_then(serde_json::Value::as_array) else {
@@ -1299,15 +1298,10 @@ impl Catalog {
         };
         let stale = serde_json::to_string(&LifecycleState::Stale)?;
         for relative_path in paths.iter().filter_map(serde_json::Value::as_str) {
-            let relative = Path::new(relative_path);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-            {
+            if !is_safe_relative_source_path(relative_path) {
                 continue;
             }
-            let source_reference = root.join(relative).to_string_lossy().into_owned();
+            let source_reference = join_source_reference(root, relative_path);
             transaction.execute(
                 "UPDATE artifacts SET lifecycle = ?1
                  WHERE host_id = ?2 AND provider_id = ?3 AND source_reference = ?4",
@@ -2972,6 +2966,31 @@ fn restrict_file_to_current_user(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+fn is_absolute_source_root(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    Path::new(value).is_absolute()
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || (bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn is_safe_relative_source_path(value: &str) -> bool {
+    let normalized = value.replace('\\', "/");
+    !(normalized.is_empty()
+        || is_absolute_source_root(value)
+        || normalized
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        || (normalized.len() >= 2 && normalized.as_bytes()[1] == b':'))
+}
+
+fn join_source_reference(root: &str, relative: &str) -> String {
+    let separator = if root.contains('\\') { '\\' } else { '/' };
+    let root = root.trim_end_matches(['/', '\\']);
+    let relative = relative.trim_start_matches(['/', '\\']);
+    format!("{root}{separator}{relative}")
 }
 
 #[cfg(test)]
