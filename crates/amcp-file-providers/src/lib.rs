@@ -877,12 +877,10 @@ mod tests {
             batch.providers[0].compatibility,
             ProviderCompatibility::Compatible
         );
-        assert!(
-            batch.providers[0]
-                .native_roots
-                .iter()
-                .any(|root| root.ends_with("fixtures/claude-code/.claude"))
-        );
+        assert!(batch.providers[0].native_roots.iter().any(|root| {
+            root.replace('\\', "/")
+                .ends_with("fixtures/claude-code/.claude")
+        }));
         assert!(
             batch
                 .memory_records
